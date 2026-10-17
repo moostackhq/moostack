@@ -328,7 +328,7 @@ func TestFindKeyWithSSHKeyOverridesSSHDir(t *testing.T) {
 	}
 	// Only the chosen key reads the store once inDir is removed.
 	s := open(t, path, operator{identity: id})
-	if err := s.RemoveRecipient(inDir.recipient.Key); err != nil {
+	if _, err := s.RemoveRecipient(inDir.recipient.Key); err != nil {
 		t.Fatal(err)
 	}
 	save(t, s)
@@ -565,5 +565,39 @@ func TestChooseKeyOffersKeyWhoseCommentWontReadBack(t *testing.T) {
 			}
 			openWithKey(t, path, secretstore.KeyOptions{Home: home})
 		}
+	}
+}
+
+func TestReadRecipientTakesAPathOrALine(t *testing.T) {
+	bob := newOperator(t, "bob")
+	pub := filepath.Join(t.TempDir(), "team keys", "bob.pub")
+	writeFile(t, pub, []byte(bob.recipient.String()+"\n"))
+
+	for _, arg := range []string{pub, bob.recipient.String()} {
+		if r, err := secretstore.ReadRecipient(arg); err != nil || r.String() != bob.recipient.String() {
+			t.Errorf("%q: %v, %v", arg, r, err)
+		}
+	}
+	if r, err := secretstore.ReadRecipient(strings.TrimSuffix(bob.recipient.String(), "bob") + "bob.pub"); err != nil || r.Comment != "bob.pub" {
+		t.Errorf("a line whose comment ends in .pub: %v, %v", r, err)
+	}
+	for _, missing := range []string{"bob.pub", "/no/such dir/bob.pub", "team keys/bob", "ssh-work.pub", "my ssh-keys.pub"} {
+		if _, err := secretstore.ReadRecipient(missing); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%q: %v, want an error that it doesn't exist", missing, err)
+		}
+	}
+}
+
+func TestReadRecipientGivesTheParseErrorForAKeyThatIsWrong(t *testing.T) {
+	_, err := secretstore.ReadRecipient("ssh-ed25519 notbase64 bob")
+
+	wantErr(t, err, "parsing recipient")
+}
+
+func TestUnlockWithoutAStoreIsErrNoStore(t *testing.T) {
+	_, err := secretstore.Unlock(storePath(t), secretstore.KeyOptions{Home: t.TempDir()})
+
+	if !errors.Is(err, secretstore.ErrNoStore) {
+		t.Errorf("got %v, want ErrNoStore", err)
 	}
 }

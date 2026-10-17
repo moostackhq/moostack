@@ -3,6 +3,8 @@ package secretstore
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -30,6 +32,60 @@ func ParseRecipient(line string) (Recipient, error) {
 	}
 	r := Recipient{Key: key, Comment: comment}
 	return r, r.check()
+}
+
+// ReadRecipient reads the recipient that arg gives: the path of a .pub
+// file, if that file exists, or else a public key in authorized_keys
+// format, which ParseRecipient reads. An arg that names no file and has
+// no key type as a field of its own is a path that doesn't exist, so the
+// error says so rather than that it isn't a key.
+//
+// The comment of a .pub file is cleaned up the way ChooseKey cleans up
+// the operator's own, rather than refused if it wouldn't read back as
+// written, such as a comment in Latin-1. A typed comment can be fixed
+// where it is typed, so ParseRecipient refuses it.
+func ReadRecipient(arg string) (Recipient, error) {
+	if _, err := os.Stat(arg); err == nil || !hasKeyType(arg) {
+		return readRecipientFile(arg)
+	}
+	return ParseRecipient(arg)
+}
+
+// keyTypes are the key types an authorized_keys line can have.
+var keyTypes = []string{
+	ssh.KeyAlgoRSA, ssh.KeyAlgoDSA, ssh.KeyAlgoED25519, ssh.KeyAlgoSKED25519,
+	ssh.KeyAlgoECDSA256, ssh.KeyAlgoECDSA384, ssh.KeyAlgoECDSA521, ssh.KeyAlgoSKECDSA256,
+	ssh.CertAlgoRSAv01, ssh.CertAlgoDSAv01, ssh.CertAlgoED25519v01, ssh.CertAlgoSKED25519v01,
+	ssh.CertAlgoECDSA256v01, ssh.CertAlgoECDSA384v01, ssh.CertAlgoECDSA521v01, ssh.CertAlgoSKECDSA256v01,
+}
+
+// hasKeyType reports whether a field of s is a key type, as one of every
+// authorized_keys line is.
+func hasKeyType(s string) bool {
+	return slices.ContainsFunc(strings.Fields(s), func(field string) bool {
+		return slices.Contains(keyTypes, field)
+	})
+}
+
+// readRecipientFile reads a recipient from a .pub file, cleaning up its
+// comment.
+func readRecipientFile(path string) (Recipient, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Recipient{}, err
+	}
+	key, comment, _, rest, err := ssh.ParseAuthorizedKey(data)
+	if err != nil {
+		return Recipient{}, fmt.Errorf("%s: %w", path, err)
+	}
+	if len(bytes.TrimSpace(rest)) > 0 {
+		return Recipient{}, fmt.Errorf("%s: more than one key", path)
+	}
+	r := Recipient{Key: key, Comment: ownComment(key, comment)}
+	if err := r.check(); err != nil {
+		return Recipient{}, fmt.Errorf("%s: %w", path, err)
+	}
+	return r, nil
 }
 
 // String is the recipient in authorized_keys format.

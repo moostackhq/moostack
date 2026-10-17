@@ -8,6 +8,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -204,7 +205,7 @@ func replaceDataKey(t *testing.T, path string, owner, leaving operator) (old sto
 	save(t, s)
 	old = readStoreFile(t, path)
 	s = open(t, path, owner)
-	if err := s.RemoveRecipient(leaving.recipient.Key); err != nil {
+	if _, err := s.RemoveRecipient(leaving.recipient.Key); err != nil {
 		t.Fatal(err)
 	}
 	save(t, s)
@@ -315,8 +316,12 @@ func TestSaveLeavesNoTempFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].Name() != filepath.Base(path) {
-		t.Errorf("directory holds %v, want only the store", entries)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if !slices.Equal(names, []string{secretstore.LockFileName, filepath.Base(path)}) {
+		t.Errorf("directory holds %v, want only the store and its lock", names)
 	}
 }
 
@@ -573,7 +578,7 @@ func TestRemovingRecipientMarksGeneratedSecretsForRotation(t *testing.T) {
 	before := readStoreFile(t, path)
 
 	s = open(t, path, bob)
-	if err := s.RemoveRecipient(alice.recipient.Key); err != nil {
+	if _, err := s.RemoveRecipient(alice.recipient.Key); err != nil {
 		t.Fatal(err)
 	}
 	save(t, s)
@@ -607,13 +612,15 @@ func TestRemovingRecipientMarksGeneratedSecretsForRotation(t *testing.T) {
 func TestRemovingLastRecipientIsRefused(t *testing.T) {
 	alice := newOperator(t, "alice")
 	s := open(t, initStore(t, alice, nil), alice)
-	wantErr(t, s.RemoveRecipient(alice.recipient.Key), "last recipient")
+	_, err := s.RemoveRecipient(alice.recipient.Key)
+	wantErr(t, err, "last recipient")
 }
 
 func TestRemovingUnknownRecipientFails(t *testing.T) {
 	alice, bob := newOperator(t, "alice"), newOperator(t, "bob")
 	s := open(t, initStore(t, alice, nil), alice)
-	wantErr(t, s.RemoveRecipient(bob.recipient.Key), "not a recipient")
+	_, err := s.RemoveRecipient(bob.recipient.Key)
+	wantErr(t, err, "not a recipient")
 }
 
 func TestValueFromOldDataKeyFailsNamingSecret(t *testing.T) {
@@ -671,7 +678,7 @@ func TestRemovingRecipientFailsOnValueFromOldDataKey(t *testing.T) {
 	f.Secrets = append(f.Secrets, stale)
 	writeStoreFile(t, path, f)
 
-	err := open(t, path, alice).RemoveRecipient(carol.recipient.Key)
+	_, err := open(t, path, alice).RemoveRecipient(carol.recipient.Key)
 	wantErr(t, err, `"merged"`, "remove it and set it again")
 }
 
@@ -801,4 +808,78 @@ func sealByHand(t *testing.T, recipient secretstore.Recipient, line string) stri
 		t.Fatal(err)
 	}
 	return buf.String()
+}
+
+func TestSaveRefusesAFileChangedSinceOpen(t *testing.T) {
+	alice := newOperator(t, "alice")
+	path := initStore(t, alice, nil)
+	first, second := open(t, path, alice), open(t, path, alice)
+	if err := first.Put("a", secretstore.Secret{Value: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	save(t, first)
+	if err := second.Put("b", secretstore.Secret{Value: "2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := second.Save()
+
+	if !errors.Is(err, secretstore.ErrChanged) {
+		t.Fatalf("got %v, want ErrChanged", err)
+	}
+	if v := value(t, open(t, path, alice), "a"); v != "1" {
+		t.Errorf("a is %q", v)
+	}
+	if err := first.Put("c", secretstore.Secret{Value: "3"}); err != nil {
+		t.Fatal(err)
+	}
+	save(t, first)
+}
+
+func TestConcurrentSavesNeverBothSucceed(t *testing.T) {
+	alice := newOperator(t, "alice")
+	path := initStore(t, alice, nil)
+	for round := range 20 {
+		stores := []*secretstore.Store{open(t, path, alice), open(t, path, alice)}
+		errs := make(chan error, len(stores))
+		for i, s := range stores {
+			if err := s.Put(fmt.Sprint(round, i), secretstore.Secret{Value: "x"}); err != nil {
+				t.Fatal(err)
+			}
+			go func() { errs <- s.Save() }()
+		}
+		var failed int
+		for range stores {
+			if err := <-errs; errors.Is(err, secretstore.ErrChanged) {
+				failed++
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if failed != 1 {
+			t.Fatalf("%d of 2 saves failed, want 1", failed)
+		}
+	}
+}
+
+func TestFindRecipientByFingerprintOrComment(t *testing.T) {
+	alice, bob, other := newOperator(t, "alice"), newOperator(t, "ops"), newOperator(t, "ops")
+	s := open(t, initStore(t, alice, nil), alice)
+	for _, r := range []secretstore.Recipient{bob.recipient, other.recipient} {
+		if err := s.AddRecipient(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if r, err := s.FindRecipient("alice"); err != nil || r.String() != alice.recipient.String() {
+		t.Errorf("by comment: %v, %v", r, err)
+	}
+	if r, err := s.FindRecipient(bob.recipient.Fingerprint()); err != nil || r.String() != bob.recipient.String() {
+		t.Errorf("by fingerprint: %v, %v", r, err)
+	}
+	_, err := s.FindRecipient("ops")
+	wantErr(t, err, "more than one", bob.recipient.Fingerprint(), other.recipient.Fingerprint())
+	if _, err := s.FindRecipient("carol"); !errors.Is(err, secretstore.ErrNotFound) {
+		t.Errorf("an unknown recipient: %v", err)
+	}
 }

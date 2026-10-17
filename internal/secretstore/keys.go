@@ -15,6 +15,8 @@ import (
 	"filippo.io/age"
 	"filippo.io/age/agessh"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/moostackhq/moostack/internal/terminal"
 )
 
 // KeyOptions say where to find the operator's SSH key and how to ask
@@ -28,18 +30,9 @@ type KeyOptions struct {
 	// key.
 	SSHKey string
 	// Terminal asks the operator. It is nil when there is no terminal.
-	Terminal Terminal
+	Terminal terminal.Terminal
 	// Out is where ChooseKey prints its warning. Nil means os.Stderr.
 	Out io.Writer
-}
-
-// Terminal is the operator's terminal. Prompts are written to it.
-type Terminal interface {
-	io.Writer
-	// ReadLine reads a line, without its line ending.
-	ReadLine() (string, error)
-	// ReadPassword reads a line without echoing it.
-	ReadPassword() ([]byte, error)
 }
 
 // lossWarning is printed once, when a store is created.
@@ -136,6 +129,23 @@ func FindKey(path string, opts KeyOptions) (age.Identity, error) {
 	return nil, noKeyError(path, problem, recipients, "choose your key with --ssh-key")
 }
 
+// ErrNoStore is returned by Unlock when there is no store at its path.
+var ErrNoStore = errors.New("there is no secret store")
+
+// Unlock finds the operator's key for the store at path, as FindKey
+// does, and opens the store with it. It fails with ErrNoStore if there
+// is no store at path.
+func Unlock(path string, opts KeyOptions) (*Store, error) {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%w at %s", ErrNoStore, path)
+	}
+	id, err := FindKey(path, opts)
+	if err != nil {
+		return nil, err
+	}
+	return Open(path, id)
+}
+
 // noKeyError is the error for when the operator has no key for the store
 // at path. It says what the problem is, lists the store's recipients, and
 // says to ask one of them to add the operator, offering alternative as
@@ -169,7 +179,7 @@ type sshKey struct {
 
 // identity reads the key's private key, asking for its passphrase on t
 // if one protects it. The private key must be the public key's.
-func (k sshKey) identity(t Terminal) (age.Identity, error) {
+func (k sshKey) identity(t terminal.Terminal) (age.Identity, error) {
 	data, err := os.ReadFile(k.path)
 	if err != nil {
 		return nil, err

@@ -35,10 +35,16 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
+
+	"github.com/moostackhq/moostack/internal/filelock"
 )
 
 // FileName is the store's file name in the cluster directory.
 const FileName = "secrets.enc.yml"
+
+// LockFileName is the file next to the store that Save locks. It is
+// never removed, and never committed.
+const LockFileName = "." + FileName + ".lock"
 
 // formatVersion is the version of the file format.
 const formatVersion = 1
@@ -46,21 +52,26 @@ const formatVersion = 1
 // ErrNotFound is returned for a secret that isn't in the store.
 var ErrNotFound = errors.New("not found")
 
+// ErrChanged is returned by Save when the file changed after the store
+// was opened, as when another mooctl saved it meanwhile.
+var ErrChanged = errors.New("changed since it was opened")
+
 // ErrNotRecipient is returned when a key isn't one of the store's
 // recipients.
 var ErrNotRecipient = errors.New("not a recipient of the secret store")
 
-// Secret is a secret's value and settings.
+// Secret is a secret's value and settings. The YAML tags are the form
+// the operator sees and edits.
 type Secret struct {
-	Value string
+	Value string `yaml:"value"`
 	// Generate says how to generate the value, if it is generated.
-	Generate *Generate
+	Generate *Generate `yaml:"generate,omitempty"`
 	// Rotate marks the value to be generated again.
-	Rotate bool
+	Rotate bool `yaml:"rotate,omitempty"`
 }
 
 // Generate are the settings to generate a value with. The store keeps
-// them but doesn't check them.
+// them without checking them; Check does.
 type Generate struct {
 	Type    string `yaml:"type" json:"type"`
 	Length  int    `yaml:"length,omitempty" json:"length,omitempty"`
@@ -76,6 +87,9 @@ type Store struct {
 	// recipients, or empty if they changed and must be encrypted again.
 	sealedKey string
 	secrets   []*entry
+	// saved is the file as it was opened or last saved, which Save
+	// checks it still is.
+	saved []byte
 }
 
 // dataKey is the key that encrypts the values, and its ID.
@@ -100,6 +114,8 @@ type file struct {
 	// DataKey is the sealed data key, armored.
 	DataKey string   `yaml:"data_key"`
 	Secrets []*entry `yaml:"secrets"`
+	// raw is the file as it was read.
+	raw []byte
 }
 
 // sealed is what the data key's age encryption holds.
@@ -137,6 +153,7 @@ func Init(path string, recipient Recipient) (*Store, error) {
 		}
 		return nil, err
 	}
+	s.saved = data
 	return s, syncDir(path)
 }
 
@@ -171,6 +188,7 @@ func Open(path string, identity age.Identity) (*Store, error) {
 		key:        dataKey{id: contents.ID, key: contents.Key},
 		sealedKey:  f.DataKey,
 		secrets:    f.Secrets,
+		saved:      f.raw,
 	}, nil
 }
 
@@ -206,6 +224,7 @@ func readFile(path string) (*file, error) {
 	if err := dec.Decode(&f); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	f.raw = data
 	if f.Version != formatVersion {
 		return nil, fmt.Errorf("%s: unsupported format version %d", path, f.Version)
 	}
@@ -263,6 +282,17 @@ func (s *Store) Get(name string) (Secret, error) {
 	return s.key.decrypt(e)
 }
 
+// Settings are the generate settings and rotate flag of the secret called
+// name, as the file has them, without its value. They are checked only
+// when the value is decrypted, so they can be read even when it can't.
+func (s *Store) Settings(name string) (generate *Generate, rotate bool, err error) {
+	e := s.find(name)
+	if e == nil {
+		return nil, false, fmt.Errorf("secret %q: %w", name, ErrNotFound)
+	}
+	return cloneGenerate(e.Generate), e.Rotate, nil
+}
+
 // Put sets the secret called name, adding it if it is new. A secret that
 // doesn't change keeps its ciphertext. A value that can't be decrypted
 // is replaced, which is how one from another data key is set again.
@@ -272,7 +302,7 @@ func (s *Store) Put(name string, secret Secret) error {
 	}
 	e := s.find(name)
 	if e != nil {
-		if old, err := s.key.decrypt(e); err == nil && sameSecret(old, secret) {
+		if old, err := s.key.decrypt(e); err == nil && old.Equal(secret) {
 			return nil
 		}
 	}
@@ -303,6 +333,33 @@ func (s *Store) Recipients() []Recipient {
 	return slices.Clone(s.recipients)
 }
 
+// FindRecipient finds the recipient whose fingerprint or comment is id.
+// A comment that more than one recipient has is refused, with an error
+// that lists their fingerprints.
+func (s *Store) FindRecipient(id string) (Recipient, error) {
+	var byComment []Recipient
+	for _, r := range s.recipients {
+		if r.Fingerprint() == id {
+			return r, nil
+		}
+		if r.Comment == id {
+			byComment = append(byComment, r)
+		}
+	}
+	switch len(byComment) {
+	case 1:
+		return byComment[0], nil
+	case 0:
+		return Recipient{}, fmt.Errorf("no recipient has the fingerprint or comment %q: %w", id, ErrNotFound)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "more than one recipient has the comment %q; use the fingerprint instead:", id)
+	for _, r := range byComment {
+		fmt.Fprintf(&b, "\n  %s %s", r.Fingerprint(), r.Comment)
+	}
+	return Recipient{}, errors.New(b.String())
+}
+
 // AddRecipient adds a recipient. Only the data key is encrypted again;
 // the values keep their ciphertext.
 func (s *Store) AddRecipient(r Recipient) error {
@@ -320,16 +377,17 @@ func (s *Store) AddRecipient(r Recipient) error {
 // RemoveRecipient removes the recipient with key. The data key is
 // replaced and every value encrypted again, so that the removed recipient
 // can't read anything written afterwards. Every secret with generate
-// settings is marked rotate, but nothing is generated again. The last
-// recipient can't be removed, nor can any recipient while a value can't
-// be decrypted; the error names that secret.
-func (s *Store) RemoveRecipient(key ssh.PublicKey) error {
+// settings is marked rotate, but nothing is generated again; marked are
+// the secrets that weren't marked before. The last recipient can't be
+// removed, nor can any recipient while a value can't be decrypted; the
+// error names that secret.
+func (s *Store) RemoveRecipient(key ssh.PublicKey) (marked []string, err error) {
 	i := recipientIndex(s.recipients, key)
 	if i < 0 {
-		return fmt.Errorf("key %s is %w", ssh.FingerprintSHA256(key), ErrNotRecipient)
+		return nil, fmt.Errorf("key %s is %w", ssh.FingerprintSHA256(key), ErrNotRecipient)
 	}
 	if len(s.recipients) == 1 {
-		return errors.New("the last recipient can't be removed")
+		return nil, errors.New("the last recipient can't be removed")
 	}
 	// Everything is decrypted and encrypted again before anything
 	// changes, so that a failure leaves the store as it was.
@@ -337,19 +395,22 @@ func (s *Store) RemoveRecipient(key ssh.PublicKey) error {
 	for j, e := range s.secrets {
 		secret, err := s.key.decrypt(e)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		secret.Rotate = secret.Rotate || secret.Generate != nil
+		if !secret.Rotate && secret.Generate != nil {
+			secret.Rotate = true
+			marked = append(marked, e.Name)
+		}
 		secrets[j] = secret
 	}
 	newKey, err := newDataKey()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	values := make([]string, len(s.secrets))
 	for j, e := range s.secrets {
 		if values[j], err = newKey.encrypt(e.Name, secrets[j]); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	for j, e := range s.secrets {
@@ -358,7 +419,7 @@ func (s *Store) RemoveRecipient(key ssh.PublicKey) error {
 	s.key = newKey
 	s.recipients = slices.Delete(s.recipients, i, i+1)
 	s.sealedKey = ""
-	return nil
+	return marked, nil
 }
 
 // recipientIndex is the index of the recipient with key, or -1.
@@ -366,11 +427,30 @@ func recipientIndex(recipients []Recipient, key ssh.PublicKey) int {
 	return slices.IndexFunc(recipients, func(r Recipient) bool { return sameKey(r.Key, key) })
 }
 
-// Save writes the store to its file atomically.
+// Save writes the store to its file atomically. It refuses, with
+// ErrChanged, if the file changed after the store was opened or last
+// saved, so that it never overwrites someone else's change. From the
+// check to the rename it holds a lock on LockFileName, next to the file,
+// so that two saves at the same moment can't both pass the check. That
+// holds for every user of the directory, and across machines where the
+// filesystem supports the lock. On a system without file locks, Save
+// refuses to save.
 func (s *Store) Save() error {
 	data, err := s.marshal()
 	if err != nil {
 		return err
+	}
+	unlock, err := filelock.Lock(filepath.Join(filepath.Dir(s.path), LockFileName))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	current, err := os.ReadFile(s.path)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(current, s.saved) {
+		return fmt.Errorf("%s %w; nothing was saved", s.path, ErrChanged)
 	}
 	tmp, err := writeTemp(s.path, data)
 	if err != nil {
@@ -380,6 +460,7 @@ func (s *Store) Save() error {
 		os.Remove(tmp)
 		return err
 	}
+	s.saved = data
 	return syncDir(s.path)
 }
 
@@ -527,11 +608,16 @@ func associatedData(keyID, name string, secret Secret) []byte {
 	return append([]byte("moostack secret store v1\n"), ad...)
 }
 
-// sameSecret reports whether a and b are the same.
-func sameSecret(a, b Secret) bool {
-	return a.Value == b.Value && a.Rotate == b.Rotate &&
-		(a.Generate == nil) == (b.Generate == nil) &&
-		(a.Generate == nil || *a.Generate == *b.Generate)
+// Equal reports whether s and o have the same value and settings.
+func (s Secret) Equal(o Secret) bool {
+	return s.Value == o.Value && s.SameSettings(o)
+}
+
+// SameSettings reports whether s and o have the same generate settings
+// and rotate flag.
+func (s Secret) SameSettings(o Secret) bool {
+	return s.Rotate == o.Rotate && (s.Generate == nil) == (o.Generate == nil) &&
+		(s.Generate == nil || *s.Generate == *o.Generate)
 }
 
 // cloneGenerate copies g, so that the caller can't change the store's.
