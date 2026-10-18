@@ -55,7 +55,7 @@ func TestGRPCThroughAForwardedSocket(t *testing.T) {
 			h := newHome(t, nodeConfig(d, user))
 			h.write(t, ".ssh/key", file)
 			opts := h.options()
-			opts.Relay = func(socket string) string { return "socat STDIO UNIX-CONNECT:" + socket }
+			opts.Relay = func(socket string) string { return "socat STDIO UNIX-CONNECT:" + sshclient.ShellQuote(socket) }
 			ctx := testContext(t)
 			c, err := sshclient.Dial(ctx, d.node(), opts)
 			if err != nil {

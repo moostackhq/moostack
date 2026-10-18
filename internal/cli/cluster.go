@@ -15,6 +15,7 @@ import (
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/cluster"
 	"github.com/moostackhq/moostack/internal/nodeclient"
+	"github.com/moostackhq/moostack/internal/release"
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
@@ -106,18 +107,10 @@ func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
 			continue
 		}
 		mode := nodeclient.ModeName(status.Mode)
-		for _, c := range status.Components {
-			pinned := "-"
-			if p, ok := rel.Component(c.Name); ok {
-				pinned = p.Version
-			}
-			running := c.Version
-			if running == "" {
-				running = "-"
-			}
-			fmt.Fprintf(w, "%s\tyes\t%s\t%s\t%s\t%s\t%s\n", n.Name, mode, c.Name, running, pinned, nodeclient.HealthName(c.Health))
-			if c.Problem != "" {
-				problems = append(problems, fmt.Sprintf("%s: %s: %s", n.Name, c.Name, c.Problem))
+		for _, row := range componentRows(rel, status.Components) {
+			fmt.Fprintf(w, "%s\tyes\t%s\t%s\t%s\t%s\t%s\n", n.Name, mode, row.name, row.running, row.pinned, row.health)
+			if row.problem != "" {
+				problems = append(problems, fmt.Sprintf("%s: %s: %s", n.Name, row.name, row.problem))
 			}
 		}
 	}
@@ -130,19 +123,62 @@ func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
 	return nil
 }
 
-// nodeStatus is n's status, from its agent over SSH.
-func nodeStatus(ctx context.Context, env Env, n cluster.Node) (*nodev1.StatusResponse, error) {
+// componentRow is a component's row in cluster status, with the
+// problem to print below the table.
+type componentRow struct{ name, running, pinned, health, problem string }
+
+// componentRows are the rows of a node that reported components: one for
+// each component rel pins, in rel's order, then one for each component
+// it doesn't. A pinned component the node didn't report is of unknown
+// health.
+func componentRows(rel *release.Release, components []*nodev1.Component) []componentRow {
+	reported := map[string]*nodev1.Component{}
+	for _, c := range components {
+		reported[c.Name] = c
+	}
+	var rows []componentRow
+	for _, p := range rel.Components {
+		c, ok := reported[p.Name]
+		if !ok {
+			rows = append(rows, componentRow{name: p.Name, running: "-", pinned: p.Version, health: nodeclient.HealthName(nodev1.Health_HEALTH_UNSPECIFIED)})
+			continue
+		}
+		rows = append(rows, reportedRow(c, p.Version))
+	}
+	for _, c := range components {
+		if _, ok := rel.Component(c.Name); !ok {
+			rows = append(rows, reportedRow(c, "-"))
+		}
+	}
+	return rows
+}
+
+// reportedRow is the row of the reported component c, pinned at pinned.
+func reportedRow(c *nodev1.Component, pinned string) componentRow {
+	running := c.Version
+	if running == "" {
+		running = "-"
+	}
+	return componentRow{name: c.Name, running: running, pinned: pinned, health: nodeclient.HealthName(c.Health), problem: c.Problem}
+}
+
+// nodeStatus is n's status, from env.NodeStatus or else over SSH. It
+// fails only if the node can't be reached.
+func nodeStatus(ctx context.Context, env Env, n cluster.Node) (nodeclient.Status, error) {
 	ctx, cancel := context.WithTimeout(ctx, statusTimeout)
 	defer cancel()
+	if env.NodeStatus != nil {
+		return env.NodeStatus(ctx, n)
+	}
 	c, err := sshclient.Dial(ctx, sshclient.Node{Target: n.User + "@" + n.Address, HostKeys: []ssh.PublicKey{n.HostKey}}, sshOptions(env))
 	if err != nil {
-		return nil, err
+		return nodeclient.Status{}, err
 	}
 	defer c.Close()
-	agent, err := nodeclient.DialAgent(c)
+	node, err := nodeclient.Dial(c)
 	if err != nil {
-		return nil, err
+		return nodeclient.Status{}, err
 	}
-	defer agent.Close()
-	return agent.Status(ctx, &nodev1.StatusRequest{})
+	defer node.Close()
+	return node.Status(ctx), nil
 }

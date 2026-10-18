@@ -11,6 +11,12 @@ func TestUnitFilesRunTheInstalledBinaries(t *testing.T) {
 			"ExecStart=/opt/moostack/bin/containerd --config /etc/moostack/containerd.toml",
 			"Environment=PATH=/opt/moostack/bin:",
 		},
+		// The updater doesn't depend on the agent or containerd, so it
+		// runs whatever state they are in.
+		"/etc/systemd/system/moostack-updater.service": {
+			"ExecStart=/opt/moostack/bin/updater serve",
+			"Restart=always",
+		},
 		"/etc/systemd/system/moostack-agent.service": {
 			"Wants=moostack-containerd.service",
 			"After=moostack-containerd.service",
@@ -21,6 +27,13 @@ func TestUnitFilesRunTheInstalledBinaries(t *testing.T) {
 		t.Fatalf("there are %d unit files, want %d", len(unitFiles), len(want))
 	}
 	for _, u := range unitFiles {
+		// Every unit dependency is set in [Unit], which for the updater
+		// holds only its description. systemd merges a repeated [Unit]
+		// into the first, so there must be only one.
+		if u.path == "/etc/systemd/system/moostack-updater.service" &&
+			(!strings.HasPrefix(u.content, "[Unit]\nDescription=Moostack updater\n\n[") || strings.Count(u.content, "[Unit]") != 1) {
+			t.Errorf("the updater's unit has more than a description in [Unit]:\n%s", u.content)
+		}
 		lines, ok := want[u.path]
 		if !ok {
 			t.Errorf("an unexpected unit file %s", u.path)

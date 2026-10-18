@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +42,9 @@ type Env struct {
 	// Exit ends mooctl. It is called when a signal stops a command, once
 	// what the command held is cleaned up.
 	Exit func(code int)
+	// NodeStatus reaches a node and asks for its status. Nil means over
+	// SSH, with the operator's SSH config and ssh-agent.
+	NodeStatus func(ctx context.Context, n cluster.Node) (nodeclient.Status, error)
 }
 
 // OSEnv is the Env of the running process.
@@ -109,8 +113,8 @@ func plural(n int, thing string) string {
 }
 
 // sshOptions are the options mooctl connects to nodes with: the
-// operator's SSH config and ssh-agent, and the agent's relay to reach its
-// socket through sudo.
+// operator's SSH config and ssh-agent, and the agent's and the updater's
+// relays to reach their sockets through sudo.
 func sshOptions(env Env) sshclient.Options {
 	return sshclient.Options{
 		SSH: sshconfig.Options{

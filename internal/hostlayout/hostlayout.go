@@ -30,6 +30,11 @@ const (
 	Agent = BinDir + "/agent"
 	// AgentSocket is where the agent serves the node API, to root only.
 	AgentSocket = RunDir + "/agent.sock"
+	// Updater is the updater's binary.
+	Updater = BinDir + "/updater"
+	// UpdaterSocket is where the updater serves its node API, to root
+	// only.
+	UpdaterSocket = RunDir + "/updater.sock"
 	// NodeFile is the node's NodeConfig.
 	NodeFile = ConfigDir + "/node.yml"
 	// ContainerdConfigFile is containerd's config, ContainerdConfig.
@@ -37,6 +42,18 @@ const (
 	// ContainerdSocket is where containerd serves its API.
 	ContainerdSocket = RunDir + "/containerd/containerd.sock"
 )
+
+// Server is the binary of the program that serves the node API on
+// socket, if one does.
+func Server(socket string) (string, bool) {
+	switch socket {
+	case AgentSocket:
+		return Agent, true
+	case UpdaterSocket:
+		return Updater, true
+	}
+	return "", false
+}
 
 // ContainerdConfig keeps containerd's files and sockets under Moostack's
 // directories, and reads no other config, so it doesn't clash with

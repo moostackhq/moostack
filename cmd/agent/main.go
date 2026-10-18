@@ -17,6 +17,7 @@ import (
 	"github.com/moostackhq/moostack/internal/agent"
 	"github.com/moostackhq/moostack/internal/buildinfo"
 	"github.com/moostackhq/moostack/internal/hostlayout"
+	"github.com/moostackhq/moostack/internal/rootsocket"
 )
 
 func main() {
@@ -38,7 +39,7 @@ func run(args []string) error {
 			ContainerdSocket: hostlayout.ContainerdSocket,
 		})
 	case len(args) == 2 && args[0] == "relay":
-		return agent.Relay(args[1], os.Stdin, os.Stdout)
+		return rootsocket.Relay(args[1], os.Stdin, os.Stdout)
 	}
 	return errors.New(usage)
 }

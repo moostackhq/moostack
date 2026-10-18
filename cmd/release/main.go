@@ -48,8 +48,10 @@ func build(ctx context.Context, version, out string) error {
 	}
 	for _, arch := range release.Architectures {
 		archDir := filepath.Join(dir, "linux-"+arch)
-		if err := goBuild(version, "linux", arch, filepath.Join(archDir, "agent"), "./cmd/agent"); err != nil {
-			return err
+		for _, program := range []string{"agent", "updater"} {
+			if err := goBuild(version, "linux", arch, filepath.Join(archDir, program), "./cmd/"+program); err != nil {
+				return err
+			}
 		}
 		if err := release.FetchContainerd(ctx, arch, cache, archDir); err != nil {
 			return err
@@ -59,6 +61,7 @@ func build(ctx context.Context, version, out string) error {
 		Version: version,
 		Components: []release.Component{
 			{Name: "agent", Version: version, Files: []string{"agent"}},
+			{Name: "updater", Version: version, Files: []string{"updater"}},
 			{Name: "containerd", Version: release.ContainerdVersion, Files: release.ContainerdFiles},
 		},
 	})

@@ -1,6 +1,7 @@
 syntax = "proto3";
 
-// The node API: what a node's agent serves about that one node.
+// The node API: what a node's agent and updater serve about that one
+// node.
 package moostack.node.v1;
 
 option go_package = "github.com/moostackhq/moostack/api/node/v1;nodev1";
@@ -11,12 +12,27 @@ service Agent {
   rpc Status(StatusRequest) returns (StatusResponse);
 }
 
+// Updater is the node API that the updater serves, on its own socket, so
+// that it answers whatever state the agent is in.
+service Updater {
+  // Status reports the updater's own state.
+  rpc Status(UpdaterStatusRequest) returns (UpdaterStatusResponse);
+}
+
 message StatusRequest {}
 
 message StatusResponse {
   Mode mode = 1;
-  // Components are the node components, the agent among them.
+  // Components are the node components, the agent among them. The
+  // updater reports itself.
   repeated Component components = 2;
+}
+
+message UpdaterStatusRequest {}
+
+message UpdaterStatusResponse {
+  // Updater is the updater itself.
+  Component updater = 1;
 }
 
 // Mode is how the node is operated.
@@ -26,9 +42,9 @@ enum Mode {
   MODE_DIRECT = 1;
 }
 
-// Component is a node component as the agent sees it.
+// Component is a node component as the agent or the updater sees it.
 message Component {
-  // Name is agent or containerd.
+  // Name is agent, updater or containerd.
   string name = 1;
   // Version is empty when the agent can't tell it.
   string version = 2;

@@ -29,7 +29,7 @@ func (c *Client) DialUnix(ctx context.Context, socket string) (net.Conn, error) 
 	if c.relay == nil {
 		return nil, fmt.Errorf("forwarding to %s: the user isn't root and no relay is set", socket)
 	}
-	conn, err := c.runRelay(ctx, c.relay(shellQuote(socket)), socket)
+	conn, err := c.runRelay(ctx, c.relay(socket), socket)
 	if err != nil {
 		return nil, fmt.Errorf("forwarding to %s: %w", socket, err)
 	}

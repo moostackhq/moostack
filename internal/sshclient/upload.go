@@ -52,8 +52,8 @@ sync "$tmp"
 chown -- %s "$tmp"
 chmod %o "$tmp"
 mv -fT "$tmp" %s
-trap - EXIT`, shellQuote(target), shellQuote(notOption(path.Join(path.Dir(file), ".upload.XXXXXX"))), t.size(), t.size(),
-		shellQuote(t.shellFormat()), shellQuote(owner), mode.Perm(), shellQuote(target))
+trap - EXIT`, ShellQuote(target), ShellQuote(notOption(path.Join(path.Dir(file), ".upload.XXXXXX"))), t.size(), t.size(),
+		ShellQuote(t.shellFormat()), ShellQuote(owner), mode.Perm(), ShellQuote(target))
 	res, err := c.Run(ctx, script, io.MultiReader(content, &lazyReader{open: func() io.Reader {
 		return strings.NewReader(t.after(content.n))
 	}}))

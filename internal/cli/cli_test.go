@@ -17,6 +17,8 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/moostackhq/moostack/internal/cli"
+	"github.com/moostackhq/moostack/internal/cluster"
+	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/secretstore"
 	"github.com/moostackhq/moostack/internal/terminal"
 )
@@ -34,6 +36,8 @@ type operator struct {
 	terminal  *scriptedTerminal
 	// version is the release version mooctl was built for.
 	version string
+	// nodeStatus, if set, answers for the nodes instead of SSH.
+	nodeStatus func(context.Context, cluster.Node) (nodeclient.Status, error)
 
 	mu sync.Mutex
 	// exits are the codes mooctl exited with after an interrupt.
@@ -113,10 +117,11 @@ func (o *operator) run(args ...string) result {
 	o.t.Helper()
 	var stdout, stderr bytes.Buffer
 	env := cli.Env{
-		Version: o.version,
-		Home:    o.home,
-		Stdout:  &stdout,
-		Stderr:  &stderr,
+		Version:    o.version,
+		Home:       o.home,
+		Stdout:     &stdout,
+		Stderr:     &stderr,
+		NodeStatus: o.nodeStatus,
 		Terminal: func(func(int)) (terminal.Terminal, io.Closer) {
 			if o.terminal == nil {
 				return nil, nil

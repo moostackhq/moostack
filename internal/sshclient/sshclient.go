@@ -30,8 +30,8 @@ type Options struct {
 	Getenv func(string) string
 	// Relay is the command that connects its stdin and stdout to a unix
 	// socket on the node, for DialUnix through sudo. It is given the
-	// socket's path quoted for the shell. Nil means DialUnix works only as
-	// root.
+	// socket's path as it is, and must quote it itself, with ShellQuote.
+	// Nil means DialUnix works only as root.
 	Relay func(socket string) string
 }
 
@@ -279,7 +279,7 @@ func (g *readGate) close() { g.closed.Store(true) }
 // asRoot is cmd run as root.
 func (c *Client) asRoot(cmd string) string {
 	if c.sudo {
-		return "sudo -n -- sh -c " + shellQuote(cmd)
+		return "sudo -n -- sh -c " + ShellQuote(cmd)
 	}
 	return cmd
 }

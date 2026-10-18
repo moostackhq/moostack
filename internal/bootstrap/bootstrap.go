@@ -1,6 +1,6 @@
 // Package bootstrap turns a host into a node over SSH: it checks the
-// host, installs containerd and the agent from a release as systemd
-// units, and removes them again if anything fails.
+// host, installs containerd, the updater and the agent from a release as
+// systemd units, and removes them again if anything fails.
 package bootstrap
 
 import (
@@ -25,8 +25,14 @@ import (
 // The systemd units that run the node components.
 const (
 	containerdUnit = "moostack-containerd.service"
+	updaterUnit    = "moostack-updater.service"
 	agentUnit      = "moostack-agent.service"
 )
+
+// units are the systemd units. systemd starts them together, the agent
+// after containerd. Uninstall stops them one by one in the reverse order,
+// the agent first.
+var units = []string{containerdUnit, updaterUnit, agentUnit}
 
 // hostFile is a file to write on the host.
 type hostFile struct{ path, content string }
@@ -39,7 +45,7 @@ var unitTemplates embed.FS
 
 // unitData is what the unit templates are executed with.
 type unitData struct {
-	BinDir, AgentBinary, ContainerdConfigFile, ContainerdUnit string
+	BinDir, AgentBinary, UpdaterBinary, ContainerdConfigFile, ContainerdUnit string
 }
 
 // unitFiles are the unit files to install, rendered from unitTemplates,
@@ -52,6 +58,7 @@ func renderUnits() []hostFile {
 	data := unitData{
 		BinDir:               hostlayout.BinDir,
 		AgentBinary:          hostlayout.Agent,
+		UpdaterBinary:        hostlayout.Updater,
 		ContainerdConfigFile: hostlayout.ContainerdConfigFile,
 		ContainerdUnit:       containerdUnit,
 	}
@@ -194,9 +201,9 @@ func checkNotNode(ctx context.Context, c *sshclient.Client) error {
 const healthTimeout = time.Minute
 
 // Install installs the components of rel for the host's architecture,
-// configured as node, starts them, and waits until the agent reports
-// them healthy at rel's versions. The host must have passed Check. If
-// Install fails, it rolls back.
+// configured as node, starts them, and waits until the agent and the
+// updater report them healthy at rel's versions. The host must have
+// passed Check. If Install fails, it rolls back.
 func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig) error {
 	if err := install(ctx, c, h, rel, node); err != nil {
 		return Rollback(ctx, c, err)
@@ -209,8 +216,8 @@ func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 // says so, and says what to stop and remove by hand.
 func Rollback(ctx context.Context, c *sshclient.Client, err error) error {
 	if rbErr := Uninstall(ctx, c); rbErr != nil {
-		return fmt.Errorf("%w; removing what was installed failed too, so stop "+agentUnit+" and "+containerdUnit+" and remove %s by hand: %v",
-			err, strings.Join(installed(), ", "), rbErr)
+		return fmt.Errorf("%w; removing what was installed failed too, so stop %s and remove %s by hand: %v",
+			err, strings.Join(units, ", "), strings.Join(installed(), ", "), rbErr)
 	}
 	return err
 }
@@ -243,24 +250,25 @@ func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 			return err
 		}
 	}
-	if _, err := output(ctx, c, "systemctl daemon-reload && systemctl enable --now "+containerdUnit+" "+agentUnit); err != nil {
+	if _, err := output(ctx, c, "systemctl daemon-reload && systemctl enable --now "+strings.Join(units, " ")); err != nil {
 		return err
 	}
 	return waitHealthy(ctx, c, rel)
 }
 
-// waitHealthy waits until the agent reports every component healthy at
-// the version rel pins, for up to healthTimeout, or until ctx ends.
+// waitHealthy waits until the agent and the updater report every
+// component healthy at the version rel pins, for up to healthTimeout, or
+// until ctx ends.
 func waitHealthy(parent context.Context, c *sshclient.Client, rel *release.Release) error {
-	agent, err := nodeclient.DialAgent(c)
+	node, err := nodeclient.Dial(c)
 	if err != nil {
 		return err
 	}
-	defer agent.Close()
+	defer node.Close()
 	ctx, cancel := context.WithTimeout(parent, healthTimeout)
 	defer cancel()
 	for {
-		err := healthy(ctx, agent, rel)
+		err := healthy(ctx, node, rel)
 		if err == nil {
 			return nil
 		}
@@ -275,15 +283,12 @@ func waitHealthy(parent context.Context, c *sshclient.Client, rel *release.Relea
 	}
 }
 
-// healthy fails unless the agent reports every component of rel healthy
-// at its pinned version.
-func healthy(ctx context.Context, agent *nodeclient.Agent, rel *release.Release) error {
+// healthy fails unless the agent and the updater report every component
+// of rel healthy at its pinned version.
+func healthy(ctx context.Context, node *nodeclient.Node, rel *release.Release) error {
 	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	status, err := agent.Status(callCtx, &nodev1.StatusRequest{})
-	if err != nil {
-		return err
-	}
+	status := node.Status(callCtx)
 	running := map[string]*nodev1.Component{}
 	for _, comp := range status.Components {
 		running[comp.Name] = comp
@@ -292,7 +297,7 @@ func healthy(ctx context.Context, agent *nodeclient.Agent, rel *release.Release)
 		got := running[want.Name]
 		switch {
 		case got == nil:
-			return fmt.Errorf("the agent doesn't report %s", want.Name)
+			return fmt.Errorf("the node doesn't report %s", want.Name)
 		case got.Health != nodev1.Health_HEALTH_HEALTHY:
 			return fmt.Errorf("%s is %s: %s", want.Name, nodeclient.HealthName(got.Health), got.Problem)
 		case got.Version != want.Version:
@@ -313,9 +318,11 @@ const uninstallTimeout = 2 * time.Minute
 func Uninstall(ctx context.Context, c *sshclient.Client) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), uninstallTimeout)
 	defer cancel()
-	units := agentUnit + " " + containerdUnit
+	stopOrder := slices.Clone(units)
+	slices.Reverse(stopOrder)
+	stopping := strings.Join(stopOrder, " ")
 	res, err := c.Run(ctx, `set -e
-for unit in `+units+`; do
+for unit in `+stopping+`; do
 	if [ "$(systemctl show -p LoadState --value "$unit")" != not-found ]; then
 		systemctl disable --now "$unit"
 	fi
@@ -327,7 +334,7 @@ for unit in `+units+`; do
 done
 rm -f `+strings.Join(unitPaths(), " ")+`
 systemctl daemon-reload
-systemctl reset-failed `+units+` 2>/dev/null || true
+systemctl reset-failed `+stopping+` 2>/dev/null || true
 rm -rf `+strings.Join(hostlayout.Dirs, " "), nil)
 	if err != nil {
 		return err

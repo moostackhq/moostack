@@ -7,11 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
-	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	versionv1 "github.com/containerd/containerd/api/services/version/v1"
@@ -21,6 +18,7 @@ import (
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/hostlayout"
+	"github.com/moostackhq/moostack/internal/rootsocket"
 )
 
 // Config says where the agent finds what it serves.
@@ -38,8 +36,7 @@ type Config struct {
 // containerdTimeout bounds asking containerd for its version.
 const containerdTimeout = 2 * time.Second
 
-// Serve serves the node API on cfg.Socket until ctx ends. It replaces a
-// socket left by an earlier agent.
+// Serve serves the node API on cfg.Socket until ctx ends.
 func Serve(ctx context.Context, cfg Config) error {
 	data, err := os.ReadFile(cfg.NodeFile)
 	if err != nil {
@@ -55,7 +52,7 @@ func Serve(ctx context.Context, cfg Config) error {
 	}
 	defer containerd.Close()
 
-	l, err := listen(cfg.Socket)
+	l, err := rootsocket.Listen(cfg.Socket)
 	if err != nil {
 		return err
 	}
@@ -67,27 +64,6 @@ func Serve(ctx context.Context, cfg Config) error {
 		return err
 	}
 	return nil
-}
-
-// listen listens on the unix socket at path, which only root can connect
-// to: the socket and its directory are root's alone.
-func listen(path string) (net.Listener, error) {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return nil, err
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	// The socket is created with the umask's mode, so no one else can
-	// connect between bind and chmod.
-	old := syscall.Umask(0o177)
-	l, err := net.Listen("unix", path)
-	syscall.Umask(old)
-	return l, err
 }
 
 // modes are the node API's modes by the node file's names for them.

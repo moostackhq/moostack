@@ -4,7 +4,8 @@
 // - protoc             v7.36.0
 // source: api/node/v1/node.proto
 
-// The node API: what a node's agent serves about that one node.
+// The node API: what a node's agent and updater serve about that one
+// node.
 
 package nodev1
 
@@ -122,6 +123,116 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Status",
 			Handler:    _Agent_Status_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "api/node/v1/node.proto",
+}
+
+const (
+	Updater_Status_FullMethodName = "/moostack.node.v1.Updater/Status"
+)
+
+// UpdaterClient is the client API for Updater service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Updater is the node API that the updater serves, on its own socket, so
+// that it answers whatever state the agent is in.
+type UpdaterClient interface {
+	// Status reports the updater's own state.
+	Status(ctx context.Context, in *UpdaterStatusRequest, opts ...grpc.CallOption) (*UpdaterStatusResponse, error)
+}
+
+type updaterClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewUpdaterClient(cc grpc.ClientConnInterface) UpdaterClient {
+	return &updaterClient{cc}
+}
+
+func (c *updaterClient) Status(ctx context.Context, in *UpdaterStatusRequest, opts ...grpc.CallOption) (*UpdaterStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdaterStatusResponse)
+	err := c.cc.Invoke(ctx, Updater_Status_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// UpdaterServer is the server API for Updater service.
+// All implementations must embed UnimplementedUpdaterServer
+// for forward compatibility.
+//
+// Updater is the node API that the updater serves, on its own socket, so
+// that it answers whatever state the agent is in.
+type UpdaterServer interface {
+	// Status reports the updater's own state.
+	Status(context.Context, *UpdaterStatusRequest) (*UpdaterStatusResponse, error)
+	mustEmbedUnimplementedUpdaterServer()
+}
+
+// UnimplementedUpdaterServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedUpdaterServer struct{}
+
+func (UnimplementedUpdaterServer) Status(context.Context, *UpdaterStatusRequest) (*UpdaterStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Status not implemented")
+}
+func (UnimplementedUpdaterServer) mustEmbedUnimplementedUpdaterServer() {}
+func (UnimplementedUpdaterServer) testEmbeddedByValue()                 {}
+
+// UnsafeUpdaterServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to UpdaterServer will
+// result in compilation errors.
+type UnsafeUpdaterServer interface {
+	mustEmbedUnimplementedUpdaterServer()
+}
+
+func RegisterUpdaterServer(s grpc.ServiceRegistrar, srv UpdaterServer) {
+	// If the following call panics, it indicates UnimplementedUpdaterServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&Updater_ServiceDesc, srv)
+}
+
+func _Updater_Status_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdaterStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(UpdaterServer).Status(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Updater_Status_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(UpdaterServer).Status(ctx, req.(*UpdaterStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// Updater_ServiceDesc is the grpc.ServiceDesc for Updater service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var Updater_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "moostack.node.v1.Updater",
+	HandlerType: (*UpdaterServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Status",
+			Handler:    _Updater_Status_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

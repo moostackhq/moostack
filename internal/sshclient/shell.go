@@ -5,8 +5,8 @@ import (
 	"strings"
 )
 
-// shellQuote quotes s as one word for the shell.
-func shellQuote(s string) string {
+// ShellQuote quotes s as one word for the shell.
+func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
