@@ -682,16 +682,6 @@ func TestSecretEditRepairsAValueFromAnotherDataKey(t *testing.T) {
 	}
 }
 
-// readFile reads path.
-func readFile(t *testing.T, path string) string {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(data)
-}
-
 // valueLine is the line holding the encrypted value of the secret called
 // name, in a store's file.
 func valueLine(t *testing.T, file, name string) string {

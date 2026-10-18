@@ -32,6 +32,8 @@ type operator struct {
 	key       string
 	recipient secretstore.Recipient
 	terminal  *scriptedTerminal
+	// version is the release version mooctl was built for.
+	version string
 
 	mu sync.Mutex
 	// exits are the codes mooctl exited with after an interrupt.
@@ -51,7 +53,7 @@ func (o *operator) exitCodes() []int {
 // .pub has comment, and an empty cluster directory.
 func newOperator(t *testing.T, comment string) *operator {
 	t.Helper()
-	o := &operator{t: t, home: t.TempDir(), dir: t.TempDir(), terminal: &scriptedTerminal{}}
+	o := &operator{t: t, home: t.TempDir(), dir: t.TempDir(), terminal: &scriptedTerminal{}, version: "1.2.3"}
 	o.key = filepath.Join(o.home, ".ssh", "id_ed25519")
 	o.recipient = writeKey(t, o.key, comment)
 	return o
@@ -79,6 +81,16 @@ func writeKey(t *testing.T, path, comment string) secretstore.Recipient {
 	return r
 }
 
+// readFile reads path.
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
 // writeFile writes data to path, making its directory.
 func writeFile(t *testing.T, path string, data []byte) {
 	t.Helper()
@@ -101,9 +113,10 @@ func (o *operator) run(args ...string) result {
 	o.t.Helper()
 	var stdout, stderr bytes.Buffer
 	env := cli.Env{
-		Home:   o.home,
-		Stdout: &stdout,
-		Stderr: &stderr,
+		Version: o.version,
+		Home:    o.home,
+		Stdout:  &stdout,
+		Stderr:  &stderr,
 		Terminal: func(func(int)) (terminal.Terminal, io.Closer) {
 			if o.terminal == nil {
 				return nil, nil

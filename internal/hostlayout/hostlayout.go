@@ -1,0 +1,99 @@
+// Package hostlayout is where Moostack keeps its files on a node's host,
+// and the files that mooctl writes there for the node components.
+package hostlayout
+
+import (
+	"errors"
+	"fmt"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/moostackhq/moostack/internal/strictyaml"
+)
+
+// The directories Moostack keeps on a host. Nothing else of Moostack's is
+// on the host, apart from its systemd units.
+const (
+	Root      = "/opt/moostack"
+	ConfigDir = "/etc/moostack"
+	StateDir  = "/var/lib/moostack"
+	RunDir    = "/run/moostack"
+)
+
+// Dirs are the directories Moostack keeps on a host.
+var Dirs = []string{Root, ConfigDir, StateDir, RunDir}
+
+const (
+	// BinDir holds the node components' binaries.
+	BinDir = Root + "/bin"
+	// Agent is the agent's binary.
+	Agent = BinDir + "/agent"
+	// AgentSocket is where the agent serves the node API, to root only.
+	AgentSocket = RunDir + "/agent.sock"
+	// NodeFile is the node's NodeConfig.
+	NodeFile = ConfigDir + "/node.yml"
+	// ContainerdConfigFile is containerd's config, ContainerdConfig.
+	ContainerdConfigFile = ConfigDir + "/containerd.toml"
+	// ContainerdSocket is where containerd serves its API.
+	ContainerdSocket = RunDir + "/containerd/containerd.sock"
+)
+
+// ContainerdConfig keeps containerd's files and sockets under Moostack's
+// directories, and reads no other config, so it doesn't clash with
+// another containerd on the host. Kubernetes' CRI and NRI are off.
+const ContainerdConfig = `version = 4
+root = "` + StateDir + `/containerd"
+state = "` + RunDir + `/containerd"
+imports = []
+disabled_plugins = [
+  "io.containerd.grpc.v1.cri",
+  "io.containerd.cri.v1.images",
+  "io.containerd.cri.v1.runtime",
+  "io.containerd.podsandbox.controller.v1.podsandbox",
+  "io.containerd.nri.v1.nri",
+]
+
+[plugins."io.containerd.server.v1.grpc"]
+  address = "` + ContainerdSocket + `"
+  uid = 0
+  gid = 0
+
+[plugins."io.containerd.server.v1.ttrpc"]
+  address = "` + ContainerdSocket + `.ttrpc"
+  uid = 0
+  gid = 0
+
+[plugins."io.containerd.internal.v1.opt"]
+  path = "` + StateDir + `/containerd-opt"
+`
+
+// ModeDirect is the mode of a node operated by mooctl over SSH.
+const ModeDirect = "direct"
+
+// NodeConfig is what the node knows about itself.
+type NodeConfig struct {
+	// Cluster is the cluster's name.
+	Cluster string `yaml:"cluster"`
+	// Node is the node's name.
+	Node string `yaml:"node"`
+	// Mode is the mode of the node's cluster, ModeDirect for now.
+	Mode string `yaml:"mode"`
+}
+
+// Marshal is c as the node file holds it.
+func (c NodeConfig) Marshal() ([]byte, error) { return yaml.Marshal(c) }
+
+// ParseNodeConfig parses a node file.
+func ParseNodeConfig(data []byte) (NodeConfig, error) {
+	var c NodeConfig
+	if err := strictyaml.Unmarshal(data, &c); err != nil {
+		return NodeConfig{}, fmt.Errorf("node file: %w", err)
+	}
+	if c.Cluster == "" || c.Node == "" {
+		return NodeConfig{}, errors.New("node file: no cluster or node name")
+	}
+	if c.Mode != ModeDirect {
+		return NodeConfig{}, fmt.Errorf("node file: unknown mode %q", c.Mode)
+	}
+	return c, nil
+}

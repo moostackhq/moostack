@@ -2,19 +2,34 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/user"
+	"path/filepath"
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/moostackhq/moostack/internal/buildinfo"
+	"github.com/moostackhq/moostack/internal/cluster"
+	"github.com/moostackhq/moostack/internal/nodeclient"
+	"github.com/moostackhq/moostack/internal/release"
+	"github.com/moostackhq/moostack/internal/sshclient"
+	"github.com/moostackhq/moostack/internal/sshconfig"
 	"github.com/moostackhq/moostack/internal/terminal"
 )
 
 // Env is what mooctl's commands take from the machine they run on.
 type Env struct {
+	// Version is the Moostack release this mooctl belongs to, empty if it
+	// wasn't built by the release build.
+	Version string
 	// Home is the operator's home directory.
 	Home string
+	// LocalUser is the operator's user name on this machine, the SSH user
+	// when neither the target nor the SSH config names one.
+	LocalUser string
 	// Stdout is where results are printed.
 	Stdout io.Writer
 	// Stderr is where warnings and problems are printed.
@@ -34,12 +49,18 @@ func OSEnv() (Env, error) {
 	if err != nil {
 		return Env{}, err
 	}
+	u, err := user.Current()
+	if err != nil {
+		return Env{}, err
+	}
 	return Env{
-		Home:     home,
-		Stdout:   os.Stdout,
-		Stderr:   os.Stderr,
-		Terminal: terminal.Open,
-		Exit:     os.Exit,
+		Version:   buildinfo.Version,
+		Home:      home,
+		LocalUser: u.Username,
+		Stdout:    os.Stdout,
+		Stderr:    os.Stderr,
+		Terminal:  terminal.Open,
+		Exit:      os.Exit,
 	}, nil
 }
 
@@ -57,8 +78,15 @@ func New(env Env) *cli.Command {
 				Usage:   "the cluster directory",
 				Value:   ".",
 			},
+			&cli.StringFlag{
+				Name:    "release-source",
+				Usage:   "the directory of Moostack releases to install from, such as the release build's dist/releases",
+				Sources: cli.EnvVars("MOOCTL_RELEASE_SOURCE"),
+			},
 		},
 		Commands: []*cli.Command{
+			clusterCommand(env),
+			nodeCommand(env),
 			secretCommand(env),
 		},
 	}
@@ -78,4 +106,28 @@ func plural(n int, thing string) string {
 		return "1 " + thing
 	}
 	return fmt.Sprintf("%d %ss", n, thing)
+}
+
+// sshOptions are the options mooctl connects to nodes with: the
+// operator's SSH config and ssh-agent, and the agent's relay to reach its
+// socket through sudo.
+func sshOptions(env Env) sshclient.Options {
+	return sshclient.Options{
+		SSH: sshconfig.Options{
+			UserConfig:   filepath.Join(env.Home, ".ssh", "config"),
+			SystemConfig: "/etc/ssh/ssh_config",
+			LocalUser:    env.LocalUser,
+			Home:         env.Home,
+		},
+		Relay: nodeclient.Relay,
+	}
+}
+
+// openRelease opens the cluster's pinned release in the release source.
+func openRelease(cmd *cli.Command, d *cluster.Dir) (*release.Release, error) {
+	source := cmd.String("release-source")
+	if source == "" {
+		return nil, errors.New("no release source; pass --release-source or set MOOCTL_RELEASE_SOURCE to a directory of releases")
+	}
+	return release.Open(source, d.Cluster.Release)
 }

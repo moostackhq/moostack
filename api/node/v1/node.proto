@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+// The node API: what a node's agent serves about that one node.
+package moostack.node.v1;
+
+option go_package = "github.com/moostackhq/moostack/api/node/v1;nodev1";
+
+// Agent is the node API that the agent serves.
+service Agent {
+  // Status reports the node's mode and the state of its node components.
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  Mode mode = 1;
+  // Components are the node components, the agent among them.
+  repeated Component components = 2;
+}
+
+// Mode is how the node is operated.
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  // MODE_DIRECT is operated by mooctl over SSH.
+  MODE_DIRECT = 1;
+}
+
+// Component is a node component as the agent sees it.
+message Component {
+  // Name is agent or containerd.
+  string name = 1;
+  // Version is empty when the agent can't tell it.
+  string version = 2;
+  Health health = 3;
+  // Problem says why the component is unhealthy.
+  string problem = 4;
+}
+
+enum Health {
+  HEALTH_UNSPECIFIED = 0;
+  HEALTH_HEALTHY = 1;
+  HEALTH_UNHEALTHY = 2;
+}

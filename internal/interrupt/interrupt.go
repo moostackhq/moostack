@@ -4,8 +4,10 @@
 package interrupt
 
 import (
+	"context"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 )
 
@@ -94,4 +96,37 @@ func (g *Guard) Stop() {
 	signal.Stop(g.signals)
 	close(g.done)
 	<-g.finished
+}
+
+// Context is parent, canceled when the first of the signals that end a
+// command arrives, until stop is called. That signal doesn't end the
+// program, so that the caller can undo what it was doing when ctx ends.
+// A second signal calls exit with 128 plus its number, even if the
+// undoing hangs.
+func Context(parent context.Context, exit func(code int)) (ctx context.Context, stop func()) {
+	ctx, cancel := context.WithCancel(parent)
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, stopSignals...)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-signals:
+			cancel()
+		case <-done:
+			return
+		}
+		select {
+		case sig := <-signals:
+			exit(exitCode(sig))
+		case <-done:
+		}
+	}()
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			signal.Stop(signals)
+			close(done)
+			cancel()
+		})
+	}
 }

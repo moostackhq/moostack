@@ -3,6 +3,7 @@
 package interrupt_test
 
 import (
+	"context"
 	"os"
 	"syscall"
 	"testing"
@@ -110,4 +111,45 @@ func TestASecondSignalExitsWhileTheCleanupHangs(t *testing.T) {
 	signal(t, syscall.SIGTERM)
 
 	e.wantExit(t, 128+int(syscall.SIGTERM))
+}
+
+func TestContextEndsOnASignalWithoutExiting(t *testing.T) {
+	for _, sig := range []syscall.Signal{syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP} {
+		e := make(exits, 1)
+		ctx, stop := interrupt.Context(context.Background(), e.exit)
+		signal(t, sig)
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+			t.Errorf("%v didn't end the context", sig)
+		}
+		e.wantNoExit(t)
+		stop()
+	}
+}
+
+func TestContextExitsOnASecondSignal(t *testing.T) {
+	e := make(exits, 1)
+	ctx, stop := interrupt.Context(context.Background(), e.exit)
+	defer stop()
+	signal(t, syscall.SIGINT)
+	<-ctx.Done()
+	signal(t, syscall.SIGTERM)
+	e.wantExit(t, 128+int(syscall.SIGTERM))
+}
+
+func TestContextAfterStopLeavesSignalsAlone(t *testing.T) {
+	e := make(exits, 1)
+	ctx, stop := interrupt.Context(context.Background(), e.exit)
+	stop()
+	if ctx.Err() == nil {
+		t.Error("stop didn't end the context")
+	}
+	// A later Context sees the signal, not the stopped one.
+	later := make(exits, 1)
+	ctx2, stop2 := interrupt.Context(context.Background(), later.exit)
+	defer stop2()
+	signal(t, syscall.SIGINT)
+	<-ctx2.Done()
+	e.wantNoExit(t)
 }
