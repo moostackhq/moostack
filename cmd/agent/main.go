@@ -38,6 +38,7 @@ func run(args []string) error {
 			Version:          buildinfo.Version,
 			Socket:           hostlayout.AgentSocket,
 			NodeFile:         hostlayout.NodeFile,
+			GenerationFile:   hostlayout.GenerationFile,
 			ContainerdSocket: hostlayout.ContainerdSocket,
 			Identity:         hostlayout.Identity,
 			PeerPort:         hostlayout.PeerPort,

@@ -78,6 +78,8 @@ type secretSession struct {
 	path     string
 	terminal terminal.Terminal
 	args     []string
+	// changed says the command changed the store.
+	changed bool
 }
 
 // anyArgs is the nargs of a command that takes any number of arguments.
@@ -95,13 +97,20 @@ func secretAction(env Env, nargs int, run func(*secretSession) error) cli.Action
 		}
 		t, closeTerminal := openTerminal(env)
 		defer closeTerminal()
-		return run(&secretSession{
+		s := &secretSession{
 			env:      env,
 			cmd:      cmd,
 			path:     filepath.Join(cmd.String("dir"), secretstore.FileName),
 			terminal: t,
 			args:     cmd.Args().Slice(),
-		})
+		}
+		if err := run(s); err != nil {
+			return err
+		}
+		if s.changed {
+			remindToCommit(env)
+		}
+		return nil
 	}
 }
 
@@ -127,7 +136,11 @@ func (s *secretSession) save(store *secretstore.Store, again string) error {
 	if errors.Is(err, secretstore.ErrChanged) {
 		return fmt.Errorf("%w; %s", err, again)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	s.changed = true
+	return nil
 }
 
 // secretInit is mooctl secret init.
@@ -139,6 +152,7 @@ func secretInit(s *secretSession) error {
 	if _, err := secretstore.Init(s.path, r); err != nil {
 		return err
 	}
+	s.changed = true
 	fmt.Fprintf(s.env.Stdout, "Created %s for %s %s\n", s.path, r.Fingerprint(), r.Comment)
 	changed, err := secretstore.IgnoreLockFile(filepath.Dir(s.path))
 	if err != nil {

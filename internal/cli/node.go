@@ -15,6 +15,7 @@ import (
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/interrupt"
+	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/secretstore"
 	"github.com/moostackhq/moostack/internal/sshclient"
 	"github.com/moostackhq/moostack/internal/sshconfig"
@@ -39,6 +40,7 @@ func nodeCommand(env Env) *cli.Command {
 						Name:  "name",
 						Usage: "the node's name, instead of the first free one of node1, node2 and so on",
 					},
+					forceFlag,
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if err := wantArgs(cmd, 1); err != nil {
@@ -69,6 +71,11 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	cl, err := preflight(ctx, env, cmd, d)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
 	ca, err := openCA(env, cmd, d)
 	if err != nil {
 		return err
@@ -132,12 +139,36 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 		}
 		return fmt.Errorf("adding %s: %w", name, err)
 	}
-	if err := d.AddNode(n); err != nil {
+	generation := cl.Next(d.Cluster.Generation)
+	if err := d.AddNode(n, generation); err != nil {
 		return bootstrap.Rollback(ctx, c, fmt.Errorf("recording %s: %w", name, err))
 	}
-	fmt.Fprintf(env.Stdout, "Added node %s\n", name)
+	fmt.Fprintf(env.Stdout, "Added node %s, at generation %d of the cluster directory\n", name, generation)
+	remindToCommit(env)
+	// The other nodes record the generation even if the new node can't
+	// be reached to.
+	if node, err := nodeclient.Dial(c); err != nil {
+		cl.Add(name, unreachedNode{err})
+	} else {
+		cl.Add(name, node)
+	}
+	if err := cl.Record(ctx, generation); err != nil {
+		return fmt.Errorf("added %s, but cluster status shows these nodes behind until an operation that changes the cluster directory records its generation: %w", name, err)
+	}
 	return nil
 }
+
+// unreachedNode is a node whose node API couldn't be reached, with why.
+// It fails whatever it is asked to do.
+type unreachedNode struct{ err error }
+
+func (n unreachedNode) Status(context.Context) nodeclient.Status {
+	return nodeclient.Status{AgentErr: n.err, UpdaterErr: n.err}
+}
+
+func (n unreachedNode) RecordGeneration(context.Context, int64, []string) error { return n.err }
+
+func (n unreachedNode) Close() error { return nil }
 
 // openCA opens the cluster CA of d, reading its key from the secret
 // store with the operator's key. An operator who isn't a recipient gets

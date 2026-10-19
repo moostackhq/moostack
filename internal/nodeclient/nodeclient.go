@@ -75,8 +75,21 @@ func (n *Node) Close() error {
 
 // Status is what a node's agent and updater report together.
 type Status struct {
+	// AgentErr says why the agent didn't answer, nil if it did.
+	AgentErr error
+	// UpdaterErr says why the updater didn't answer, nil if it did.
+	UpdaterErr error
 	// Mode is unspecified if the agent didn't answer.
 	Mode nodev1.Mode
+	// Generation is the generation of the cluster directory that the node
+	// last applied, 0 if none, and Nodes are the names of that
+	// directory's nodes. Both are unknown, and zero, if the agent didn't
+	// answer or GenerationUnknown says why the node can't tell.
+	Generation int64
+	Nodes      []string
+	// GenerationUnknown says why the node can't tell the generation it
+	// last applied, empty if it can.
+	GenerationUnknown string
 	// Components are the agent's components and the updater. The agent
 	// or the updater that didn't answer is unhealthy, with why as its
 	// problem, and the components only the agent reports are missing.
@@ -100,12 +113,15 @@ func (n *Node) Status(ctx context.Context) Status {
 	}
 	var s Status
 	if agentErr != nil {
+		s.AgentErr = agentErr
 		s.Components = append(s.Components, notAnswering("agent", agentErr))
 	} else {
 		s.Mode = agent.Mode
+		s.Generation, s.Nodes, s.GenerationUnknown = agent.Generation, agent.Nodes, agent.GenerationUnknown
 		s.Components = append(s.Components, agent.Components...)
 	}
 	if updaterErr != nil {
+		s.UpdaterErr = updaterErr
 		s.Components = append(s.Components, notAnswering("updater", updaterErr))
 	} else {
 		s.Components = append(s.Components, updater.Updater)
@@ -113,17 +129,34 @@ func (n *Node) Status(ctx context.Context) Status {
 	return s
 }
 
+// KnownGeneration is the generation the node last applied, and whether
+// it is known: whether the agent answered and could tell.
+func (s Status) KnownGeneration() (int64, bool) {
+	if s.AgentErr != nil || s.GenerationUnknown != "" {
+		return 0, false
+	}
+	return s.Generation, true
+}
+
+// RecordGeneration has the agent record generation, of a cluster
+// directory of the nodes called nodes, as the one the node has applied.
+func (n *Node) RecordGeneration(ctx context.Context, generation int64, nodes []string) error {
+	_, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: generation, Nodes: nodes})
+	return err
+}
+
 // notAnswering is the program that didn't answer with err.
 func notAnswering(name string, err error) *nodev1.Component {
 	return &nodev1.Component{Name: name, Health: nodev1.Health_HEALTH_UNHEALTHY, Problem: fmt.Sprintf("the %s doesn't answer: %v", name, err)}
 }
 
-// ModeName is mode as mooctl shows it: "-" when the mode isn't known.
+// ModeName is mode as mooctl shows it, such as "control plane": "-" when
+// the mode isn't known.
 func ModeName(mode nodev1.Mode) string {
 	if mode == nodev1.Mode_MODE_UNSPECIFIED {
 		return "-"
 	}
-	return strings.ToLower(strings.TrimPrefix(mode.String(), "MODE_"))
+	return strings.ReplaceAll(strings.ToLower(strings.TrimPrefix(mode.String(), "MODE_")), "_", " ")
 }
 
 // HealthName is health as mooctl shows it: "unknown" when the health

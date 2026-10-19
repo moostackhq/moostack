@@ -31,6 +31,8 @@ const (
 	Mode_MODE_UNSPECIFIED Mode = 0
 	// MODE_DIRECT is operated by mooctl over SSH.
 	Mode_MODE_DIRECT Mode = 1
+	// MODE_CONTROL_PLANE is operated by a control plane.
+	Mode_MODE_CONTROL_PLANE Mode = 2
 )
 
 // Enum value maps for Mode.
@@ -38,10 +40,12 @@ var (
 	Mode_name = map[int32]string{
 		0: "MODE_UNSPECIFIED",
 		1: "MODE_DIRECT",
+		2: "MODE_CONTROL_PLANE",
 	}
 	Mode_value = map[string]int32{
-		"MODE_UNSPECIFIED": 0,
-		"MODE_DIRECT":      1,
+		"MODE_UNSPECIFIED":   0,
+		"MODE_DIRECT":        1,
+		"MODE_CONTROL_PLANE": 2,
 	}
 )
 
@@ -162,9 +166,19 @@ type StatusResponse struct {
 	Mode  Mode                   `protobuf:"varint,1,opt,name=mode,proto3,enum=moostack.node.v1.Mode" json:"mode,omitempty"`
 	// Components are the node components, the agent among them. The
 	// updater reports itself.
-	Components    []*Component `protobuf:"bytes,2,rep,name=components,proto3" json:"components,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Components []*Component `protobuf:"bytes,2,rep,name=components,proto3" json:"components,omitempty"`
+	// Generation is the generation of the cluster directory that the node
+	// last applied, 0 if none or if generation_unknown says why the node
+	// can't tell.
+	Generation int64 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
+	// Nodes are the names of the nodes in the cluster directory at that
+	// generation.
+	Nodes []string `protobuf:"bytes,4,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	// GenerationUnknown says why the node can't tell the generation it last
+	// applied, such as a file it can't read. It is empty when it can.
+	GenerationUnknown string `protobuf:"bytes,5,opt,name=generation_unknown,json=generationUnknown,proto3" json:"generation_unknown,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *StatusResponse) Reset() {
@@ -211,6 +225,120 @@ func (x *StatusResponse) GetComponents() []*Component {
 	return nil
 }
 
+func (x *StatusResponse) GetGeneration() int64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetNodes() []string {
+	if x != nil {
+		return x.Nodes
+	}
+	return nil
+}
+
+func (x *StatusResponse) GetGenerationUnknown() string {
+	if x != nil {
+		return x.GenerationUnknown
+	}
+	return ""
+}
+
+// RecordGenerationRequest is a generation of the cluster directory that
+// the node has applied.
+type RecordGenerationRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Generation is the cluster directory's generation.
+	Generation int64 `protobuf:"varint,1,opt,name=generation,proto3" json:"generation,omitempty"`
+	// Nodes are the names of the nodes in the cluster directory at that
+	// generation.
+	Nodes         []string `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RecordGenerationRequest) Reset() {
+	*x = RecordGenerationRequest{}
+	mi := &file_api_node_v1_node_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RecordGenerationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RecordGenerationRequest) ProtoMessage() {}
+
+func (x *RecordGenerationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RecordGenerationRequest.ProtoReflect.Descriptor instead.
+func (*RecordGenerationRequest) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *RecordGenerationRequest) GetGeneration() int64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *RecordGenerationRequest) GetNodes() []string {
+	if x != nil {
+		return x.Nodes
+	}
+	return nil
+}
+
+type RecordGenerationResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RecordGenerationResponse) Reset() {
+	*x = RecordGenerationResponse{}
+	mi := &file_api_node_v1_node_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RecordGenerationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RecordGenerationResponse) ProtoMessage() {}
+
+func (x *RecordGenerationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RecordGenerationResponse.ProtoReflect.Descriptor instead.
+func (*RecordGenerationResponse) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{3}
+}
+
 type UpdaterStatusRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -219,7 +347,7 @@ type UpdaterStatusRequest struct {
 
 func (x *UpdaterStatusRequest) Reset() {
 	*x = UpdaterStatusRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[2]
+	mi := &file_api_node_v1_node_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -231,7 +359,7 @@ func (x *UpdaterStatusRequest) String() string {
 func (*UpdaterStatusRequest) ProtoMessage() {}
 
 func (x *UpdaterStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[2]
+	mi := &file_api_node_v1_node_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -244,7 +372,7 @@ func (x *UpdaterStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdaterStatusRequest.ProtoReflect.Descriptor instead.
 func (*UpdaterStatusRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{2}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{4}
 }
 
 type UpdaterStatusResponse struct {
@@ -257,7 +385,7 @@ type UpdaterStatusResponse struct {
 
 func (x *UpdaterStatusResponse) Reset() {
 	*x = UpdaterStatusResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[3]
+	mi := &file_api_node_v1_node_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -269,7 +397,7 @@ func (x *UpdaterStatusResponse) String() string {
 func (*UpdaterStatusResponse) ProtoMessage() {}
 
 func (x *UpdaterStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[3]
+	mi := &file_api_node_v1_node_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -282,7 +410,7 @@ func (x *UpdaterStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdaterStatusResponse.ProtoReflect.Descriptor instead.
 func (*UpdaterStatusResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{3}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *UpdaterStatusResponse) GetUpdater() *Component {
@@ -308,7 +436,7 @@ type Component struct {
 
 func (x *Component) Reset() {
 	*x = Component{}
-	mi := &file_api_node_v1_node_proto_msgTypes[4]
+	mi := &file_api_node_v1_node_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -320,7 +448,7 @@ func (x *Component) String() string {
 func (*Component) ProtoMessage() {}
 
 func (x *Component) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[4]
+	mi := &file_api_node_v1_node_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -333,7 +461,7 @@ func (x *Component) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Component.ProtoReflect.Descriptor instead.
 func (*Component) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{4}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Component) GetName() string {
@@ -369,12 +497,23 @@ var File_api_node_v1_node_proto protoreflect.FileDescriptor
 const file_api_node_v1_node_proto_rawDesc = "" +
 	"\n" +
 	"\x16api/node/v1/node.proto\x12\x10moostack.node.v1\"\x0f\n" +
-	"\rStatusRequest\"y\n" +
+	"\rStatusRequest\"\xde\x01\n" +
 	"\x0eStatusResponse\x12*\n" +
 	"\x04mode\x18\x01 \x01(\x0e2\x16.moostack.node.v1.ModeR\x04mode\x12;\n" +
 	"\n" +
 	"components\x18\x02 \x03(\v2\x1b.moostack.node.v1.ComponentR\n" +
-	"components\"\x16\n" +
+	"components\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x03 \x01(\x03R\n" +
+	"generation\x12\x14\n" +
+	"\x05nodes\x18\x04 \x03(\tR\x05nodes\x12-\n" +
+	"\x12generation_unknown\x18\x05 \x01(\tR\x11generationUnknown\"O\n" +
+	"\x17RecordGenerationRequest\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x01 \x01(\x03R\n" +
+	"generation\x12\x14\n" +
+	"\x05nodes\x18\x02 \x03(\tR\x05nodes\"\x1a\n" +
+	"\x18RecordGenerationResponse\"\x16\n" +
 	"\x14UpdaterStatusRequest\"N\n" +
 	"\x15UpdaterStatusResponse\x125\n" +
 	"\aupdater\x18\x01 \x01(\v2\x1b.moostack.node.v1.ComponentR\aupdater\"\x85\x01\n" +
@@ -382,16 +521,18 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x120\n" +
 	"\x06health\x18\x03 \x01(\x0e2\x18.moostack.node.v1.HealthR\x06health\x12\x18\n" +
-	"\aproblem\x18\x04 \x01(\tR\aproblem*-\n" +
+	"\aproblem\x18\x04 \x01(\tR\aproblem*E\n" +
 	"\x04Mode\x12\x14\n" +
 	"\x10MODE_UNSPECIFIED\x10\x00\x12\x0f\n" +
-	"\vMODE_DIRECT\x10\x01*J\n" +
+	"\vMODE_DIRECT\x10\x01\x12\x16\n" +
+	"\x12MODE_CONTROL_PLANE\x10\x02*J\n" +
 	"\x06Health\x12\x16\n" +
 	"\x12HEALTH_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eHEALTH_HEALTHY\x10\x01\x12\x14\n" +
-	"\x10HEALTH_UNHEALTHY\x10\x022T\n" +
+	"\x10HEALTH_UNHEALTHY\x10\x022\xbf\x01\n" +
 	"\x05Agent\x12K\n" +
-	"\x06Status\x12\x1f.moostack.node.v1.StatusRequest\x1a .moostack.node.v1.StatusResponse2d\n" +
+	"\x06Status\x12\x1f.moostack.node.v1.StatusRequest\x1a .moostack.node.v1.StatusResponse\x12i\n" +
+	"\x10RecordGeneration\x12).moostack.node.v1.RecordGenerationRequest\x1a*.moostack.node.v1.RecordGenerationResponse2d\n" +
 	"\aUpdater\x12Y\n" +
 	"\x06Status\x12&.moostack.node.v1.UpdaterStatusRequest\x1a'.moostack.node.v1.UpdaterStatusResponseB3Z1github.com/moostackhq/moostack/api/node/v1;nodev1b\x06proto3"
 
@@ -408,27 +549,31 @@ func file_api_node_v1_node_proto_rawDescGZIP() []byte {
 }
 
 var file_api_node_v1_node_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_api_node_v1_node_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_api_node_v1_node_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_api_node_v1_node_proto_goTypes = []any{
-	(Mode)(0),                     // 0: moostack.node.v1.Mode
-	(Health)(0),                   // 1: moostack.node.v1.Health
-	(*StatusRequest)(nil),         // 2: moostack.node.v1.StatusRequest
-	(*StatusResponse)(nil),        // 3: moostack.node.v1.StatusResponse
-	(*UpdaterStatusRequest)(nil),  // 4: moostack.node.v1.UpdaterStatusRequest
-	(*UpdaterStatusResponse)(nil), // 5: moostack.node.v1.UpdaterStatusResponse
-	(*Component)(nil),             // 6: moostack.node.v1.Component
+	(Mode)(0),                        // 0: moostack.node.v1.Mode
+	(Health)(0),                      // 1: moostack.node.v1.Health
+	(*StatusRequest)(nil),            // 2: moostack.node.v1.StatusRequest
+	(*StatusResponse)(nil),           // 3: moostack.node.v1.StatusResponse
+	(*RecordGenerationRequest)(nil),  // 4: moostack.node.v1.RecordGenerationRequest
+	(*RecordGenerationResponse)(nil), // 5: moostack.node.v1.RecordGenerationResponse
+	(*UpdaterStatusRequest)(nil),     // 6: moostack.node.v1.UpdaterStatusRequest
+	(*UpdaterStatusResponse)(nil),    // 7: moostack.node.v1.UpdaterStatusResponse
+	(*Component)(nil),                // 8: moostack.node.v1.Component
 }
 var file_api_node_v1_node_proto_depIdxs = []int32{
 	0, // 0: moostack.node.v1.StatusResponse.mode:type_name -> moostack.node.v1.Mode
-	6, // 1: moostack.node.v1.StatusResponse.components:type_name -> moostack.node.v1.Component
-	6, // 2: moostack.node.v1.UpdaterStatusResponse.updater:type_name -> moostack.node.v1.Component
+	8, // 1: moostack.node.v1.StatusResponse.components:type_name -> moostack.node.v1.Component
+	8, // 2: moostack.node.v1.UpdaterStatusResponse.updater:type_name -> moostack.node.v1.Component
 	1, // 3: moostack.node.v1.Component.health:type_name -> moostack.node.v1.Health
 	2, // 4: moostack.node.v1.Agent.Status:input_type -> moostack.node.v1.StatusRequest
-	4, // 5: moostack.node.v1.Updater.Status:input_type -> moostack.node.v1.UpdaterStatusRequest
-	3, // 6: moostack.node.v1.Agent.Status:output_type -> moostack.node.v1.StatusResponse
-	5, // 7: moostack.node.v1.Updater.Status:output_type -> moostack.node.v1.UpdaterStatusResponse
-	6, // [6:8] is the sub-list for method output_type
-	4, // [4:6] is the sub-list for method input_type
+	4, // 5: moostack.node.v1.Agent.RecordGeneration:input_type -> moostack.node.v1.RecordGenerationRequest
+	6, // 6: moostack.node.v1.Updater.Status:input_type -> moostack.node.v1.UpdaterStatusRequest
+	3, // 7: moostack.node.v1.Agent.Status:output_type -> moostack.node.v1.StatusResponse
+	5, // 8: moostack.node.v1.Agent.RecordGeneration:output_type -> moostack.node.v1.RecordGenerationResponse
+	7, // 9: moostack.node.v1.Updater.Status:output_type -> moostack.node.v1.UpdaterStatusResponse
+	7, // [7:10] is the sub-list for method output_type
+	4, // [4:7] is the sub-list for method input_type
 	4, // [4:4] is the sub-list for extension type_name
 	4, // [4:4] is the sub-list for extension extendee
 	0, // [0:4] is the sub-list for field type_name
@@ -445,7 +590,7 @@ func file_api_node_v1_node_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_node_v1_node_proto_rawDesc), len(file_api_node_v1_node_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   5,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

@@ -120,7 +120,7 @@ func Start(t *testing.T) *Node {
 
 	var script strings.Builder
 	for _, p := range programs {
-		fmt.Fprintf(&script, "%s >/var/log/%s.log 2>&1 & echo $! >/run/%[2]s.pid\n", p.command, p.name)
+		script.WriteString(startScript(p.name, p.command))
 	}
 	if out, err := exec.Command("docker", "exec", n.Name, "sh", "-c", script.String()).CombinedOutput(); err != nil {
 		t.Fatalf("starting the node's programs: %v\n%s", err, out)
@@ -305,6 +305,30 @@ func (n *Node) EventuallyHealthy(t *testing.T) *nodev1.StatusResponse {
 func (n *Node) Kill(t *testing.T, program string) {
 	t.Helper()
 	n.Exec(t, "root", "sh", "-c", "kill $(cat /run/"+program+".pid)")
+}
+
+// Restart stops one of the node's programs, waits for it to exit, and
+// starts it again.
+func (n *Node) Restart(t *testing.T, program string) {
+	t.Helper()
+	for _, p := range programs {
+		if p.name == program {
+			// Nothing reaps the program once it exits, so it is gone
+			// when it is a zombie.
+			n.Exec(t, "root", "sh", "-c", "pid=$(cat /run/"+program+".pid); kill $pid\n"+
+				"while [ -e /proc/$pid ] && [ \"$(cut -d' ' -f3 /proc/$pid/stat)\" != Z ]; do sleep 0.1; done\n"+
+				startScript(p.name, p.command))
+			return
+		}
+	}
+	t.Fatalf("the node has no program %s", program)
+}
+
+// startScript is the shell line that starts the program name with
+// command in the background, with its pid in /run/<name>.pid and its
+// output appended to /var/log/<name>.log.
+func startScript(name, command string) string {
+	return fmt.Sprintf("%s >>/var/log/%s.log 2>&1 & echo $! >/run/%[2]s.pid\n", command, name)
 }
 
 // Exec runs args in the node as user, failing the test if it fails.

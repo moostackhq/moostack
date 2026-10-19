@@ -6,20 +6,26 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	versionv1 "github.com/containerd/containerd/api/services/version/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
@@ -36,6 +42,9 @@ type Config struct {
 	Socket string
 	// NodeFile is the node's hostlayout.NodeConfig.
 	NodeFile string
+	// GenerationFile holds the generation the node last applied. Its
+	// directory must exist.
+	GenerationFile string
 	// ContainerdSocket is where containerd serves its API.
 	ContainerdSocket string
 	// Identity is the node's identity, which it proves to its peers.
@@ -86,7 +95,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		return err
 	}
 	server := grpc.NewServer()
-	nodev1.RegisterAgentServer(server, &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: versionv1.NewVersionClient(containerd)})
+	nodev1.RegisterAgentServer(server, &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: versionv1.NewVersionClient(containerd), generationFile: cfg.GenerationFile})
 	peers := grpc.NewServer(grpc.Creds(credentials.NewTLS(id.ServerTLS())))
 	healthpb.RegisterHealthServer(peers, health.NewServer())
 	return serveAll(ctx, map[*grpc.Server]net.Listener{server: l, peers: peerListener})
@@ -131,19 +140,104 @@ var modes = map[string]nodev1.Mode{hostlayout.ModeDirect: nodev1.Mode_MODE_DIREC
 
 type agentServer struct {
 	nodev1.UnimplementedAgentServer
-	version    string
-	mode       nodev1.Mode
-	containerd versionv1.VersionClient
+	version        string
+	mode           nodev1.Mode
+	containerd     versionv1.VersionClient
+	generationFile string
+	// generationMu orders recording generations.
+	generationMu sync.Mutex
 }
 
 func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nodev1.StatusResponse, error) {
-	return &nodev1.StatusResponse{
+	res := &nodev1.StatusResponse{
 		Mode: s.mode,
 		Components: []*nodev1.Component{
 			{Name: "agent", Version: s.version, Health: nodev1.Health_HEALTH_HEALTHY},
 			s.containerdStatus(ctx),
 		},
-	}, nil
+	}
+	if applied, err := s.applied(); err != nil {
+		res.GenerationUnknown = err.Error()
+	} else {
+		res.Generation, res.Nodes = applied.Generation, applied.Nodes
+	}
+	return res, nil
+}
+
+func (s *agentServer) RecordGeneration(_ context.Context, req *nodev1.RecordGenerationRequest) (*nodev1.RecordGenerationResponse, error) {
+	s.generationMu.Lock()
+	defer s.generationMu.Unlock()
+	// A node that can't tell the generation it applied accepts any, so
+	// that a recording repairs it.
+	if recorded, err := s.applied(); err == nil && req.Generation < recorded.Generation {
+		return nil, status.Errorf(codes.FailedPrecondition, "the node has applied generation %d, later than %d", recorded.Generation, req.Generation)
+	}
+	data, err := json.Marshal(appliedGeneration{Generation: req.Generation, Nodes: req.Nodes})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "recording the generation: %v", err)
+	}
+	if err := writeFile(s.generationFile, append(data, '\n')); err != nil {
+		return nil, status.Errorf(codes.Internal, "recording the generation: %v", err)
+	}
+	return &nodev1.RecordGenerationResponse{}, nil
+}
+
+// appliedGeneration is what the generation file holds: the generation of
+// the cluster directory that the node last applied, and the names of the
+// directory's nodes at that generation.
+type appliedGeneration struct {
+	Generation int64    `json:"generation"`
+	Nodes      []string `json:"nodes"`
+}
+
+// applied is what the node last applied: generation 0 of no nodes if it
+// has recorded none. It fails if the file can't be read, naming it.
+func (s *agentServer) applied() (appliedGeneration, error) {
+	var a appliedGeneration
+	data, err := os.ReadFile(s.generationFile)
+	if errors.Is(err, fs.ErrNotExist) {
+		return a, nil
+	}
+	if err == nil {
+		err = json.Unmarshal(data, &a)
+	}
+	if err != nil {
+		return appliedGeneration{}, fmt.Errorf("reading %s: %w", s.generationFile, err)
+	}
+	return a, nil
+}
+
+// writeFile replaces the file at path with data, which a crash leaves
+// either whole or not written at all. Once it returns, the new file
+// survives a crash: its directory is synced after the rename.
+func writeFile(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	_, err = tmp.Write(data)
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), path)
+	}
+	if err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	err = dir.Sync()
+	if closeErr := dir.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 // containerdStatus is containerd's version, if it answers, without the

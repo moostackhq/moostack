@@ -295,9 +295,10 @@ func (d *Dir) CheckNewNode(n Node) error {
 	return nil
 }
 
-// AddNode writes n's node file. It refuses a name already taken, with an
-// error that is fs.ErrExist.
-func (d *Dir) AddNode(n Node) error {
+// AddNode writes n's node file, and then the cluster file at generation.
+// It refuses a name already taken, with an error that is fs.ErrExist. If
+// it fails, it leaves no node file behind.
+func (d *Dir) AddNode(n Node, generation int64) error {
 	if err := d.CheckNewNode(n); err != nil {
 		return err
 	}
@@ -320,6 +321,28 @@ func (d *Dir) AddNode(n Node) error {
 		}
 		return err
 	}
+	if err := d.setGeneration(generation); err != nil {
+		os.Remove(d.nodePath(n.Name))
+		return err
+	}
+	return nil
+}
+
+// setGeneration writes the cluster file at generation.
+func (d *Dir) setGeneration(generation int64) error {
+	c := d.Cluster
+	c.Generation = generation
+	if err := c.check(); err != nil {
+		return err
+	}
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		return err
+	}
+	if err := writeFile(filepath.Join(d.path, FileName), data, os.Rename); err != nil {
+		return err
+	}
+	d.Cluster = c
 	return nil
 }
 
@@ -336,6 +359,13 @@ func (d *Dir) nodePath(name string) string {
 // not at all. It refuses an existing path, with an error that is
 // fs.ErrExist.
 func createFile(path string, data []byte) error {
+	return writeFile(path, data, os.Link)
+}
+
+// writeFile writes data to a temporary file next to path, and then puts
+// it in place with put, such as os.Link or os.Rename, so that the file
+// at path is whole or not written at all.
+func writeFile(path string, data []byte, put func(tmp, path string) error) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
 	if err != nil {
 		return err
@@ -354,5 +384,5 @@ func createFile(path string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	return os.Link(tmp.Name(), path)
+	return put(tmp.Name(), path)
 }

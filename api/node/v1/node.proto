@@ -10,6 +10,11 @@ option go_package = "github.com/moostackhq/moostack/api/node/v1;nodev1";
 service Agent {
   // Status reports the node's mode and the state of its node components.
   rpc Status(StatusRequest) returns (StatusResponse);
+  // RecordGeneration records the generation of the cluster directory that
+  // the node has applied, with the directory's nodes. It refuses a
+  // generation lower than the one recorded, with FAILED_PRECONDITION,
+  // unless the node can't tell the one recorded.
+  rpc RecordGeneration(RecordGenerationRequest) returns (RecordGenerationResponse);
 }
 
 // Updater is the node API that the updater serves, on its own socket, so
@@ -26,7 +31,29 @@ message StatusResponse {
   // Components are the node components, the agent among them. The
   // updater reports itself.
   repeated Component components = 2;
+  // Generation is the generation of the cluster directory that the node
+  // last applied, 0 if none or if generation_unknown says why the node
+  // can't tell.
+  int64 generation = 3;
+  // Nodes are the names of the nodes in the cluster directory at that
+  // generation.
+  repeated string nodes = 4;
+  // GenerationUnknown says why the node can't tell the generation it last
+  // applied, such as a file it can't read. It is empty when it can.
+  string generation_unknown = 5;
 }
+
+// RecordGenerationRequest is a generation of the cluster directory that
+// the node has applied.
+message RecordGenerationRequest {
+  // Generation is the cluster directory's generation.
+  int64 generation = 1;
+  // Nodes are the names of the nodes in the cluster directory at that
+  // generation.
+  repeated string nodes = 2;
+}
+
+message RecordGenerationResponse {}
 
 message UpdaterStatusRequest {}
 
@@ -40,6 +67,8 @@ enum Mode {
   MODE_UNSPECIFIED = 0;
   // MODE_DIRECT is operated by mooctl over SSH.
   MODE_DIRECT = 1;
+  // MODE_CONTROL_PLANE is operated by a control plane.
+  MODE_CONTROL_PLANE = 2;
 }
 
 // Component is a node component as the agent or the updater sees it.

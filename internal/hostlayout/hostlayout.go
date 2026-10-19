@@ -43,6 +43,9 @@ const (
 	ContainerdConfigFile = ConfigDir + "/containerd.toml"
 	// ContainerdSocket is where containerd serves its API.
 	ContainerdSocket = RunDir + "/containerd/containerd.sock"
+	// GenerationFile holds the generation of the cluster directory that
+	// the node last applied, with the directory's nodes, as JSON.
+	GenerationFile = StateDir + "/generation"
 	// PeerPort is the port the agent listens for peers on, at the node's
 	// private address.
 	PeerPort = 7443

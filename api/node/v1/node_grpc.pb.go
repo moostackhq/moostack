@@ -22,7 +22,8 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Agent_Status_FullMethodName = "/moostack.node.v1.Agent/Status"
+	Agent_Status_FullMethodName           = "/moostack.node.v1.Agent/Status"
+	Agent_RecordGeneration_FullMethodName = "/moostack.node.v1.Agent/RecordGeneration"
 )
 
 // AgentClient is the client API for Agent service.
@@ -33,6 +34,11 @@ const (
 type AgentClient interface {
 	// Status reports the node's mode and the state of its node components.
 	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
+	// RecordGeneration records the generation of the cluster directory that
+	// the node has applied, with the directory's nodes. It refuses a
+	// generation lower than the one recorded, with FAILED_PRECONDITION,
+	// unless the node can't tell the one recorded.
+	RecordGeneration(ctx context.Context, in *RecordGenerationRequest, opts ...grpc.CallOption) (*RecordGenerationResponse, error)
 }
 
 type agentClient struct {
@@ -53,6 +59,16 @@ func (c *agentClient) Status(ctx context.Context, in *StatusRequest, opts ...grp
 	return out, nil
 }
 
+func (c *agentClient) RecordGeneration(ctx context.Context, in *RecordGenerationRequest, opts ...grpc.CallOption) (*RecordGenerationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RecordGenerationResponse)
+	err := c.cc.Invoke(ctx, Agent_RecordGeneration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServer is the server API for Agent service.
 // All implementations must embed UnimplementedAgentServer
 // for forward compatibility.
@@ -61,6 +77,11 @@ func (c *agentClient) Status(ctx context.Context, in *StatusRequest, opts ...grp
 type AgentServer interface {
 	// Status reports the node's mode and the state of its node components.
 	Status(context.Context, *StatusRequest) (*StatusResponse, error)
+	// RecordGeneration records the generation of the cluster directory that
+	// the node has applied, with the directory's nodes. It refuses a
+	// generation lower than the one recorded, with FAILED_PRECONDITION,
+	// unless the node can't tell the one recorded.
+	RecordGeneration(context.Context, *RecordGenerationRequest) (*RecordGenerationResponse, error)
 	mustEmbedUnimplementedAgentServer()
 }
 
@@ -73,6 +94,9 @@ type UnimplementedAgentServer struct{}
 
 func (UnimplementedAgentServer) Status(context.Context, *StatusRequest) (*StatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Status not implemented")
+}
+func (UnimplementedAgentServer) RecordGeneration(context.Context, *RecordGenerationRequest) (*RecordGenerationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RecordGeneration not implemented")
 }
 func (UnimplementedAgentServer) mustEmbedUnimplementedAgentServer() {}
 func (UnimplementedAgentServer) testEmbeddedByValue()               {}
@@ -113,6 +137,24 @@ func _Agent_Status_Handler(srv interface{}, ctx context.Context, dec func(interf
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_RecordGeneration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RecordGenerationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).RecordGeneration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_RecordGeneration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).RecordGeneration(ctx, req.(*RecordGenerationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Agent_ServiceDesc is the grpc.ServiceDesc for Agent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -123,6 +165,10 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Status",
 			Handler:    _Agent_Status_Handler,
+		},
+		{
+			MethodName: "RecordGeneration",
+			Handler:    _Agent_RecordGeneration_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -1,12 +1,12 @@
 package cli_test
 
 import (
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
 	"net/netip"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -41,7 +41,7 @@ func statusCluster(t *testing.T, o *operator, names ...string) string {
 		err = d.AddNode(cluster.Node{
 			Name: name, Address: name, User: "root", HostKey: key,
 			PrivateAddress: netip.AddrFrom4([4]byte{10, 0, 0, byte(i + 1)}), Architecture: "amd64",
-		})
+		}, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -76,23 +76,19 @@ const (
 func TestClusterStatusShowsEachPinnedComponentOfEachNode(t *testing.T) {
 	o := newOperator(t, "op")
 	source := statusCluster(t, o, "node1", "node2", "node3")
-	o.nodeStatus = func(_ context.Context, n cluster.Node) (nodeclient.Status, error) {
-		switch n.Name {
-		case "node1":
-			// Up to date, apart from containerd.
-			return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Components: []*nodev1.Component{
-				component("agent", "1.0.0", healthy, ""),
-				component("containerd", "1.9.0", healthy, ""),
-				component("updater", "1.0.0", healthy, ""),
-			}}, nil
-		case "node2":
-			// The agent is stopped, so only the updater answers.
-			return nodeclient.Status{Components: []*nodev1.Component{
-				component("agent", "", unhealthy, "the agent doesn't answer: connection refused"),
-				component("updater", "1.0.0", healthy, ""),
-			}}, nil
-		}
-		return nodeclient.Status{}, errors.New("dial tcp: no route to host")
+	o.nodes = map[string]*fakeNode{
+		// Up to date, apart from containerd.
+		"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: []*nodev1.Component{
+			component("agent", "1.0.0", healthy, ""),
+			component("containerd", "1.9.0", healthy, ""),
+			component("updater", "1.0.0", healthy, ""),
+		}}},
+		// The agent is stopped, so only the updater answers.
+		"node2": {status: nodeclient.Status{AgentErr: errors.New("connection refused"), Components: []*nodev1.Component{
+			component("agent", "", unhealthy, "the agent doesn't answer: connection refused"),
+			component("updater", "1.0.0", healthy, ""),
+		}}},
+		"node3": {err: errors.New("dial tcp: no route to host")},
 	}
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	want := `Cluster prod on release 1.0.0
@@ -117,14 +113,12 @@ node3: dial tcp: no route to host
 func TestClusterStatusShowsAComponentTheReleaseDoesntPin(t *testing.T) {
 	o := newOperator(t, "op")
 	source := statusCluster(t, o, "node1")
-	o.nodeStatus = func(context.Context, cluster.Node) (nodeclient.Status, error) {
-		return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Components: []*nodev1.Component{
-			component("agent", "1.0.0", healthy, ""),
-			component("updater", "1.0.0", healthy, ""),
-			component("containerd", "2.0.0", healthy, ""),
-			component("extra", "0.1.0", unhealthy, "it is broken"),
-		}}, nil
-	}
+	o.nodes = map[string]*fakeNode{"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: []*nodev1.Component{
+		component("agent", "1.0.0", healthy, ""),
+		component("updater", "1.0.0", healthy, ""),
+		component("containerd", "2.0.0", healthy, ""),
+		component("extra", "0.1.0", unhealthy, "it is broken"),
+	}}}}
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	want := `Cluster prod on release 1.0.0
 
@@ -138,5 +132,145 @@ node1: extra: it is broken
 `
 	if r.stdout != want {
 		t.Errorf("cluster status printed\n%s\nwant\n%s", r.stdout, want)
+	}
+}
+
+func TestClusterStatusPrintsJSON(t *testing.T) {
+	o := newOperator(t, "op")
+	source := statusCluster(t, o, "node1", "node2", "node3")
+	o.nodes = map[string]*fakeNode{
+		"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: []*nodev1.Component{
+			component("agent", "1.0.0", healthy, ""),
+			component("updater", "1.0.0", unhealthy, "it is stuck"),
+		}}},
+		"node2": {err: errors.New("dial tcp: no route to host")},
+		// Only the updater answers, so the mode and generation aren't
+		// known.
+		"node3": {status: nodeclient.Status{AgentErr: errors.New("connection refused"), Components: []*nodev1.Component{
+			component("agent", "", unhealthy, "the agent doesn't answer: connection refused"),
+			component("updater", "1.0.0", healthy, ""),
+		}}},
+	}
+	r := o.mustRun("--release-source", source, "cluster", "status", "--json")
+	want := `{
+  "cluster": "prod",
+  "release": "1.0.0",
+  "generation": 1,
+  "nodes": [
+    {
+      "name": "node1",
+      "reachable": true,
+      "mode": "direct",
+      "generation": 1,
+      "components": [
+        {
+          "name": "agent",
+          "running": "1.0.0",
+          "pinned": "1.0.0",
+          "health": "healthy"
+        },
+        {
+          "name": "updater",
+          "running": "1.0.0",
+          "pinned": "1.0.0",
+          "health": "unhealthy",
+          "problem": "it is stuck"
+        },
+        {
+          "name": "containerd",
+          "pinned": "2.0.0",
+          "health": "unknown"
+        }
+      ]
+    },
+    {
+      "name": "node2",
+      "reachable": false,
+      "error": "dial tcp: no route to host"
+    },
+    {
+      "name": "node3",
+      "reachable": true,
+      "components": [
+        {
+          "name": "agent",
+          "pinned": "1.0.0",
+          "health": "unhealthy",
+          "problem": "the agent doesn't answer: connection refused"
+        },
+        {
+          "name": "updater",
+          "running": "1.0.0",
+          "pinned": "1.0.0",
+          "health": "healthy"
+        },
+        {
+          "name": "containerd",
+          "pinned": "2.0.0",
+          "health": "unknown"
+        }
+      ]
+    }
+  ]
+}
+`
+	if r.stdout != want {
+		t.Errorf("cluster status --json printed\n%s\nwant\n%s", r.stdout, want)
+	}
+}
+
+func TestClusterStatusReachesEveryNodeAtOnce(t *testing.T) {
+	o := newOperator(t, "op")
+	source := statusCluster(t, o, "node1", "node2", "node3")
+	o.nodes = map[string]*fakeNode{"node1": healthyNode(1), "node2": healthyNode(1), "node3": healthyNode(1)}
+	barrier(t, o.nodes)
+	o.mustRun("--release-source", source, "cluster", "status")
+}
+
+func TestClusterStatusSaysWhenANodeAppliedALaterGeneration(t *testing.T) {
+	o := newOperator(t, "op")
+	source := statusCluster(t, o, "node1", "node2")
+	o.nodes = map[string]*fakeNode{"node1": healthyNode(1), "node2": healthyNode(4)}
+	r := o.mustRun("--release-source", source, "cluster", "status")
+	wantContains(t, "cluster status", r.stdout, "\nnode2: it has applied generation 4, later than this cluster directory's 1\n")
+	if strings.Contains(r.stdout, "node1: ") {
+		t.Errorf("cluster status gives a problem for node1, which is at the directory's generation:\n%s", r.stdout)
+	}
+}
+
+func TestClusterStatusSaysWhenANodeIsBehindTheClusterDirectory(t *testing.T) {
+	o := newOperator(t, "op")
+	source := statusCluster(t, o, "node1", "node2")
+	o.nodes = map[string]*fakeNode{"node1": healthyNode(1), "node2": healthyNode(0)}
+	r := o.mustRun("--release-source", source, "cluster", "status")
+	wantContains(t, "cluster status", r.stdout, "\nnode2: it has applied generation 0, earlier than this cluster directory's 1, until an operation that changes the cluster directory records its generation\n")
+	if strings.Contains(r.stdout, "node1: ") {
+		t.Errorf("cluster status gives a problem for node1, which is at the directory's generation:\n%s", r.stdout)
+	}
+}
+
+func TestClusterStatusSaysWhenANodeCantTellItsGeneration(t *testing.T) {
+	o := newOperator(t, "op")
+	source := statusCluster(t, o, "node1", "node2")
+	o.nodes = map[string]*fakeNode{
+		"node1": healthyNode(1),
+		"node2": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, GenerationUnknown: "reading /var/lib/moostack/generation: invalid character"}},
+	}
+	r := o.mustRun("--release-source", source, "cluster", "status")
+	wantContains(t, "cluster status", r.stdout, "\nnode2: it can't tell the generation it has applied: reading /var/lib/moostack/generation: invalid character\n")
+	r = o.mustRun("--release-source", source, "cluster", "status", "--json")
+	wantContains(t, "cluster status --json", r.stdout, `"generation_problem": "it can't tell the generation it has applied: reading /var/lib/moostack/generation: invalid character"`)
+}
+
+func TestClusterStatusJSONSaysHowEachNodesGenerationDiffers(t *testing.T) {
+	o := newOperator(t, "op")
+	source := statusCluster(t, o, "node1", "node2", "node3")
+	o.nodes = map[string]*fakeNode{"node1": healthyNode(1), "node2": healthyNode(0), "node3": healthyNode(4)}
+	r := o.mustRun("--release-source", source, "cluster", "status", "--json")
+	wantContains(t, "cluster status --json", r.stdout,
+		`"generation_problem": "it has applied generation 0, earlier than this cluster directory's 1`,
+		`"generation_problem": "it has applied generation 4, later than this cluster directory's 1"`)
+	if n := strings.Count(r.stdout, "generation_problem"); n != 2 {
+		t.Errorf("cluster status --json gives %d generation problems, want 2, for node2 and node3:\n%s", n, r.stdout)
 	}
 }

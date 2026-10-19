@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -11,18 +12,16 @@ import (
 	"slices"
 	"strings"
 	"text/tabwriter"
-	"time"
 
 	"github.com/urfave/cli/v3"
-	"golang.org/x/crypto/ssh"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/cluster"
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/nodeclient"
+	"github.com/moostackhq/moostack/internal/orchestrate"
 	"github.com/moostackhq/moostack/internal/release"
 	"github.com/moostackhq/moostack/internal/secretstore"
-	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
 // clusterCommand is mooctl cluster.
@@ -50,6 +49,12 @@ func clusterCommand(env Env) *cli.Command {
 			{
 				Name:  "status",
 				Usage: "show each node's mode and node components, next to the pinned release",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{
+						Name:  "json",
+						Usage: "print the status as JSON",
+					},
+				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if err := wantArgs(cmd, 0); err != nil {
 						return err
@@ -114,6 +119,7 @@ func clusterInit(env Env, cmd *cli.Command) error {
 	if ignored {
 		fmt.Fprintf(env.Stdout, "Added %s to .gitignore\n", secretstore.LockFileName)
 	}
+	remindToCommit(env)
 	return nil
 }
 
@@ -278,10 +284,8 @@ func (u *rollback) putBack(path string, before []byte, existed bool) {
 	})
 }
 
-// statusTimeout bounds reaching one node and asking for its status.
-const statusTimeout = 30 * time.Second
-
-// clusterStatus is mooctl cluster status.
+// clusterStatus is mooctl cluster status. It reaches every node at once,
+// and shows those it can't reach rather than failing.
 func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
 	d, err := cluster.Open(cmd.String("dir"))
 	if err != nil {
@@ -295,23 +299,36 @@ func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(env.Stdout, "Cluster %s on release %s\n\n", d.Cluster.Name, rel.Version)
+	view := statusOf(d, rel, orchestrate.Survey(ctx, nodesToDial(env, nodes)))
+	if cmd.Bool("json") {
+		e := json.NewEncoder(env.Stdout)
+		e.SetIndent("", "  ")
+		return e.Encode(view)
+	}
+	return printStatus(env, view)
+}
+
+// printStatus prints the cluster status view as a table, with the
+// problems it found below.
+func printStatus(env Env, view statusView) error {
+	fmt.Fprintf(env.Stdout, "Cluster %s on release %s\n\n", view.Cluster, view.Release)
 	w := tabwriter.NewWriter(env.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "NODE\tREACHABLE\tMODE\tCOMPONENT\tRUNNING\tPINNED\tHEALTH")
 	var problems []string
-	for _, n := range nodes {
-		status, err := nodeStatus(ctx, env, n)
-		if err != nil {
+	for _, n := range view.Nodes {
+		if !n.Reachable {
 			fmt.Fprintf(w, "%s\tno\t-\t-\t-\t-\t-\n", n.Name)
-			problems = append(problems, fmt.Sprintf("%s: %v", n.Name, err))
+			problems = append(problems, fmt.Sprintf("%s: %s", n.Name, n.Error))
 			continue
 		}
-		mode := nodeclient.ModeName(status.Mode)
-		for _, row := range componentRows(rel, status.Components) {
-			fmt.Fprintf(w, "%s\tyes\t%s\t%s\t%s\t%s\t%s\n", n.Name, mode, row.name, row.running, row.pinned, row.health)
-			if row.problem != "" {
-				problems = append(problems, fmt.Sprintf("%s: %s: %s", n.Name, row.name, row.problem))
+		for _, c := range n.Components {
+			fmt.Fprintf(w, "%s\tyes\t%s\t%s\t%s\t%s\t%s\n", n.Name, dash(n.Mode), c.Name, dash(c.Running), dash(c.Pinned), c.Health)
+			if c.Problem != "" {
+				problems = append(problems, fmt.Sprintf("%s: %s: %s", n.Name, c.Name, c.Problem))
 			}
+		}
+		if n.GenerationProblem != "" {
+			problems = append(problems, fmt.Sprintf("%s: %s", n.Name, n.GenerationProblem))
 		}
 	}
 	if err := w.Flush(); err != nil {
@@ -323,62 +340,102 @@ func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
 	return nil
 }
 
-// componentRow is a component's row in cluster status, with the
-// problem to print below the table.
-type componentRow struct{ name, running, pinned, health, problem string }
+// statusView is what cluster status shows, as a table or as JSON.
+type statusView struct {
+	Cluster    string           `json:"cluster"`
+	Release    string           `json:"release"`
+	Generation int64            `json:"generation"`
+	Nodes      []nodeStatusView `json:"nodes"`
+}
 
-// componentRows are the rows of a node that reported components: one for
-// each component rel pins, in rel's order, then one for each component
-// it doesn't. A pinned component the node didn't report is of unknown
-// health.
-func componentRows(rel *release.Release, components []*nodev1.Component) []componentRow {
+// nodeStatusView is a node in cluster status. An unreachable node has
+// only its name, reachable and the error.
+type nodeStatusView struct {
+	Name      string `json:"name"`
+	Reachable bool   `json:"reachable"`
+	Error     string `json:"error,omitempty"`
+	// Mode is empty when the node didn't say.
+	Mode string `json:"mode,omitempty"`
+	// Generation is nil when the node didn't say.
+	Generation *int64 `json:"generation,omitempty"`
+	// GenerationProblem says how the node's generation differs from the
+	// cluster directory's, or why the node can't tell it.
+	GenerationProblem string                `json:"generation_problem,omitempty"`
+	Components        []componentStatusView `json:"components,omitempty"`
+}
+
+// componentStatusView is a component in cluster status: one for each
+// component the release pins, in its order, then one for each component
+// it doesn't. Running is empty if the node didn't report a version, and
+// Pinned if the release doesn't pin the component. A pinned component
+// the node didn't report is of unknown health.
+type componentStatusView struct {
+	Name    string `json:"name"`
+	Running string `json:"running,omitempty"`
+	Pinned  string `json:"pinned,omitempty"`
+	Health  string `json:"health"`
+	Problem string `json:"problem,omitempty"`
+}
+
+// statusOf is the status of the cluster of d, pinned at rel, whose nodes
+// are as reached.
+func statusOf(d *cluster.Dir, rel *release.Release, reached []orchestrate.Reached) statusView {
+	view := statusView{Cluster: d.Cluster.Name, Release: rel.Version, Generation: d.Cluster.Generation, Nodes: []nodeStatusView{}}
+	for _, r := range reached {
+		n := nodeStatusView{Name: r.Name, Reachable: r.Err == nil}
+		if r.Err != nil {
+			n.Error = r.Err.Error()
+			view.Nodes = append(view.Nodes, n)
+			continue
+		}
+		if r.Status.Mode != nodev1.Mode_MODE_UNSPECIFIED {
+			n.Mode = nodeclient.ModeName(r.Status.Mode)
+		}
+		if applied, ok := r.KnownGeneration(); ok {
+			n.Generation = &applied
+		}
+		if err := r.GenerationProblem(d.Cluster.Generation); err != nil {
+			n.GenerationProblem = err.Error()
+		}
+		n.Components = componentsOf(rel, r.Status.Components)
+		view.Nodes = append(view.Nodes, n)
+	}
+	return view
+}
+
+// dash is s, or "-" if it is empty.
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// componentsOf are the components of a node that reported components,
+// pinned at rel.
+func componentsOf(rel *release.Release, components []*nodev1.Component) []componentStatusView {
 	reported := map[string]*nodev1.Component{}
 	for _, c := range components {
 		reported[c.Name] = c
 	}
-	var rows []componentRow
+	var views []componentStatusView
 	for _, p := range rel.Components {
 		c, ok := reported[p.Name]
 		if !ok {
-			rows = append(rows, componentRow{name: p.Name, running: "-", pinned: p.Version, health: nodeclient.HealthName(nodev1.Health_HEALTH_UNSPECIFIED)})
+			views = append(views, componentStatusView{Name: p.Name, Pinned: p.Version, Health: nodeclient.HealthName(nodev1.Health_HEALTH_UNSPECIFIED)})
 			continue
 		}
-		rows = append(rows, reportedRow(c, p.Version))
+		views = append(views, reportedComponent(c, p.Version))
 	}
 	for _, c := range components {
 		if _, ok := rel.Component(c.Name); !ok {
-			rows = append(rows, reportedRow(c, "-"))
+			views = append(views, reportedComponent(c, ""))
 		}
 	}
-	return rows
+	return views
 }
 
-// reportedRow is the row of the reported component c, pinned at pinned.
-func reportedRow(c *nodev1.Component, pinned string) componentRow {
-	running := c.Version
-	if running == "" {
-		running = "-"
-	}
-	return componentRow{name: c.Name, running: running, pinned: pinned, health: nodeclient.HealthName(c.Health), problem: c.Problem}
-}
-
-// nodeStatus is n's status, from env.NodeStatus or else over SSH. It
-// fails only if the node can't be reached.
-func nodeStatus(ctx context.Context, env Env, n cluster.Node) (nodeclient.Status, error) {
-	ctx, cancel := context.WithTimeout(ctx, statusTimeout)
-	defer cancel()
-	if env.NodeStatus != nil {
-		return env.NodeStatus(ctx, n)
-	}
-	c, err := sshclient.Dial(ctx, sshclient.Node{Target: n.User + "@" + n.Address, HostKeys: []ssh.PublicKey{n.HostKey}}, sshOptions(env))
-	if err != nil {
-		return nodeclient.Status{}, err
-	}
-	defer c.Close()
-	node, err := nodeclient.Dial(c)
-	if err != nil {
-		return nodeclient.Status{}, err
-	}
-	defer node.Close()
-	return node.Status(ctx), nil
+// reportedComponent is the reported component c, pinned at pinned.
+func reportedComponent(c *nodev1.Component, pinned string) componentStatusView {
+	return componentStatusView{Name: c.Name, Running: c.Version, Pinned: pinned, Health: nodeclient.HealthName(c.Health), Problem: c.Problem}
 }

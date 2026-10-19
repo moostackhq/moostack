@@ -188,6 +188,52 @@ func TestOpenRefusesBadClusterFiles(t *testing.T) {
 	}
 }
 
+func TestAddNodeWritesTheGeneration(t *testing.T) {
+	d := newCluster(t)
+	if err := d.AddNode(node(t, "web-1"), 7); err != nil {
+		t.Fatal(err)
+	}
+	if d.Cluster.Generation != 7 {
+		t.Errorf("the open directory is at generation %d, want 7", d.Cluster.Generation)
+	}
+	reopened, err := cluster.Open(d.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.Cluster != d.Cluster {
+		t.Errorf("the cluster file holds %+v, want %+v", reopened.Cluster, d.Cluster)
+	}
+}
+
+func TestAddNodeThatCantWriteTheGenerationLeavesNoNodeFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to read-only directories")
+	}
+	d := newCluster(t)
+	if err := d.AddNode(node(t, "web-1"), 2); err != nil {
+		t.Fatal(err)
+	}
+	before := readFile(t, filepath.Join(d.Path(), "cluster.yml"))
+	// The nodes directory stays writable, and the cluster file can't be
+	// replaced.
+	if err := os.Chmod(d.Path(), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(d.Path(), 0o755) })
+	if err := d.AddNode(node(t, "web-2"), 3); err == nil {
+		t.Fatal("AddNode succeeded without writing the cluster file")
+	}
+	if _, err := os.Lstat(filepath.Join(d.Path(), "nodes", "web-2.yml")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the failed AddNode left web-2.yml: %v", err)
+	}
+	if got := readFile(t, filepath.Join(d.Path(), "cluster.yml")); got != before {
+		t.Errorf("the failed AddNode changed cluster.yml to\n%s", got)
+	}
+	if d.Cluster.Generation != 2 {
+		t.Errorf("after the failed AddNode, the open directory is at generation %d, want 2", d.Cluster.Generation)
+	}
+}
+
 func TestAddNodeWritesANodeFile(t *testing.T) {
 	d := newCluster(t)
 	key := hostKey(t)
@@ -199,7 +245,7 @@ func TestAddNodeWritesANodeFile(t *testing.T) {
 		PrivateAddress: netip.MustParseAddr("10.0.0.5"),
 		Architecture:   "amd64",
 	}
-	if err := d.AddNode(n); err != nil {
+	if err := d.AddNode(n, 2); err != nil {
 		t.Fatal(err)
 	}
 	got := readFile(t, filepath.Join(d.Path(), "nodes", "web-1.yml"))
@@ -216,7 +262,7 @@ func TestAddNodeWritesANodeFile(t *testing.T) {
 func TestNodesReadsWhatAddNodeWrote(t *testing.T) {
 	d := newCluster(t)
 	for _, name := range []string{"web-2", "db", "web-1"} {
-		if err := d.AddNode(node(t, name)); err != nil {
+		if err := d.AddNode(node(t, name), 2); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -252,13 +298,13 @@ func TestNodesOfANewClusterAreNone(t *testing.T) {
 
 func TestAddNodeRefusesATakenName(t *testing.T) {
 	d := newCluster(t)
-	if err := d.AddNode(node(t, "web-1")); err != nil {
+	if err := d.AddNode(node(t, "web-1"), 2); err != nil {
 		t.Fatal(err)
 	}
 	before := readFile(t, filepath.Join(d.Path(), "nodes", "web-1.yml"))
 	other := node(t, "web-1")
 	other.Address = "elsewhere"
-	if err := d.AddNode(other); !errors.Is(err, fs.ErrExist) {
+	if err := d.AddNode(other, 2); !errors.Is(err, fs.ErrExist) {
 		t.Errorf("AddNode of a taken name: %v, want an error that is fs.ErrExist", err)
 	}
 	if got := readFile(t, filepath.Join(d.Path(), "nodes", "web-1.yml")); got != before {
@@ -273,14 +319,14 @@ func TestFreeNodeNameIsTheFirstFreeNodeN(t *testing.T) {
 		t.Errorf("FreeNodeName of a new cluster: %q, %v, want node1", name, err)
 	}
 	for _, name := range []string{"node1", "node3", "web"} {
-		if err := d.AddNode(node(t, name)); err != nil {
+		if err := d.AddNode(node(t, name), 2); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if name, err := d.FreeNodeName(); err != nil || name != "node2" {
 		t.Errorf("FreeNodeName with node1 and node3 taken: %q, %v, want node2", name, err)
 	}
-	if err := d.AddNode(node(t, "node2")); err != nil {
+	if err := d.AddNode(node(t, "node2"), 2); err != nil {
 		t.Fatal(err)
 	}
 	if name, err := d.FreeNodeName(); err != nil || name != "node4" {
@@ -293,7 +339,7 @@ func TestCheckNewNodeRefusesWhatAddNodeWould(t *testing.T) {
 	if err := d.CheckNewNode(node(t, "web-1")); err != nil {
 		t.Errorf("CheckNewNode of a new node: %v", err)
 	}
-	if err := d.AddNode(node(t, "web-1")); err != nil {
+	if err := d.AddNode(node(t, "web-1"), 2); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.CheckNewNode(node(t, "web-1")); !errors.Is(err, fs.ErrExist) {
@@ -319,7 +365,7 @@ func TestAddNodeRefusesIncompleteNodes(t *testing.T) {
 			d := newCluster(t)
 			n := node(t, "web-1")
 			change(&n)
-			if err := d.AddNode(n); err == nil {
+			if err := d.AddNode(n, 2); err == nil {
 				t.Error("AddNode accepted it")
 			}
 			if entries, _ := os.ReadDir(filepath.Join(d.Path(), "nodes")); len(entries) != 0 {
