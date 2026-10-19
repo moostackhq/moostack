@@ -23,11 +23,31 @@ type node struct {
 	problem string
 	// recordErr, if set, is why recording a generation fails.
 	recordErr error
-	// hangs says the node never answers once reached: a status call or a
-	// recording waits until its context ends.
+	// hangs says the node never answers once reached: a status call, a
+	// recording or a lock call waits until its context ends.
 	hangs bool
+	// answerLost says the node grants the lock, but its answer never
+	// reaches the operation: AcquireLock waits until its context ends.
+	answerLost bool
+	// answerDelay is how long the node's answer to AcquireLock takes to
+	// reach the operation, after the node granted the lock.
+	answerDelay time.Duration
+	// laterGeneration, if set, is the generation the node reports from
+	// its second status call on, as if another operation recorded it in
+	// between.
+	laterGeneration int64
 
-	mu       sync.Mutex
+	mu sync.Mutex
+	// lock is the lease that holds the node's operation lock, nil if
+	// none, until expires.
+	lock    *nodeclient.Lock
+	expires time.Time
+	// acquired counts the calls to AcquireLock.
+	acquired int
+	// statusCalls counts the calls to Status.
+	statusCalls int
+	// hanging, once set, makes the node stop answering, as hangs does.
+	hanging  bool
 	recorded []int64
 	// recordedNodes are the nodes given with the last recording.
 	recordedNodes []string
@@ -39,12 +59,18 @@ func (n *node) Status(ctx context.Context) nodeclient.Status {
 		<-ctx.Done()
 		return nodeclient.Status{AgentErr: ctx.Err(), UpdaterErr: ctx.Err()}
 	}
-	return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: n.generation, Nodes: n.nodes, GenerationUnknown: n.problem}
+	n.mu.Lock()
+	n.statusCalls++
+	generation := n.generation
+	if n.laterGeneration != 0 && n.statusCalls > 1 {
+		generation = n.laterGeneration
+	}
+	n.mu.Unlock()
+	return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock()}
 }
 
-func (n *node) RecordGeneration(ctx context.Context, g int64, nodes []string) error {
-	if n.hangs {
-		<-ctx.Done()
+func (n *node) RecordGeneration(ctx context.Context, g int64, nodes []string, lease string) error {
+	if n.hang(ctx) {
 		return ctx.Err()
 	}
 	n.mu.Lock()
@@ -52,9 +78,119 @@ func (n *node) RecordGeneration(ctx context.Context, g int64, nodes []string) er
 	if n.recordErr != nil {
 		return n.recordErr
 	}
+	if l := n.held(); l == nil || l.Lease != lease {
+		return errors.New("the operation's lease doesn't hold the node's operation lock")
+	}
 	n.recorded = append(n.recorded, g)
 	n.recordedNodes = nodes
 	return nil
+}
+
+// hang waits until ctx ends and returns true if the node doesn't answer.
+func (n *node) hang(ctx context.Context) bool {
+	n.mu.Lock()
+	hangs := n.hangs || n.hanging
+	n.mu.Unlock()
+	if hangs {
+		<-ctx.Done()
+	}
+	return hangs
+}
+
+// held is the lease that holds the lock now, nil if none. n.mu must be
+// held.
+func (n *node) held() *nodeclient.Lock {
+	if n.lock != nil && !time.Now().Before(n.expires) {
+		n.lock = nil
+	}
+	return n.lock
+}
+
+// heldLock is the lease that holds the lock now, nil if none.
+func (n *node) heldLock() *nodeclient.Lock {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.held()
+}
+
+// lockFor has another operation, of lease, hold the lock for ttl.
+func (n *node) lockFor(lease string, ttl time.Duration) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.lock = &nodeclient.Lock{Lease: lease, Holder: "bob", Machine: "desktop", Since: time.Date(2026, 10, 19, 9, 30, 0, 0, time.UTC)}
+	n.expires = time.Now().Add(ttl)
+}
+
+func (n *node) AcquireLock(ctx context.Context, lock nodeclient.Lock, ttl time.Duration) (nodeclient.Lock, error) {
+	if n.hang(ctx) {
+		return nodeclient.Lock{}, ctx.Err()
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.acquired++
+	if l := n.held(); l != nil && l.Lease != lock.Lease {
+		return *l, nil
+	}
+	if n.lock == nil {
+		lock.Since = time.Now()
+		n.lock = &lock
+	}
+	n.expires = time.Now().Add(ttl)
+	if n.answerLost {
+		n.mu.Unlock()
+		<-ctx.Done()
+		n.mu.Lock()
+		return nodeclient.Lock{}, ctx.Err()
+	}
+	if n.answerDelay > 0 {
+		n.mu.Unlock()
+		time.Sleep(n.answerDelay)
+		n.mu.Lock()
+	}
+	return *n.lock, nil
+}
+
+func (n *node) RenewLock(ctx context.Context, lease string, ttl time.Duration) (*nodeclient.Lock, error) {
+	if n.hang(ctx) {
+		return nil, ctx.Err()
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	l := n.held()
+	if l != nil && l.Lease == lease {
+		n.expires = time.Now().Add(ttl)
+	}
+	return l, nil
+}
+
+// leaseExpires is when the node's lease runs out unless renewed.
+func (n *node) leaseExpires() time.Time {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.expires
+}
+
+func (n *node) ReleaseLock(ctx context.Context, lease string) error {
+	if n.hang(ctx) {
+		return ctx.Err()
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if l := n.held(); l != nil && l.Lease == lease {
+		n.lock = nil
+	}
+	return nil
+}
+
+func (n *node) BreakLock(ctx context.Context) (*nodeclient.Lock, error) {
+	if n.hang(ctx) {
+		return nil, ctx.Err()
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	l := n.held()
+	n.lock = nil
+	return l, nil
 }
 
 func (n *node) Close() error {
@@ -115,7 +251,7 @@ func TestTheNextGenerationIsLaterThanTheDirectorysAndEveryNodes(t *testing.T) {
 			for i, g := range c.applied {
 				f[string(rune('a'+i))] = &node{generation: g}
 			}
-			cl, err := orchestrate.Preflight(t.Context(), f.nodes(), c.dir, c.force)
+			cl, err := orchestrate.Preflight(t.Context(), f.nodes(), c.dir, c.force, holder)
 			if c.wantRefusing {
 				if err == nil {
 					t.Fatal("the preflight passed")
@@ -135,7 +271,7 @@ func TestTheNextGenerationIsLaterThanTheDirectorysAndEveryNodes(t *testing.T) {
 
 func TestRecordRecordsOnEveryNodeTheAddedOneToo(t *testing.T) {
 	f := fakes{"node1": {generation: 1}, "node2": {generation: 1}}
-	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 1, false)
+	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 1, false, holder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +299,7 @@ func TestRecordNamesEveryNodeThatDidntRecord(t *testing.T) {
 		"node2": {generation: 1},
 		"node3": {generation: 1, recordErr: errors.New("it is stuck")},
 	}
-	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 1, false)
+	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 1, false, holder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +323,7 @@ func TestRecordNamesEveryNodeThatDidntRecord(t *testing.T) {
 
 func TestAFailedPreflightClosesTheConnectionsItMade(t *testing.T) {
 	f := fakes{"node1": {generation: 1}, "node2": {generation: 9}}
-	if _, err := orchestrate.Preflight(t.Context(), f.nodes("gone"), 1, false); err == nil {
+	if _, err := orchestrate.Preflight(t.Context(), f.nodes("gone"), 1, false, holder); err == nil {
 		t.Fatal("the preflight passed")
 	}
 	for name, n := range f {
@@ -220,13 +356,16 @@ func TestRecordGivesUpOnANodeThatDoesntAnswer(t *testing.T) {
 	f := fakes{"node1": {generation: 1}, "node2": {generation: 1}}
 	nodes := f.nodes()
 	nodes.RecordTimeout = 100 * time.Millisecond
-	cl, err := orchestrate.Preflight(t.Context(), nodes, 1, false)
+	nodes.ReachTimeout = time.Second
+	cl, err := orchestrate.Preflight(t.Context(), nodes, 1, false, holder)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cl.Close()
 	// node2 stops answering after the preflight.
-	f["node2"].hangs = true
+	f["node2"].mu.Lock()
+	f["node2"].hanging = true
+	f["node2"].mu.Unlock()
 	done := make(chan error, 1)
 	go func() { done <- cl.Record(context.Background(), 2) }()
 	select {
@@ -249,7 +388,7 @@ func TestThePreflightGivesUpOnANodeThatDoesntAnswer(t *testing.T) {
 	nodes.ReachTimeout = 100 * time.Millisecond
 	done := make(chan error, 1)
 	go func() {
-		_, err := orchestrate.Preflight(context.Background(), nodes, 1, false)
+		_, err := orchestrate.Preflight(context.Background(), nodes, 1, false, holder)
 		done <- err
 	}()
 	select {
@@ -264,7 +403,7 @@ func TestThePreflightGivesUpOnANodeThatDoesntAnswer(t *testing.T) {
 
 func TestRecordRecordsTheNodesOfTheClusterDirectory(t *testing.T) {
 	f := fakes{"node2": {generation: 1}, "node1": {generation: 1}}
-	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 1, false)
+	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 1, false, holder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +429,7 @@ func TestThePreflightFindsTheNodesTheLatestGenerationListsButTheDirectoryDoesnt(
 		"node1": {generation: 3, nodes: []string{"node1", "node2", "node3", "node4"}},
 		"node2": {generation: 2, nodes: []string{"node2", "node5"}},
 	}
-	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 2, true)
+	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 2, true, holder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +444,7 @@ func TestThePreflightFindsTheNodesTheLatestGenerationListsButTheDirectoryDoesnt(
 
 func TestThePreflightListsNoNodesWhenTheDirectoryListsThemAll(t *testing.T) {
 	f := fakes{"node1": {generation: 2, nodes: []string{"node1", "node2"}}, "node2": {generation: 2, nodes: []string{"node1", "node2"}}}
-	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 2, false)
+	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 2, false, holder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,11 +456,11 @@ func TestThePreflightListsNoNodesWhenTheDirectoryListsThemAll(t *testing.T) {
 
 func TestThePreflightRefusesANodeThatCantTellItsGenerationUnlessForced(t *testing.T) {
 	f := fakes{"node1": {generation: 1}, "node2": {problem: "reading /var/lib/moostack/generation: invalid character"}}
-	_, err := orchestrate.Preflight(t.Context(), f.nodes(), 1, false)
+	_, err := orchestrate.Preflight(t.Context(), f.nodes(), 1, false, holder)
 	if err == nil || !strings.Contains(err.Error(), "node2: it can't tell the generation it has applied: reading /var/lib/moostack/generation") {
 		t.Errorf("the preflight's error is %v, want node2 refused for not telling its generation", err)
 	}
-	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 1, true)
+	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 1, true, holder)
 	if err != nil {
 		t.Fatalf("the forced preflight failed: %v", err)
 	}
@@ -335,7 +474,7 @@ func TestAnUnforcedPreflightLooksForNoUnlistedNodes(t *testing.T) {
 	// node1 lists node3, which the directory doesn't, at the directory's
 	// generation, as after a removal it didn't hear of.
 	f := fakes{"node1": {generation: 2, nodes: []string{"node1", "node2", "node3"}}, "node2": {generation: 2, nodes: []string{"node1", "node2"}}}
-	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 2, false)
+	cl, err := orchestrate.Preflight(t.Context(), f.nodes(), 2, false, holder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +507,7 @@ func TestAPreflightErrorSaysWhetherForceWouldPassIt(t *testing.T) {
 		{name: "a later generation and an unreachable node", f: fakes{"node1": {generation: 5}}, unreachable: []string{"gone"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := orchestrate.Preflight(t.Context(), c.f.nodes(c.unreachable...), 1, false)
+			_, err := orchestrate.Preflight(t.Context(), c.f.nodes(c.unreachable...), 1, false, holder)
 			var perr *orchestrate.PreflightError
 			if !errors.As(err, &perr) {
 				t.Fatalf("the preflight's error is %v, want a PreflightError", err)

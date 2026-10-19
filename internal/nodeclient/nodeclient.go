@@ -8,9 +8,11 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/hostlayout"
@@ -90,6 +92,9 @@ type Status struct {
 	// GenerationUnknown says why the node can't tell the generation it
 	// last applied, empty if it can.
 	GenerationUnknown string
+	// Lock is the node's operation lock, nil if no lease holds it or the
+	// agent didn't answer.
+	Lock *Lock
 	// Components are the agent's components and the updater. The agent
 	// or the updater that didn't answer is unhealthy, with why as its
 	// problem, and the components only the agent reports are missing.
@@ -118,6 +123,7 @@ func (n *Node) Status(ctx context.Context) Status {
 	} else {
 		s.Mode = agent.Mode
 		s.Generation, s.Nodes, s.GenerationUnknown = agent.Generation, agent.Nodes, agent.GenerationUnknown
+		s.Lock = lockOf(agent.Lock)
 		s.Components = append(s.Components, agent.Components...)
 	}
 	if updaterErr != nil {
@@ -139,10 +145,75 @@ func (s Status) KnownGeneration() (int64, bool) {
 }
 
 // RecordGeneration has the agent record generation, of a cluster
-// directory of the nodes called nodes, as the one the node has applied.
-func (n *Node) RecordGeneration(ctx context.Context, generation int64, nodes []string) error {
-	_, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: generation, Nodes: nodes})
+// directory of the nodes called nodes, as the one the node has applied,
+// for the operation whose lease holds the node's operation lock.
+func (n *Node) RecordGeneration(ctx context.Context, generation int64, nodes []string, lease string) error {
+	_, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: generation, Nodes: nodes, Lease: lease})
 	return err
+}
+
+// Lock is the operation lock, as one operation's lease holds it.
+type Lock struct {
+	// Lease identifies the operation's hold on the lock.
+	Lease string
+	// Holder is who runs the operation, and Machine where.
+	Holder, Machine string
+	// Since is when the node granted the lease, and Until when it runs
+	// out on the node unless renewed.
+	Since, Until time.Time
+}
+
+// lockOf is l, nil if l is.
+func lockOf(l *nodev1.Lock) *Lock {
+	if l == nil {
+		return nil
+	}
+	return &Lock{Lease: l.Lease, Holder: l.Holder, Machine: l.Machine, Since: l.Since.AsTime(), Until: l.Until.AsTime()}
+}
+
+// AcquireLock asks the agent for the node's operation lock for lock's
+// lease, or to renew it, for ttl. It returns the lock as it now is: held
+// by lock's lease if granted, or by another.
+func (n *Node) AcquireLock(ctx context.Context, lock Lock, ttl time.Duration) (Lock, error) {
+	res, err := n.Agent.AcquireLock(ctx, &nodev1.AcquireLockRequest{
+		Lock: &nodev1.Lock{Lease: lock.Lease, Holder: lock.Holder, Machine: lock.Machine},
+		Ttl:  durationpb.New(ttl),
+	})
+	if err != nil {
+		return Lock{}, err
+	}
+	if res.Lock == nil {
+		return Lock{}, errors.New("the agent reported no lock")
+	}
+	return *lockOf(res.Lock), nil
+}
+
+// RenewLock asks the agent to renew the node's operation lock for lease,
+// for ttl, only if lease still holds it. It returns the lock as it now
+// is, nil if free.
+func (n *Node) RenewLock(ctx context.Context, lease string, ttl time.Duration) (*Lock, error) {
+	res, err := n.Agent.RenewLock(ctx, &nodev1.RenewLockRequest{Lease: lease, Ttl: durationpb.New(ttl)})
+	if err != nil {
+		return nil, err
+	}
+	return lockOf(res.Lock), nil
+}
+
+// ReleaseLock has the agent release the node's operation lock, if lease
+// holds it.
+func (n *Node) ReleaseLock(ctx context.Context, lease string) error {
+	_, err := n.Agent.ReleaseLock(ctx, &nodev1.ReleaseLockRequest{Lease: lease})
+	return err
+}
+
+// BreakLock has the agent release the node's operation lock, whichever
+// lease holds it, and returns the lock it broke, nil if none.
+func (n *Node) BreakLock(ctx context.Context) (*Lock, error) {
+	res, err := n.Agent.BreakLock(ctx, &nodev1.BreakLockRequest{})
+	if err != nil {
+		return nil, err
+	}
+	return lockOf(res.Broken), nil
 }
 
 // notAnswering is the program that didn't answer with err.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/cluster"
@@ -25,6 +26,36 @@ type fakeNode struct {
 	mu sync.Mutex
 	// recorded are the generations recorded on the node, in order.
 	recorded []int64
+	// lock is the lease that holds the node's operation lock, nil if
+	// none. It never expires.
+	lock *nodeclient.Lock
+	// taken are the locks the node granted, in order.
+	taken []nodeclient.Lock
+	// acquired counts the calls to AcquireLock.
+	acquired int
+}
+
+// bobsLock is a lock that bob's operation holds, from his desktop.
+var bobsLock = nodeclient.Lock{Lease: "bobs", Holder: "bob", Machine: "desktop", Since: time.Date(2026, 10, 19, 9, 30, 0, 0, time.UTC), Until: time.Date(2026, 10, 19, 9, 31, 0, 0, time.UTC)}
+
+// locked is n with its operation lock held by l.
+func (n *fakeNode) locked(l nodeclient.Lock) *fakeNode {
+	n.lock = &l
+	return n
+}
+
+// heldLock is the lease that holds the node's lock, nil if none.
+func (n *fakeNode) heldLock() *nodeclient.Lock {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lock
+}
+
+// granted are the locks the node granted so far.
+func (n *fakeNode) granted() []nodeclient.Lock {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.taken)
 }
 
 // healthyNode is a node in direct mode that has applied generation.
@@ -39,13 +70,58 @@ func (n *fakeNode) generations() []int64 {
 	return slices.Clone(n.recorded)
 }
 
-func (n *fakeNode) Status(context.Context) nodeclient.Status { return n.status }
+func (n *fakeNode) Status(context.Context) nodeclient.Status {
+	s := n.status
+	s.Lock = n.heldLock()
+	return s
+}
 
-func (n *fakeNode) RecordGeneration(_ context.Context, g int64, _ []string) error {
+func (n *fakeNode) RecordGeneration(_ context.Context, g int64, _ []string, lease string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.lock == nil || n.lock.Lease != lease {
+		return fmt.Errorf("the operation's lease doesn't hold the node's operation lock")
+	}
 	n.recorded = append(n.recorded, g)
 	return nil
+}
+
+func (n *fakeNode) AcquireLock(_ context.Context, l nodeclient.Lock, _ time.Duration) (nodeclient.Lock, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.acquired++
+	if n.lock != nil && n.lock.Lease != l.Lease {
+		return *n.lock, nil
+	}
+	if n.lock == nil {
+		l.Since = time.Now()
+		n.lock = &l
+		n.taken = append(n.taken, l)
+	}
+	return *n.lock, nil
+}
+
+func (n *fakeNode) RenewLock(_ context.Context, lease string, _ time.Duration) (*nodeclient.Lock, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lock, nil
+}
+
+func (n *fakeNode) ReleaseLock(_ context.Context, lease string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.lock != nil && n.lock.Lease == lease {
+		n.lock = nil
+	}
+	return nil
+}
+
+func (n *fakeNode) BreakLock(context.Context) (*nodeclient.Lock, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	l := n.lock
+	n.lock = nil
+	return l, nil
 }
 
 func (n *fakeNode) Close() error { return nil }

@@ -33,8 +33,12 @@ type Env struct {
 	// Home is the operator's home directory.
 	Home string
 	// LocalUser is the operator's user name on this machine, the SSH user
-	// when neither the target nor the SSH config names one.
+	// when neither the target nor the SSH config names one, and who holds
+	// the operation lock for their operations.
 	LocalUser string
+	// Machine is this machine's name, where the operation lock says its
+	// holder runs mooctl.
+	Machine string
 	// Stdout is where results are printed.
 	Stdout io.Writer
 	// Stderr is where warnings and problems are printed.
@@ -61,7 +65,12 @@ func OSEnv() (Env, error) {
 	if err != nil {
 		return Env{}, err
 	}
+	machine, err := os.Hostname()
+	if err != nil {
+		return Env{}, err
+	}
 	return Env{
+		Machine:   machine,
 		Version:   buildinfo.Version,
 		Home:      home,
 		LocalUser: u.Username,
@@ -187,13 +196,24 @@ var forceFlag = &cli.BoolFlag{
 }
 
 // preflight runs the preflight on the nodes of d, for an operation that
-// writes d.
+// writes d, and takes the operation lock for the operator on this
+// machine. The operation runs in the returned cluster's context, which
+// ends if it loses the lock.
 func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir) (*orchestrate.Cluster, error) {
 	nodes, err := d.Nodes()
 	if err != nil {
 		return nil, err
 	}
-	c, err := orchestrate.Preflight(ctx, nodesToDial(env, nodes), d.Cluster.Generation, cmd.Bool("force"))
+	ttl, err := leaseTTL()
+	if err != nil {
+		return nil, err
+	}
+	toDial := nodesToDial(env, nodes)
+	toDial.LeaseTTL = ttl
+	c, err := orchestrate.Preflight(ctx, toDial, d.Cluster.Generation, cmd.Bool("force"), orchestrate.Holder{Who: env.LocalUser, Machine: env.Machine})
+	if errors.As(err, new(*orchestrate.LockHeldError)) {
+		return nil, fmt.Errorf("%w\nAnother operation holds the operation lock. Ask its holder, or wait for it to end. If their mooctl has died, the lock expires on its own, or break it now with mooctl cluster unlock.", err)
+	}
 	if perr := (*orchestrate.PreflightError)(nil); errors.As(err, &perr) && perr.Forceable() {
 		var hints []string
 		if errors.As(err, new(*orchestrate.LaterGenerationError)) {

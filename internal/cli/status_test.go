@@ -92,6 +92,7 @@ func TestClusterStatusShowsEachPinnedComponentOfEachNode(t *testing.T) {
 	}
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	want := `Cluster prod on release 1.0.0
+Operation lock: free on the nodes whose agent answered
 
 NODE   REACHABLE  MODE    COMPONENT   RUNNING  PINNED  HEALTH
 node1  yes        direct  agent       1.0.0    1.0.0   healthy
@@ -121,6 +122,7 @@ func TestClusterStatusShowsAComponentTheReleaseDoesntPin(t *testing.T) {
 	}}}}
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	want := `Cluster prod on release 1.0.0
+Operation lock: free
 
 NODE   REACHABLE  MODE    COMPONENT   RUNNING  PINNED  HEALTH
 node1  yes        direct  agent       1.0.0    1.0.0   healthy

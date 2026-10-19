@@ -115,11 +115,13 @@ func (o *operator) run(args ...string) result {
 	o.t.Helper()
 	var stdout, stderr bytes.Buffer
 	env := cli.Env{
-		Version:  o.version,
-		Home:     o.home,
-		Stdout:   &stdout,
-		Stderr:   &stderr,
-		DialNode: o.dialNode(),
+		Version:   o.version,
+		Home:      o.home,
+		LocalUser: "alice",
+		Machine:   "laptop",
+		Stdout:    &stdout,
+		Stderr:    &stderr,
+		DialNode:  o.dialNode(),
 		Terminal: func(func(int)) (terminal.Terminal, io.Closer) {
 			if o.terminal == nil {
 				return nil, nil

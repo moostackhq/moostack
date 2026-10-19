@@ -15,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	versionv1 "github.com/containerd/containerd/api/services/version/v1"
@@ -45,6 +44,9 @@ type Config struct {
 	// GenerationFile holds the generation the node last applied. Its
 	// directory must exist.
 	GenerationFile string
+	// LockFile keeps the operation lock across restarts. Its directory
+	// must exist.
+	LockFile string
 	// ContainerdSocket is where containerd serves its API.
 	ContainerdSocket string
 	// Identity is the node's identity, which it proves to its peers.
@@ -95,7 +97,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		return err
 	}
 	server := grpc.NewServer()
-	nodev1.RegisterAgentServer(server, &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: versionv1.NewVersionClient(containerd), generationFile: cfg.GenerationFile})
+	nodev1.RegisterAgentServer(server, &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: versionv1.NewVersionClient(containerd), generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile)})
 	peers := grpc.NewServer(grpc.Creds(credentials.NewTLS(id.ServerTLS())))
 	healthpb.RegisterHealthServer(peers, health.NewServer())
 	return serveAll(ctx, map[*grpc.Server]net.Listener{server: l, peers: peerListener})
@@ -144,8 +146,7 @@ type agentServer struct {
 	mode           nodev1.Mode
 	containerd     versionv1.VersionClient
 	generationFile string
-	// generationMu orders recording generations.
-	generationMu sync.Mutex
+	lock           *operationLock
 }
 
 func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nodev1.StatusResponse, error) {
@@ -155,6 +156,7 @@ func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nod
 			{Name: "agent", Version: s.version, Health: nodev1.Health_HEALTH_HEALTHY},
 			s.containerdStatus(ctx),
 		},
+		Lock: s.lockStatus(),
 	}
 	if applied, err := s.applied(); err != nil {
 		res.GenerationUnknown = err.Error()
@@ -165,8 +167,14 @@ func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nod
 }
 
 func (s *agentServer) RecordGeneration(_ context.Context, req *nodev1.RecordGenerationRequest) (*nodev1.RecordGenerationResponse, error) {
-	s.generationMu.Lock()
-	defer s.generationMu.Unlock()
+	// The lock's mutex stays held until the generation is written, so
+	// that the lease can't be broken or run out between the check and the
+	// write. It orders recordings too.
+	s.lock.mu.Lock()
+	defer s.lock.mu.Unlock()
+	if h := s.lock.current(); h == nil || req.Lease == "" || h.Lease != req.Lease {
+		return nil, status.Error(codes.FailedPrecondition, "the operation's lease doesn't hold the node's operation lock")
+	}
 	// A node that can't tell the generation it applied accepts any, so
 	// that a recording repairs it.
 	if recorded, err := s.applied(); err == nil && req.Generation < recorded.Generation {
@@ -229,7 +237,13 @@ func writeFile(path string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	dir, err := os.Open(filepath.Dir(path))
+	return syncDir(filepath.Dir(path))
+}
+
+// syncDir syncs the directory at path, so that the renames and removals
+// in it survive a crash.
+func syncDir(path string) error {
+	dir, err := os.Open(path)
 	if err != nil {
 		return err
 	}

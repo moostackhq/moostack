@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/urfave/cli/v3"
 
@@ -60,6 +61,16 @@ func clusterCommand(env Env) *cli.Command {
 						return err
 					}
 					return clusterStatus(ctx, env, cmd)
+				},
+			},
+			{
+				Name:  "unlock",
+				Usage: "break the operation lock, whoever holds it, when their mooctl has died",
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					if err := wantArgs(cmd, 0); err != nil {
+						return err
+					}
+					return clusterUnlock(ctx, env, cmd)
 				},
 			},
 		},
@@ -311,7 +322,8 @@ func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
 // printStatus prints the cluster status view as a table, with the
 // problems it found below.
 func printStatus(env Env, view statusView) error {
-	fmt.Fprintf(env.Stdout, "Cluster %s on release %s\n\n", view.Cluster, view.Release)
+	fmt.Fprintf(env.Stdout, "Cluster %s on release %s\n", view.Cluster, view.Release)
+	fmt.Fprintf(env.Stdout, "Operation lock: %s\n\n", describeLocks(view.Lock, len(view.Nodes), view.answered))
 	w := tabwriter.NewWriter(env.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "NODE\tREACHABLE\tMODE\tCOMPONENT\tRUNNING\tPINNED\tHEALTH")
 	var problems []string
@@ -342,10 +354,113 @@ func printStatus(env Env, view statusView) error {
 
 // statusView is what cluster status shows, as a table or as JSON.
 type statusView struct {
-	Cluster    string           `json:"cluster"`
-	Release    string           `json:"release"`
-	Generation int64            `json:"generation"`
-	Nodes      []nodeStatusView `json:"nodes"`
+	Cluster    string `json:"cluster"`
+	Release    string `json:"release"`
+	Generation int64  `json:"generation"`
+	// Lock is the operation lock as the nodes hold it: one entry for each
+	// operation that holds it on any node. It is empty if no node does.
+	Lock  []lockView       `json:"lock,omitempty"`
+	Nodes []nodeStatusView `json:"nodes"`
+	// answered is how many nodes' agents answered, and so could say
+	// whether they hold the lock.
+	answered int
+}
+
+// lockView is the operation lock as one operation holds it, on the nodes
+// called Nodes.
+type lockView struct {
+	Holder  string    `json:"holder"`
+	Machine string    `json:"machine"`
+	Since   time.Time `json:"since"`
+	Nodes   []string  `json:"nodes"`
+	lock    nodeclient.Lock
+}
+
+// locksOf are the operation locks the reached nodes hold, one for each
+// lease, in the order a node first reported it.
+func locksOf(reached []orchestrate.Reached) []lockView {
+	var views []lockView
+	for _, r := range reached {
+		l := r.Status.Lock
+		if r.Err != nil || l == nil {
+			continue
+		}
+		i := slices.IndexFunc(views, func(v lockView) bool { return v.lock.Lease == l.Lease })
+		if i < 0 {
+			views = append(views, lockView{Holder: l.Holder, Machine: l.Machine, Since: l.Since, lock: *l})
+			i = len(views) - 1
+		}
+		views[i].Nodes = append(views[i].Nodes, r.Name)
+	}
+	return views
+}
+
+// describeLocks says who holds the operation lock, as locks says, in a
+// cluster of nodes nodes, of which answered could say: free, or held,
+// with the nodes that hold it unless every node does.
+func describeLocks(locks []lockView, nodes, answered int) string {
+	if len(locks) == 0 && answered < nodes {
+		return "free on the nodes whose agent answered"
+	}
+	if len(locks) == 0 {
+		return "free"
+	}
+	var held []string
+	for _, l := range locks {
+		s := "held by " + orchestrate.DescribeLock(l.lock)
+		if len(locks) > 1 || len(l.Nodes) < nodes {
+			s += " on " + strings.Join(l.Nodes, ", ")
+		}
+		held = append(held, s)
+	}
+	return strings.Join(held, "; ")
+}
+
+// clusterUnlock is mooctl cluster unlock. It breaks the operation lock on
+// every node it reaches, says whose lock it broke, warns until when a
+// mooctl still running can go on, and fails naming the nodes it couldn't
+// reach, whose lock expires on its own.
+func clusterUnlock(ctx context.Context, env Env, cmd *cli.Command) error {
+	d, err := cluster.Open(cmd.String("dir"))
+	if err != nil {
+		return err
+	}
+	nodes, err := d.Nodes()
+	if err != nil {
+		return err
+	}
+	var (
+		broken   []orchestrate.Reached
+		problems []string
+	)
+	for _, u := range orchestrate.Unlock(ctx, nodesToDial(env, nodes)) {
+		switch {
+		case u.Err != nil:
+			problems = append(problems, fmt.Sprintf("  %s: %v", u.Name, u.Err))
+		case u.Broken != nil:
+			broken = append(broken, orchestrate.Reached{Name: u.Name, Status: nodeclient.Status{Lock: u.Broken}})
+		}
+	}
+	locks := locksOf(broken)
+	for _, l := range locks {
+		fmt.Fprintf(env.Stdout, "Broke the operation lock held by %s, on %s.\n", orchestrate.DescribeLock(l.lock), strings.Join(l.Nodes, ", "))
+	}
+	if len(locks) > 0 {
+		var until time.Time
+		for _, b := range broken {
+			if u := b.Status.Lock.Until; u.After(until) {
+				until = u
+			}
+		}
+		fmt.Fprintf(env.Stderr, "If that mooctl is still running, it can go on until %s at the latest, when its lease would have run out, and the next operation can overlap with it until then.\n", orchestrate.LocalTime(until))
+	}
+	if len(locks) == 0 && len(problems) == 0 {
+		fmt.Fprintln(env.Stdout, "No node held the operation lock.")
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("couldn't break the operation lock on these nodes, where it expires on its own if it is held:\n%s", strings.Join(problems, "\n"))
+	}
+	return nil
 }
 
 // nodeStatusView is a node in cluster status. An unreachable node has
@@ -380,13 +495,16 @@ type componentStatusView struct {
 // statusOf is the status of the cluster of d, pinned at rel, whose nodes
 // are as reached.
 func statusOf(d *cluster.Dir, rel *release.Release, reached []orchestrate.Reached) statusView {
-	view := statusView{Cluster: d.Cluster.Name, Release: rel.Version, Generation: d.Cluster.Generation, Nodes: []nodeStatusView{}}
+	view := statusView{Cluster: d.Cluster.Name, Release: rel.Version, Generation: d.Cluster.Generation, Lock: locksOf(reached), Nodes: []nodeStatusView{}}
 	for _, r := range reached {
 		n := nodeStatusView{Name: r.Name, Reachable: r.Err == nil}
 		if r.Err != nil {
 			n.Error = r.Err.Error()
 			view.Nodes = append(view.Nodes, n)
 			continue
+		}
+		if r.Status.AgentErr == nil {
+			view.answered++
 		}
 		if r.Status.Mode != nodev1.Mode_MODE_UNSPECIFIED {
 			n.Mode = nodeclient.ModeName(r.Status.Mode)

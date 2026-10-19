@@ -12,6 +12,8 @@ package nodev1
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	durationpb "google.golang.org/protobuf/types/known/durationpb"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -177,8 +179,10 @@ type StatusResponse struct {
 	// GenerationUnknown says why the node can't tell the generation it last
 	// applied, such as a file it can't read. It is empty when it can.
 	GenerationUnknown string `protobuf:"bytes,5,opt,name=generation_unknown,json=generationUnknown,proto3" json:"generation_unknown,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Lock is the operation lock, unset if no lease holds it.
+	Lock          *Lock `protobuf:"bytes,6,opt,name=lock,proto3" json:"lock,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StatusResponse) Reset() {
@@ -246,6 +250,13 @@ func (x *StatusResponse) GetGenerationUnknown() string {
 	return ""
 }
 
+func (x *StatusResponse) GetLock() *Lock {
+	if x != nil {
+		return x.Lock
+	}
+	return nil
+}
+
 // RecordGenerationRequest is a generation of the cluster directory that
 // the node has applied.
 type RecordGenerationRequest struct {
@@ -254,7 +265,9 @@ type RecordGenerationRequest struct {
 	Generation int64 `protobuf:"varint,1,opt,name=generation,proto3" json:"generation,omitempty"`
 	// Nodes are the names of the nodes in the cluster directory at that
 	// generation.
-	Nodes         []string `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	Nodes []string `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	// Lease is the operation's lease, which must hold the operation lock.
+	Lease         string `protobuf:"bytes,3,opt,name=lease,proto3" json:"lease,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -303,6 +316,13 @@ func (x *RecordGenerationRequest) GetNodes() []string {
 	return nil
 }
 
+func (x *RecordGenerationRequest) GetLease() string {
+	if x != nil {
+		return x.Lease
+	}
+	return ""
+}
+
 type RecordGenerationResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -339,6 +359,444 @@ func (*RecordGenerationResponse) Descriptor() ([]byte, []int) {
 	return file_api_node_v1_node_proto_rawDescGZIP(), []int{3}
 }
 
+// Lock is the operation lock, as one operation's lease holds it.
+type Lock struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Lease identifies the operation's hold on the lock.
+	Lease string `protobuf:"bytes,1,opt,name=lease,proto3" json:"lease,omitempty"`
+	// Holder is who runs the operation, and machine where.
+	Holder  string `protobuf:"bytes,2,opt,name=holder,proto3" json:"holder,omitempty"`
+	Machine string `protobuf:"bytes,3,opt,name=machine,proto3" json:"machine,omitempty"`
+	// Since is when the node granted the lease. A request leaves it unset.
+	Since *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=since,proto3" json:"since,omitempty"`
+	// Until is when the lease runs out on the node unless renewed, on the
+	// node's clock. A request leaves it unset.
+	Until         *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=until,proto3" json:"until,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Lock) Reset() {
+	*x = Lock{}
+	mi := &file_api_node_v1_node_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Lock) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Lock) ProtoMessage() {}
+
+func (x *Lock) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Lock.ProtoReflect.Descriptor instead.
+func (*Lock) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *Lock) GetLease() string {
+	if x != nil {
+		return x.Lease
+	}
+	return ""
+}
+
+func (x *Lock) GetHolder() string {
+	if x != nil {
+		return x.Holder
+	}
+	return ""
+}
+
+func (x *Lock) GetMachine() string {
+	if x != nil {
+		return x.Machine
+	}
+	return ""
+}
+
+func (x *Lock) GetSince() *timestamppb.Timestamp {
+	if x != nil {
+		return x.Since
+	}
+	return nil
+}
+
+func (x *Lock) GetUntil() *timestamppb.Timestamp {
+	if x != nil {
+		return x.Until
+	}
+	return nil
+}
+
+type AcquireLockRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Lock  *Lock                  `protobuf:"bytes,1,opt,name=lock,proto3" json:"lock,omitempty"`
+	// Ttl is how long the lease holds the lock unless renewed.
+	Ttl           *durationpb.Duration `protobuf:"bytes,2,opt,name=ttl,proto3" json:"ttl,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AcquireLockRequest) Reset() {
+	*x = AcquireLockRequest{}
+	mi := &file_api_node_v1_node_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AcquireLockRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AcquireLockRequest) ProtoMessage() {}
+
+func (x *AcquireLockRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AcquireLockRequest.ProtoReflect.Descriptor instead.
+func (*AcquireLockRequest) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *AcquireLockRequest) GetLock() *Lock {
+	if x != nil {
+		return x.Lock
+	}
+	return nil
+}
+
+func (x *AcquireLockRequest) GetTtl() *durationpb.Duration {
+	if x != nil {
+		return x.Ttl
+	}
+	return nil
+}
+
+type AcquireLockResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Lock is the lock as it now is.
+	Lock          *Lock `protobuf:"bytes,1,opt,name=lock,proto3" json:"lock,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AcquireLockResponse) Reset() {
+	*x = AcquireLockResponse{}
+	mi := &file_api_node_v1_node_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AcquireLockResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AcquireLockResponse) ProtoMessage() {}
+
+func (x *AcquireLockResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AcquireLockResponse.ProtoReflect.Descriptor instead.
+func (*AcquireLockResponse) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *AcquireLockResponse) GetLock() *Lock {
+	if x != nil {
+		return x.Lock
+	}
+	return nil
+}
+
+type RenewLockRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Lease         string                 `protobuf:"bytes,1,opt,name=lease,proto3" json:"lease,omitempty"`
+	Ttl           *durationpb.Duration   `protobuf:"bytes,2,opt,name=ttl,proto3" json:"ttl,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RenewLockRequest) Reset() {
+	*x = RenewLockRequest{}
+	mi := &file_api_node_v1_node_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RenewLockRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RenewLockRequest) ProtoMessage() {}
+
+func (x *RenewLockRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RenewLockRequest.ProtoReflect.Descriptor instead.
+func (*RenewLockRequest) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *RenewLockRequest) GetLease() string {
+	if x != nil {
+		return x.Lease
+	}
+	return ""
+}
+
+func (x *RenewLockRequest) GetTtl() *durationpb.Duration {
+	if x != nil {
+		return x.Ttl
+	}
+	return nil
+}
+
+type RenewLockResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Lock is the lock as it now is, unset if free.
+	Lock          *Lock `protobuf:"bytes,1,opt,name=lock,proto3" json:"lock,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RenewLockResponse) Reset() {
+	*x = RenewLockResponse{}
+	mi := &file_api_node_v1_node_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RenewLockResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RenewLockResponse) ProtoMessage() {}
+
+func (x *RenewLockResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RenewLockResponse.ProtoReflect.Descriptor instead.
+func (*RenewLockResponse) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *RenewLockResponse) GetLock() *Lock {
+	if x != nil {
+		return x.Lock
+	}
+	return nil
+}
+
+type ReleaseLockRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Lease         string                 `protobuf:"bytes,1,opt,name=lease,proto3" json:"lease,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseLockRequest) Reset() {
+	*x = ReleaseLockRequest{}
+	mi := &file_api_node_v1_node_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseLockRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseLockRequest) ProtoMessage() {}
+
+func (x *ReleaseLockRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseLockRequest.ProtoReflect.Descriptor instead.
+func (*ReleaseLockRequest) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *ReleaseLockRequest) GetLease() string {
+	if x != nil {
+		return x.Lease
+	}
+	return ""
+}
+
+type ReleaseLockResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseLockResponse) Reset() {
+	*x = ReleaseLockResponse{}
+	mi := &file_api_node_v1_node_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseLockResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseLockResponse) ProtoMessage() {}
+
+func (x *ReleaseLockResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseLockResponse.ProtoReflect.Descriptor instead.
+func (*ReleaseLockResponse) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{10}
+}
+
+type BreakLockRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BreakLockRequest) Reset() {
+	*x = BreakLockRequest{}
+	mi := &file_api_node_v1_node_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BreakLockRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BreakLockRequest) ProtoMessage() {}
+
+func (x *BreakLockRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BreakLockRequest.ProtoReflect.Descriptor instead.
+func (*BreakLockRequest) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{11}
+}
+
+type BreakLockResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Broken is the lock that was broken, unset if no lease held it.
+	Broken        *Lock `protobuf:"bytes,1,opt,name=broken,proto3" json:"broken,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BreakLockResponse) Reset() {
+	*x = BreakLockResponse{}
+	mi := &file_api_node_v1_node_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BreakLockResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BreakLockResponse) ProtoMessage() {}
+
+func (x *BreakLockResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BreakLockResponse.ProtoReflect.Descriptor instead.
+func (*BreakLockResponse) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *BreakLockResponse) GetBroken() *Lock {
+	if x != nil {
+		return x.Broken
+	}
+	return nil
+}
+
 type UpdaterStatusRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -347,7 +805,7 @@ type UpdaterStatusRequest struct {
 
 func (x *UpdaterStatusRequest) Reset() {
 	*x = UpdaterStatusRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[4]
+	mi := &file_api_node_v1_node_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -359,7 +817,7 @@ func (x *UpdaterStatusRequest) String() string {
 func (*UpdaterStatusRequest) ProtoMessage() {}
 
 func (x *UpdaterStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[4]
+	mi := &file_api_node_v1_node_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -372,7 +830,7 @@ func (x *UpdaterStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdaterStatusRequest.ProtoReflect.Descriptor instead.
 func (*UpdaterStatusRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{4}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{13}
 }
 
 type UpdaterStatusResponse struct {
@@ -385,7 +843,7 @@ type UpdaterStatusResponse struct {
 
 func (x *UpdaterStatusResponse) Reset() {
 	*x = UpdaterStatusResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[5]
+	mi := &file_api_node_v1_node_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -397,7 +855,7 @@ func (x *UpdaterStatusResponse) String() string {
 func (*UpdaterStatusResponse) ProtoMessage() {}
 
 func (x *UpdaterStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[5]
+	mi := &file_api_node_v1_node_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -410,7 +868,7 @@ func (x *UpdaterStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdaterStatusResponse.ProtoReflect.Descriptor instead.
 func (*UpdaterStatusResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{5}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *UpdaterStatusResponse) GetUpdater() *Component {
@@ -436,7 +894,7 @@ type Component struct {
 
 func (x *Component) Reset() {
 	*x = Component{}
-	mi := &file_api_node_v1_node_proto_msgTypes[6]
+	mi := &file_api_node_v1_node_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -448,7 +906,7 @@ func (x *Component) String() string {
 func (*Component) ProtoMessage() {}
 
 func (x *Component) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[6]
+	mi := &file_api_node_v1_node_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -461,7 +919,7 @@ func (x *Component) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Component.ProtoReflect.Descriptor instead.
 func (*Component) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{6}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *Component) GetName() string {
@@ -496,8 +954,8 @@ var File_api_node_v1_node_proto protoreflect.FileDescriptor
 
 const file_api_node_v1_node_proto_rawDesc = "" +
 	"\n" +
-	"\x16api/node/v1/node.proto\x12\x10moostack.node.v1\"\x0f\n" +
-	"\rStatusRequest\"\xde\x01\n" +
+	"\x16api/node/v1/node.proto\x12\x10moostack.node.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x0f\n" +
+	"\rStatusRequest\"\x8a\x02\n" +
 	"\x0eStatusResponse\x12*\n" +
 	"\x04mode\x18\x01 \x01(\x0e2\x16.moostack.node.v1.ModeR\x04mode\x12;\n" +
 	"\n" +
@@ -507,13 +965,37 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"generation\x18\x03 \x01(\x03R\n" +
 	"generation\x12\x14\n" +
 	"\x05nodes\x18\x04 \x03(\tR\x05nodes\x12-\n" +
-	"\x12generation_unknown\x18\x05 \x01(\tR\x11generationUnknown\"O\n" +
+	"\x12generation_unknown\x18\x05 \x01(\tR\x11generationUnknown\x12*\n" +
+	"\x04lock\x18\x06 \x01(\v2\x16.moostack.node.v1.LockR\x04lock\"e\n" +
 	"\x17RecordGenerationRequest\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\x03R\n" +
 	"generation\x12\x14\n" +
-	"\x05nodes\x18\x02 \x03(\tR\x05nodes\"\x1a\n" +
-	"\x18RecordGenerationResponse\"\x16\n" +
+	"\x05nodes\x18\x02 \x03(\tR\x05nodes\x12\x14\n" +
+	"\x05lease\x18\x03 \x01(\tR\x05lease\"\x1a\n" +
+	"\x18RecordGenerationResponse\"\xb2\x01\n" +
+	"\x04Lock\x12\x14\n" +
+	"\x05lease\x18\x01 \x01(\tR\x05lease\x12\x16\n" +
+	"\x06holder\x18\x02 \x01(\tR\x06holder\x12\x18\n" +
+	"\amachine\x18\x03 \x01(\tR\amachine\x120\n" +
+	"\x05since\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x05since\x120\n" +
+	"\x05until\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\x05until\"m\n" +
+	"\x12AcquireLockRequest\x12*\n" +
+	"\x04lock\x18\x01 \x01(\v2\x16.moostack.node.v1.LockR\x04lock\x12+\n" +
+	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"A\n" +
+	"\x13AcquireLockResponse\x12*\n" +
+	"\x04lock\x18\x01 \x01(\v2\x16.moostack.node.v1.LockR\x04lock\"U\n" +
+	"\x10RenewLockRequest\x12\x14\n" +
+	"\x05lease\x18\x01 \x01(\tR\x05lease\x12+\n" +
+	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"?\n" +
+	"\x11RenewLockResponse\x12*\n" +
+	"\x04lock\x18\x01 \x01(\v2\x16.moostack.node.v1.LockR\x04lock\"*\n" +
+	"\x12ReleaseLockRequest\x12\x14\n" +
+	"\x05lease\x18\x01 \x01(\tR\x05lease\"\x15\n" +
+	"\x13ReleaseLockResponse\"\x12\n" +
+	"\x10BreakLockRequest\"C\n" +
+	"\x11BreakLockResponse\x12.\n" +
+	"\x06broken\x18\x01 \x01(\v2\x16.moostack.node.v1.LockR\x06broken\"\x16\n" +
 	"\x14UpdaterStatusRequest\"N\n" +
 	"\x15UpdaterStatusResponse\x125\n" +
 	"\aupdater\x18\x01 \x01(\v2\x1b.moostack.node.v1.ComponentR\aupdater\"\x85\x01\n" +
@@ -529,10 +1011,14 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"\x06Health\x12\x16\n" +
 	"\x12HEALTH_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eHEALTH_HEALTHY\x10\x01\x12\x14\n" +
-	"\x10HEALTH_UNHEALTHY\x10\x022\xbf\x01\n" +
+	"\x10HEALTH_UNHEALTHY\x10\x022\xa3\x04\n" +
 	"\x05Agent\x12K\n" +
 	"\x06Status\x12\x1f.moostack.node.v1.StatusRequest\x1a .moostack.node.v1.StatusResponse\x12i\n" +
-	"\x10RecordGeneration\x12).moostack.node.v1.RecordGenerationRequest\x1a*.moostack.node.v1.RecordGenerationResponse2d\n" +
+	"\x10RecordGeneration\x12).moostack.node.v1.RecordGenerationRequest\x1a*.moostack.node.v1.RecordGenerationResponse\x12Z\n" +
+	"\vAcquireLock\x12$.moostack.node.v1.AcquireLockRequest\x1a%.moostack.node.v1.AcquireLockResponse\x12T\n" +
+	"\tRenewLock\x12\".moostack.node.v1.RenewLockRequest\x1a#.moostack.node.v1.RenewLockResponse\x12Z\n" +
+	"\vReleaseLock\x12$.moostack.node.v1.ReleaseLockRequest\x1a%.moostack.node.v1.ReleaseLockResponse\x12T\n" +
+	"\tBreakLock\x12\".moostack.node.v1.BreakLockRequest\x1a#.moostack.node.v1.BreakLockResponse2d\n" +
 	"\aUpdater\x12Y\n" +
 	"\x06Status\x12&.moostack.node.v1.UpdaterStatusRequest\x1a'.moostack.node.v1.UpdaterStatusResponseB3Z1github.com/moostackhq/moostack/api/node/v1;nodev1b\x06proto3"
 
@@ -549,7 +1035,7 @@ func file_api_node_v1_node_proto_rawDescGZIP() []byte {
 }
 
 var file_api_node_v1_node_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_api_node_v1_node_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_api_node_v1_node_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_api_node_v1_node_proto_goTypes = []any{
 	(Mode)(0),                        // 0: moostack.node.v1.Mode
 	(Health)(0),                      // 1: moostack.node.v1.Health
@@ -557,26 +1043,54 @@ var file_api_node_v1_node_proto_goTypes = []any{
 	(*StatusResponse)(nil),           // 3: moostack.node.v1.StatusResponse
 	(*RecordGenerationRequest)(nil),  // 4: moostack.node.v1.RecordGenerationRequest
 	(*RecordGenerationResponse)(nil), // 5: moostack.node.v1.RecordGenerationResponse
-	(*UpdaterStatusRequest)(nil),     // 6: moostack.node.v1.UpdaterStatusRequest
-	(*UpdaterStatusResponse)(nil),    // 7: moostack.node.v1.UpdaterStatusResponse
-	(*Component)(nil),                // 8: moostack.node.v1.Component
+	(*Lock)(nil),                     // 6: moostack.node.v1.Lock
+	(*AcquireLockRequest)(nil),       // 7: moostack.node.v1.AcquireLockRequest
+	(*AcquireLockResponse)(nil),      // 8: moostack.node.v1.AcquireLockResponse
+	(*RenewLockRequest)(nil),         // 9: moostack.node.v1.RenewLockRequest
+	(*RenewLockResponse)(nil),        // 10: moostack.node.v1.RenewLockResponse
+	(*ReleaseLockRequest)(nil),       // 11: moostack.node.v1.ReleaseLockRequest
+	(*ReleaseLockResponse)(nil),      // 12: moostack.node.v1.ReleaseLockResponse
+	(*BreakLockRequest)(nil),         // 13: moostack.node.v1.BreakLockRequest
+	(*BreakLockResponse)(nil),        // 14: moostack.node.v1.BreakLockResponse
+	(*UpdaterStatusRequest)(nil),     // 15: moostack.node.v1.UpdaterStatusRequest
+	(*UpdaterStatusResponse)(nil),    // 16: moostack.node.v1.UpdaterStatusResponse
+	(*Component)(nil),                // 17: moostack.node.v1.Component
+	(*timestamppb.Timestamp)(nil),    // 18: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),      // 19: google.protobuf.Duration
 }
 var file_api_node_v1_node_proto_depIdxs = []int32{
-	0, // 0: moostack.node.v1.StatusResponse.mode:type_name -> moostack.node.v1.Mode
-	8, // 1: moostack.node.v1.StatusResponse.components:type_name -> moostack.node.v1.Component
-	8, // 2: moostack.node.v1.UpdaterStatusResponse.updater:type_name -> moostack.node.v1.Component
-	1, // 3: moostack.node.v1.Component.health:type_name -> moostack.node.v1.Health
-	2, // 4: moostack.node.v1.Agent.Status:input_type -> moostack.node.v1.StatusRequest
-	4, // 5: moostack.node.v1.Agent.RecordGeneration:input_type -> moostack.node.v1.RecordGenerationRequest
-	6, // 6: moostack.node.v1.Updater.Status:input_type -> moostack.node.v1.UpdaterStatusRequest
-	3, // 7: moostack.node.v1.Agent.Status:output_type -> moostack.node.v1.StatusResponse
-	5, // 8: moostack.node.v1.Agent.RecordGeneration:output_type -> moostack.node.v1.RecordGenerationResponse
-	7, // 9: moostack.node.v1.Updater.Status:output_type -> moostack.node.v1.UpdaterStatusResponse
-	7, // [7:10] is the sub-list for method output_type
-	4, // [4:7] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	0,  // 0: moostack.node.v1.StatusResponse.mode:type_name -> moostack.node.v1.Mode
+	17, // 1: moostack.node.v1.StatusResponse.components:type_name -> moostack.node.v1.Component
+	6,  // 2: moostack.node.v1.StatusResponse.lock:type_name -> moostack.node.v1.Lock
+	18, // 3: moostack.node.v1.Lock.since:type_name -> google.protobuf.Timestamp
+	18, // 4: moostack.node.v1.Lock.until:type_name -> google.protobuf.Timestamp
+	6,  // 5: moostack.node.v1.AcquireLockRequest.lock:type_name -> moostack.node.v1.Lock
+	19, // 6: moostack.node.v1.AcquireLockRequest.ttl:type_name -> google.protobuf.Duration
+	6,  // 7: moostack.node.v1.AcquireLockResponse.lock:type_name -> moostack.node.v1.Lock
+	19, // 8: moostack.node.v1.RenewLockRequest.ttl:type_name -> google.protobuf.Duration
+	6,  // 9: moostack.node.v1.RenewLockResponse.lock:type_name -> moostack.node.v1.Lock
+	6,  // 10: moostack.node.v1.BreakLockResponse.broken:type_name -> moostack.node.v1.Lock
+	17, // 11: moostack.node.v1.UpdaterStatusResponse.updater:type_name -> moostack.node.v1.Component
+	1,  // 12: moostack.node.v1.Component.health:type_name -> moostack.node.v1.Health
+	2,  // 13: moostack.node.v1.Agent.Status:input_type -> moostack.node.v1.StatusRequest
+	4,  // 14: moostack.node.v1.Agent.RecordGeneration:input_type -> moostack.node.v1.RecordGenerationRequest
+	7,  // 15: moostack.node.v1.Agent.AcquireLock:input_type -> moostack.node.v1.AcquireLockRequest
+	9,  // 16: moostack.node.v1.Agent.RenewLock:input_type -> moostack.node.v1.RenewLockRequest
+	11, // 17: moostack.node.v1.Agent.ReleaseLock:input_type -> moostack.node.v1.ReleaseLockRequest
+	13, // 18: moostack.node.v1.Agent.BreakLock:input_type -> moostack.node.v1.BreakLockRequest
+	15, // 19: moostack.node.v1.Updater.Status:input_type -> moostack.node.v1.UpdaterStatusRequest
+	3,  // 20: moostack.node.v1.Agent.Status:output_type -> moostack.node.v1.StatusResponse
+	5,  // 21: moostack.node.v1.Agent.RecordGeneration:output_type -> moostack.node.v1.RecordGenerationResponse
+	8,  // 22: moostack.node.v1.Agent.AcquireLock:output_type -> moostack.node.v1.AcquireLockResponse
+	10, // 23: moostack.node.v1.Agent.RenewLock:output_type -> moostack.node.v1.RenewLockResponse
+	12, // 24: moostack.node.v1.Agent.ReleaseLock:output_type -> moostack.node.v1.ReleaseLockResponse
+	14, // 25: moostack.node.v1.Agent.BreakLock:output_type -> moostack.node.v1.BreakLockResponse
+	16, // 26: moostack.node.v1.Updater.Status:output_type -> moostack.node.v1.UpdaterStatusResponse
+	20, // [20:27] is the sub-list for method output_type
+	13, // [13:20] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_api_node_v1_node_proto_init() }
@@ -590,7 +1104,7 @@ func file_api_node_v1_node_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_node_v1_node_proto_rawDesc), len(file_api_node_v1_node_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   7,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

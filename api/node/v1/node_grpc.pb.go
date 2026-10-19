@@ -24,6 +24,10 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	Agent_Status_FullMethodName           = "/moostack.node.v1.Agent/Status"
 	Agent_RecordGeneration_FullMethodName = "/moostack.node.v1.Agent/RecordGeneration"
+	Agent_AcquireLock_FullMethodName      = "/moostack.node.v1.Agent/AcquireLock"
+	Agent_RenewLock_FullMethodName        = "/moostack.node.v1.Agent/RenewLock"
+	Agent_ReleaseLock_FullMethodName      = "/moostack.node.v1.Agent/ReleaseLock"
+	Agent_BreakLock_FullMethodName        = "/moostack.node.v1.Agent/BreakLock"
 )
 
 // AgentClient is the client API for Agent service.
@@ -37,8 +41,27 @@ type AgentClient interface {
 	// RecordGeneration records the generation of the cluster directory that
 	// the node has applied, with the directory's nodes. It refuses a
 	// generation lower than the one recorded, with FAILED_PRECONDITION,
-	// unless the node can't tell the one recorded.
+	// unless the node can't tell the one recorded, and refuses it with
+	// FAILED_PRECONDITION unless the request's lease holds the operation
+	// lock.
 	RecordGeneration(ctx context.Context, in *RecordGenerationRequest, opts ...grpc.CallOption) (*RecordGenerationResponse, error)
+	// AcquireLock grants the operation lock to the request's lease, if no
+	// other lease holds it, or renews it for the lease that does. Either
+	// way the lease holds it for ttl from when the agent got the call. It
+	// answers with the lock as it now is, held by the request's lease or
+	// by another.
+	AcquireLock(ctx context.Context, in *AcquireLockRequest, opts ...grpc.CallOption) (*AcquireLockResponse, error)
+	// RenewLock renews the operation lock for the request's lease, for ttl
+	// from when the agent got the call, only if that lease still holds it:
+	// a lease that was broken or ran out never gets it back this way. It
+	// answers with the lock as it now is, unset if free.
+	RenewLock(ctx context.Context, in *RenewLockRequest, opts ...grpc.CallOption) (*RenewLockResponse, error)
+	// ReleaseLock releases the operation lock, if the request's lease holds
+	// it.
+	ReleaseLock(ctx context.Context, in *ReleaseLockRequest, opts ...grpc.CallOption) (*ReleaseLockResponse, error)
+	// BreakLock releases the operation lock, whichever lease holds it, and
+	// answers with the lock it broke.
+	BreakLock(ctx context.Context, in *BreakLockRequest, opts ...grpc.CallOption) (*BreakLockResponse, error)
 }
 
 type agentClient struct {
@@ -69,6 +92,46 @@ func (c *agentClient) RecordGeneration(ctx context.Context, in *RecordGeneration
 	return out, nil
 }
 
+func (c *agentClient) AcquireLock(ctx context.Context, in *AcquireLockRequest, opts ...grpc.CallOption) (*AcquireLockResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AcquireLockResponse)
+	err := c.cc.Invoke(ctx, Agent_AcquireLock_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) RenewLock(ctx context.Context, in *RenewLockRequest, opts ...grpc.CallOption) (*RenewLockResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RenewLockResponse)
+	err := c.cc.Invoke(ctx, Agent_RenewLock_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) ReleaseLock(ctx context.Context, in *ReleaseLockRequest, opts ...grpc.CallOption) (*ReleaseLockResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseLockResponse)
+	err := c.cc.Invoke(ctx, Agent_ReleaseLock_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) BreakLock(ctx context.Context, in *BreakLockRequest, opts ...grpc.CallOption) (*BreakLockResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BreakLockResponse)
+	err := c.cc.Invoke(ctx, Agent_BreakLock_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServer is the server API for Agent service.
 // All implementations must embed UnimplementedAgentServer
 // for forward compatibility.
@@ -80,8 +143,27 @@ type AgentServer interface {
 	// RecordGeneration records the generation of the cluster directory that
 	// the node has applied, with the directory's nodes. It refuses a
 	// generation lower than the one recorded, with FAILED_PRECONDITION,
-	// unless the node can't tell the one recorded.
+	// unless the node can't tell the one recorded, and refuses it with
+	// FAILED_PRECONDITION unless the request's lease holds the operation
+	// lock.
 	RecordGeneration(context.Context, *RecordGenerationRequest) (*RecordGenerationResponse, error)
+	// AcquireLock grants the operation lock to the request's lease, if no
+	// other lease holds it, or renews it for the lease that does. Either
+	// way the lease holds it for ttl from when the agent got the call. It
+	// answers with the lock as it now is, held by the request's lease or
+	// by another.
+	AcquireLock(context.Context, *AcquireLockRequest) (*AcquireLockResponse, error)
+	// RenewLock renews the operation lock for the request's lease, for ttl
+	// from when the agent got the call, only if that lease still holds it:
+	// a lease that was broken or ran out never gets it back this way. It
+	// answers with the lock as it now is, unset if free.
+	RenewLock(context.Context, *RenewLockRequest) (*RenewLockResponse, error)
+	// ReleaseLock releases the operation lock, if the request's lease holds
+	// it.
+	ReleaseLock(context.Context, *ReleaseLockRequest) (*ReleaseLockResponse, error)
+	// BreakLock releases the operation lock, whichever lease holds it, and
+	// answers with the lock it broke.
+	BreakLock(context.Context, *BreakLockRequest) (*BreakLockResponse, error)
 	mustEmbedUnimplementedAgentServer()
 }
 
@@ -97,6 +179,18 @@ func (UnimplementedAgentServer) Status(context.Context, *StatusRequest) (*Status
 }
 func (UnimplementedAgentServer) RecordGeneration(context.Context, *RecordGenerationRequest) (*RecordGenerationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RecordGeneration not implemented")
+}
+func (UnimplementedAgentServer) AcquireLock(context.Context, *AcquireLockRequest) (*AcquireLockResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AcquireLock not implemented")
+}
+func (UnimplementedAgentServer) RenewLock(context.Context, *RenewLockRequest) (*RenewLockResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RenewLock not implemented")
+}
+func (UnimplementedAgentServer) ReleaseLock(context.Context, *ReleaseLockRequest) (*ReleaseLockResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseLock not implemented")
+}
+func (UnimplementedAgentServer) BreakLock(context.Context, *BreakLockRequest) (*BreakLockResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BreakLock not implemented")
 }
 func (UnimplementedAgentServer) mustEmbedUnimplementedAgentServer() {}
 func (UnimplementedAgentServer) testEmbeddedByValue()               {}
@@ -155,6 +249,78 @@ func _Agent_RecordGeneration_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_AcquireLock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AcquireLockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).AcquireLock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_AcquireLock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).AcquireLock(ctx, req.(*AcquireLockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_RenewLock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RenewLockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).RenewLock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_RenewLock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).RenewLock(ctx, req.(*RenewLockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_ReleaseLock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseLockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).ReleaseLock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_ReleaseLock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).ReleaseLock(ctx, req.(*ReleaseLockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_BreakLock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BreakLockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).BreakLock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_BreakLock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).BreakLock(ctx, req.(*BreakLockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Agent_ServiceDesc is the grpc.ServiceDesc for Agent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -169,6 +335,22 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RecordGeneration",
 			Handler:    _Agent_RecordGeneration_Handler,
+		},
+		{
+			MethodName: "AcquireLock",
+			Handler:    _Agent_AcquireLock_Handler,
+		},
+		{
+			MethodName: "RenewLock",
+			Handler:    _Agent_RenewLock_Handler,
+		},
+		{
+			MethodName: "ReleaseLock",
+			Handler:    _Agent_ReleaseLock_Handler,
+		},
+		{
+			MethodName: "BreakLock",
+			Handler:    _Agent_BreakLock_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

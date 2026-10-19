@@ -6,6 +6,9 @@ package moostack.node.v1;
 
 option go_package = "github.com/moostackhq/moostack/api/node/v1;nodev1";
 
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
 // Agent is the node API that the agent serves.
 service Agent {
   // Status reports the node's mode and the state of its node components.
@@ -13,8 +16,27 @@ service Agent {
   // RecordGeneration records the generation of the cluster directory that
   // the node has applied, with the directory's nodes. It refuses a
   // generation lower than the one recorded, with FAILED_PRECONDITION,
-  // unless the node can't tell the one recorded.
+  // unless the node can't tell the one recorded, and refuses it with
+  // FAILED_PRECONDITION unless the request's lease holds the operation
+  // lock.
   rpc RecordGeneration(RecordGenerationRequest) returns (RecordGenerationResponse);
+  // AcquireLock grants the operation lock to the request's lease, if no
+  // other lease holds it, or renews it for the lease that does. Either
+  // way the lease holds it for ttl from when the agent got the call. It
+  // answers with the lock as it now is, held by the request's lease or
+  // by another.
+  rpc AcquireLock(AcquireLockRequest) returns (AcquireLockResponse);
+  // RenewLock renews the operation lock for the request's lease, for ttl
+  // from when the agent got the call, only if that lease still holds it:
+  // a lease that was broken or ran out never gets it back this way. It
+  // answers with the lock as it now is, unset if free.
+  rpc RenewLock(RenewLockRequest) returns (RenewLockResponse);
+  // ReleaseLock releases the operation lock, if the request's lease holds
+  // it.
+  rpc ReleaseLock(ReleaseLockRequest) returns (ReleaseLockResponse);
+  // BreakLock releases the operation lock, whichever lease holds it, and
+  // answers with the lock it broke.
+  rpc BreakLock(BreakLockRequest) returns (BreakLockResponse);
 }
 
 // Updater is the node API that the updater serves, on its own socket, so
@@ -41,6 +63,8 @@ message StatusResponse {
   // GenerationUnknown says why the node can't tell the generation it last
   // applied, such as a file it can't read. It is empty when it can.
   string generation_unknown = 5;
+  // Lock is the operation lock, unset if no lease holds it.
+  Lock lock = 6;
 }
 
 // RecordGenerationRequest is a generation of the cluster directory that
@@ -51,9 +75,59 @@ message RecordGenerationRequest {
   // Nodes are the names of the nodes in the cluster directory at that
   // generation.
   repeated string nodes = 2;
+  // Lease is the operation's lease, which must hold the operation lock.
+  string lease = 3;
 }
 
 message RecordGenerationResponse {}
+
+// Lock is the operation lock, as one operation's lease holds it.
+message Lock {
+  // Lease identifies the operation's hold on the lock.
+  string lease = 1;
+  // Holder is who runs the operation, and machine where.
+  string holder = 2;
+  string machine = 3;
+  // Since is when the node granted the lease. A request leaves it unset.
+  google.protobuf.Timestamp since = 4;
+  // Until is when the lease runs out on the node unless renewed, on the
+  // node's clock. A request leaves it unset.
+  google.protobuf.Timestamp until = 5;
+}
+
+message AcquireLockRequest {
+  Lock lock = 1;
+  // Ttl is how long the lease holds the lock unless renewed.
+  google.protobuf.Duration ttl = 2;
+}
+
+message AcquireLockResponse {
+  // Lock is the lock as it now is.
+  Lock lock = 1;
+}
+
+message RenewLockRequest {
+  string lease = 1;
+  google.protobuf.Duration ttl = 2;
+}
+
+message RenewLockResponse {
+  // Lock is the lock as it now is, unset if free.
+  Lock lock = 1;
+}
+
+message ReleaseLockRequest {
+  string lease = 1;
+}
+
+message ReleaseLockResponse {}
+
+message BreakLockRequest {}
+
+message BreakLockResponse {
+  // Broken is the lock that was broken, unset if no lease held it.
+  Lock broken = 1;
+}
 
 message UpdaterStatusRequest {}
 

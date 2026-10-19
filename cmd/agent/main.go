@@ -39,6 +39,7 @@ func run(args []string) error {
 			Socket:           hostlayout.AgentSocket,
 			NodeFile:         hostlayout.NodeFile,
 			GenerationFile:   hostlayout.GenerationFile,
+			LockFile:         hostlayout.LockFile,
 			ContainerdSocket: hostlayout.ContainerdSocket,
 			Identity:         hostlayout.Identity,
 			PeerPort:         hostlayout.PeerPort,

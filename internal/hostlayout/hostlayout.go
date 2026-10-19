@@ -46,6 +46,9 @@ const (
 	// GenerationFile holds the generation of the cluster directory that
 	// the node last applied, with the directory's nodes, as JSON.
 	GenerationFile = StateDir + "/generation"
+	// LockFile keeps the node's operation lock across restarts of the
+	// agent.
+	LockFile = StateDir + "/lock"
 	// PeerPort is the port the agent listens for peers on, at the node's
 	// private address.
 	PeerPort = 7443

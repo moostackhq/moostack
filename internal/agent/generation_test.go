@@ -56,7 +56,7 @@ func TestTheAgentRefusesALowerGeneration(t *testing.T) {
 	record(t, n, 5, "node-1")
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	_, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: 4})
+	_, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: 4, Lease: "record"})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("recording generation 4 after 5: %v, want FailedPrecondition", err)
 	}
@@ -65,13 +65,21 @@ func TestTheAgentRefusesALowerGeneration(t *testing.T) {
 	}
 }
 
-// record records generation g of a cluster directory of nodes on n,
-// which must succeed.
+// record records generation g of a cluster directory of nodes on n, as
+// an operation whose lease holds the lock, which must succeed.
 func record(t *testing.T, n *nodetest.Node, g int64, nodes ...string) {
+	t.Helper()
+	acquire(t, n, "record", time.Minute)
+	recordAs(t, n, "record", g, nodes...)
+}
+
+// recordAs records generation g of a cluster directory of nodes on n, as
+// the operation of lease, which must succeed.
+func recordAs(t *testing.T, n *nodetest.Node, lease string, g int64, nodes ...string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	if _, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: g, Nodes: nodes}); err != nil {
+	if _, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: g, Nodes: nodes, Lease: lease}); err != nil {
 		t.Fatalf("recording generation %d: %v", g, err)
 	}
 }

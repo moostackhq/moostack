@@ -2,10 +2,12 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/urfave/cli/v3"
 	"golang.org/x/crypto/ssh"
@@ -16,6 +18,7 @@ import (
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/interrupt"
 	"github.com/moostackhq/moostack/internal/nodeclient"
+	"github.com/moostackhq/moostack/internal/orchestrate"
 	"github.com/moostackhq/moostack/internal/secretstore"
 	"github.com/moostackhq/moostack/internal/sshclient"
 	"github.com/moostackhq/moostack/internal/sshconfig"
@@ -76,6 +79,8 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 		return err
 	}
 	defer cl.Close()
+	// The rest runs only while the operation holds the lock.
+	ctx = cl.Context()
 	ca, err := openCA(env, cmd, d)
 	if err != nil {
 		return err
@@ -94,7 +99,14 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	defer c.Close()
+	// Once the new node is added, the cluster closes the connection, after
+	// it has released the lock on the node over it.
+	added := false
+	defer func() {
+		if !added {
+			c.Close()
+		}
+	}()
 
 	host, err := bootstrap.Check(ctx, c)
 	if err != nil {
@@ -126,6 +138,9 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err := d.CheckNewNode(n); err != nil {
 		return err
 	}
+	if err := cl.CheckLock(); err != nil {
+		return err
+	}
 	fmt.Fprintf(env.Stdout, "Installing release %s on %s (%s)\n", rel.Version, name, host.Architecture)
 	// From here on, a signal cancels the install, which then rolls back,
 	// rather than ending mooctl. Once the install has finished, the node
@@ -134,6 +149,9 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	defer stop()
 	err = bootstrap.Install(ctx, c, host, rel, hostlayout.NodeConfig{Cluster: d.Cluster.Name, Node: name, Mode: hostlayout.ModeDirect, PrivateAddress: private}, ca)
 	if err != nil {
+		if cause := context.Cause(ctx); errors.Is(cause, orchestrate.ErrLockLost) {
+			return fmt.Errorf("adding %s: %w", name, cause)
+		}
 		if ctx.Err() != nil {
 			return fmt.Errorf("adding %s: interrupted: %w", name, err)
 		}
@@ -150,7 +168,8 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	if node, err := nodeclient.Dial(c); err != nil {
 		cl.Add(name, unreachedNode{err})
 	} else {
-		cl.Add(name, node)
+		cl.Add(name, sshNode{node, c})
+		added = true
 	}
 	if err := cl.Record(ctx, generation); err != nil {
 		return fmt.Errorf("added %s, but cluster status shows these nodes behind until an operation that changes the cluster directory records its generation: %w", name, err)
@@ -166,7 +185,19 @@ func (n unreachedNode) Status(context.Context) nodeclient.Status {
 	return nodeclient.Status{AgentErr: n.err, UpdaterErr: n.err}
 }
 
-func (n unreachedNode) RecordGeneration(context.Context, int64, []string) error { return n.err }
+func (n unreachedNode) RecordGeneration(context.Context, int64, []string, string) error { return n.err }
+
+func (n unreachedNode) AcquireLock(context.Context, nodeclient.Lock, time.Duration) (nodeclient.Lock, error) {
+	return nodeclient.Lock{}, n.err
+}
+
+func (n unreachedNode) RenewLock(context.Context, string, time.Duration) (*nodeclient.Lock, error) {
+	return nil, n.err
+}
+
+func (n unreachedNode) ReleaseLock(context.Context, string) error { return n.err }
+
+func (n unreachedNode) BreakLock(context.Context) (*nodeclient.Lock, error) { return nil, n.err }
 
 func (n unreachedNode) Close() error { return nil }
 

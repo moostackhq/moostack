@@ -1,7 +1,7 @@
 // Package orchestrate is what an operation does across the whole
 // cluster through the node API: the preflight, which reaches every node
-// before anything changes, and recording the generation every node has
-// applied.
+// and takes the operation lock before anything changes, and recording
+// the generation every node has applied.
 package orchestrate
 
 import (
@@ -23,8 +23,21 @@ type Node interface {
 	// Status is what the node's agent and updater report.
 	Status(ctx context.Context) nodeclient.Status
 	// RecordGeneration has the node record generation, of a cluster
-	// directory of the nodes called nodes, as the one it has applied.
-	RecordGeneration(ctx context.Context, generation int64, nodes []string) error
+	// directory of the nodes called nodes, as the one it has applied, for
+	// the operation whose lease holds the node's operation lock.
+	RecordGeneration(ctx context.Context, generation int64, nodes []string, lease string) error
+	// AcquireLock asks the node for its operation lock for lock's lease,
+	// or to renew it, for ttl, and returns the lock as it now is.
+	AcquireLock(ctx context.Context, lock nodeclient.Lock, ttl time.Duration) (nodeclient.Lock, error)
+	// ReleaseLock releases the node's operation lock, if lease holds it.
+	ReleaseLock(ctx context.Context, lease string) error
+	// RenewLock renews the node's operation lock for lease, for ttl, only
+	// if lease still holds it, and returns the lock as it now is, nil if
+	// free.
+	RenewLock(ctx context.Context, lease string, ttl time.Duration) (*nodeclient.Lock, error)
+	// BreakLock releases the node's operation lock, whichever lease holds
+	// it, and returns the lock it broke, nil if none.
+	BreakLock(ctx context.Context) (*nodeclient.Lock, error)
 	// Close closes the connection.
 	Close() error
 }
@@ -46,6 +59,9 @@ type Nodes struct {
 	// status, and RecordTimeout recording a generation on one node. Zero
 	// means DefaultTimeout.
 	ReachTimeout, RecordTimeout time.Duration
+	// LeaseTTL is how long a node holds the operation lock after the
+	// operation last renewed it. Zero means DefaultLeaseTTL.
+	LeaseTTL time.Duration
 }
 
 // Reached is a node as Survey found it.
@@ -125,7 +141,8 @@ func Survey(ctx context.Context, nodes Nodes) []Reached {
 }
 
 // Cluster is the cluster an operation runs on once its preflight has
-// passed, with a connection to every node. Close it when done.
+// passed, with a connection to every node, holding the operation lock
+// until it is closed. Close it when done.
 type Cluster struct {
 	// Forced are the generation problems that force let the preflight
 	// pass, one error per node, which names it.
@@ -137,14 +154,28 @@ type Cluster struct {
 	Unlisted []string
 	// Latest is the latest generation any node has applied.
 	Latest        int64
-	conns         []namedConn
 	recordTimeout time.Duration
+	reachTimeout  time.Duration
+	// lease is the operation's hold on the lock, which every node holds
+	// for ttl after the operation last renewed it.
+	lease nodeclient.Lock
+	ttl   time.Duration
+	// ctx ends when the operation loses the lock, or the cluster is
+	// closed.
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	// stop ends keepLease, which closes kept once it has.
+	stop, kept chan struct{}
+	mu         sync.Mutex
+	conns      []*namedConn
 }
 
-// namedConn is the connection to the node called name.
+// namedConn is the connection to the node called name, and the
+// operation's hold on its lock.
 type namedConn struct {
-	name string
-	conn Node
+	name  string
+	conn  Node
+	lease leased
 }
 
 // LaterGenerationError says a node has applied a later generation than
@@ -189,14 +220,69 @@ func (e *UnknownGenerationError) Error() string {
 // generation it has applied, which isn't later than the directory's.
 // With force, the generation checks pass, and Cluster.Forced says what
 // they found. It fails naming every node that fails a check, and why.
-func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool) (*Cluster, error) {
-	c := &Cluster{recordTimeout: cmp.Or(nodes.RecordTimeout, DefaultTimeout)}
+// Once every node passes, it takes the operation lock for holder on
+// every node, or fails naming each node whose lock another operation
+// holds, after handing back the lock on the others. Holding the lock, it
+// checks the generations again, and fails if a lease may already have
+// run out.
+func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, holder Holder) (*Cluster, error) {
+	c := &Cluster{
+		recordTimeout: cmp.Or(nodes.RecordTimeout, DefaultTimeout),
+		reachTimeout:  cmp.Or(nodes.ReachTimeout, DefaultTimeout),
+		lease:         nodeclient.Lock{Lease: newLease(), Holder: holder.Who, Machine: holder.Machine},
+		ttl:           cmp.Or(nodes.LeaseTTL, DefaultLeaseTTL),
+	}
 	reached := reach(ctx, nodes)
-	var problems []error
 	for _, r := range reached {
 		if r.conn != nil {
-			c.conns = append(c.conns, namedConn{r.Name, r.conn})
+			c.conns = append(c.conns, &namedConn{name: r.Name, conn: r.conn})
 		}
+	}
+	// A node that can't be operated fails the preflight before the lock
+	// is asked for.
+	if problems := c.check(reached, generation, force); len(problems) > 0 {
+		c.closeConns()
+		return nil, &PreflightError{Problems: problems}
+	}
+	fail := func(err error) (*Cluster, error) {
+		c.releaseLease(min(c.reachTimeout, releaseTimeout))
+		c.closeConns()
+		return nil, err
+	}
+	if problems := c.takeLease(ctx, c.reachTimeout); len(problems) > 0 {
+		return fail(&PreflightError{Problems: problems})
+	}
+	// Another operation may have recorded a generation and ended between
+	// the check and the lock. Holding the lock, no other can, so the
+	// generations are checked again on what the nodes say now.
+	refresh(ctx, reached, c.reachTimeout)
+	if problems := c.check(reached, generation, force); len(problems) > 0 {
+		return fail(&PreflightError{Problems: problems})
+	}
+	if force {
+		c.Unlisted = unlisted(reached, nodes.Names, c.Latest)
+	}
+	// A grant that took long to arrive may have run out already.
+	if err := c.lost(time.Now().Add(c.ttl / 10)); err != nil {
+		return fail(err)
+	}
+	c.ctx, c.cancel = context.WithCancelCause(ctx)
+	c.stop, c.kept = make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(c.kept)
+		c.keepLease(c.stop)
+	}()
+	return c, nil
+}
+
+// check checks that each reached node can be operated from a cluster
+// directory at generation, and sets c.Latest and, with force, c.Forced
+// from what they report. It returns one error per node that fails, which
+// names it.
+func (c *Cluster) check(reached []Reached, generation int64, force bool) []error {
+	c.Latest, c.Forced = 0, nil
+	var problems []error
+	for _, r := range reached {
 		if applied, ok := r.KnownGeneration(); ok {
 			c.Latest = max(c.Latest, applied)
 		}
@@ -214,14 +300,45 @@ func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool) (
 			problems = append(problems, fmt.Errorf("%s: %w", r.Name, err))
 		}
 	}
-	if len(problems) > 0 {
-		c.Close()
-		return nil, &PreflightError{Problems: problems}
+	return problems
+}
+
+// refresh asks each reached node for its status again, all at once, each
+// within timeout.
+func refresh(ctx context.Context, reached []Reached, timeout time.Duration) {
+	var wg sync.WaitGroup
+	for i := range reached {
+		if reached[i].conn == nil {
+			continue
+		}
+		wg.Go(func() {
+			ctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			reached[i].Status = reached[i].conn.Status(ctx)
+		})
 	}
-	if force {
-		c.Unlisted = unlisted(reached, nodes.Names, c.Latest)
+	wg.Wait()
+}
+
+// Context is the operation's context, which ends with a cause that wraps
+// ErrLockLost when the operation can no longer be sure it holds the
+// operation lock, or when the cluster is closed. Everything the operation
+// does once the preflight has passed runs in it.
+func (c *Cluster) Context() context.Context { return c.ctx }
+
+// CheckLock fails, and ends the operation's context, if the operation
+// can't be sure it still holds the operation lock. keepLease calls it
+// every twentieth of a lease time, but its timer runs on the monotonic
+// clock, which stops while the machine sleeps, so on waking it may not
+// have noticed yet that the leases ran out. An operation calls it too
+// before a step that changes a node outside what the node fences, such
+// as an install.
+func (c *Cluster) CheckLock() error {
+	if err := c.lost(time.Now().Add(c.ttl / 10)); err != nil {
+		c.cancel(err)
+		return err
 	}
-	return c, nil
+	return nil
 }
 
 // check fails if the reached node r can't be operated, whatever the
@@ -295,9 +412,20 @@ func (e *PreflightError) Forceable() bool {
 // older generation is forced.
 func (c *Cluster) Next(generation int64) int64 { return max(generation, c.Latest) + 1 }
 
-// Add adds the connection to a new node called name, which Close closes.
+// Add adds the connection to a new node called name, which Close closes,
+// and takes the operation lock on it. A node that doesn't grant it can't
+// record a generation, and Record says why.
 func (c *Cluster) Add(name string, conn Node) {
-	c.conns = append(c.conns, namedConn{name, conn})
+	n := &namedConn{name: name, conn: conn}
+	sent, err := c.take(c.ctx, conn, c.reachTimeout)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err != nil {
+		n.lease.err = err
+	} else {
+		n.lease.granted(sent, c.ttl)
+	}
+	c.conns = append(c.conns, n)
 }
 
 // Record has every node record generation, of a cluster directory of
@@ -305,18 +433,25 @@ func (c *Cluster) Add(name string, conn Node) {
 // all at once, each within the record timeout. It fails naming every
 // node that didn't.
 func (c *Cluster) Record(ctx context.Context, generation int64) error {
-	names := make([]string, len(c.conns))
-	for i, n := range c.conns {
+	c.mu.Lock()
+	conns := slices.Clone(c.conns)
+	c.mu.Unlock()
+	names := make([]string, len(conns))
+	for i, n := range conns {
 		names[i] = n.name
 	}
 	slices.Sort(names)
-	errs := make([]error, len(c.conns))
+	errs := make([]error, len(conns))
 	var wg sync.WaitGroup
-	for i, n := range c.conns {
+	for i, n := range conns {
 		wg.Go(func() {
+			if n.lease.err != nil {
+				errs[i] = fmt.Errorf("%s didn't record generation %d: %w", n.name, generation, n.lease.err)
+				return
+			}
 			ctx, cancel := context.WithTimeout(ctx, c.recordTimeout)
 			defer cancel()
-			if err := n.conn.RecordGeneration(ctx, generation, names); err != nil {
+			if err := n.conn.RecordGeneration(ctx, generation, names, c.lease.Lease); err != nil {
 				errs[i] = fmt.Errorf("%s didn't record generation %d: %w", n.name, generation, err)
 			}
 		})
@@ -325,8 +460,22 @@ func (c *Cluster) Record(ctx context.Context, generation int64) error {
 	return errors.Join(slices.DeleteFunc(errs, func(err error) bool { return err == nil })...)
 }
 
-// Close closes the connections to the nodes.
+// Close releases the operation lock, ends the operation's context, and
+// closes the connections to the nodes.
 func (c *Cluster) Close() error {
+	// Cancelling first ends a renewal in flight, which keepLease waits
+	// for.
+	c.cancel(context.Canceled)
+	close(c.stop)
+	<-c.kept
+	c.releaseLease(min(c.reachTimeout, releaseTimeout))
+	return c.closeConns()
+}
+
+// closeConns closes the connections to the nodes.
+func (c *Cluster) closeConns() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	var errs []error
 	for _, n := range c.conns {
 		errs = append(errs, n.conn.Close())
