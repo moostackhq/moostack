@@ -1,6 +1,7 @@
 package cluster_test
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
@@ -10,15 +11,19 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
 	"github.com/moostackhq/moostack/internal/cluster"
 )
 
+// caCert stands for a CA certificate, which cluster keeps as it is.
+var caCert = []byte("ca\n")
+
 func TestInitWritesTheClusterFile(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "prod")
-	if _, err := cluster.Init(dir, cluster.Cluster{Name: "prod", Release: "1.2.3"}); err != nil {
+	if _, err := cluster.Init(dir, cluster.Cluster{Name: "prod", Release: "1.2.3"}, caCert); err != nil {
 		t.Fatal(err)
 	}
 	got := readFile(t, filepath.Join(dir, "cluster.yml"))
@@ -30,10 +35,10 @@ func TestInitWritesTheClusterFile(t *testing.T) {
 
 func TestInitRefusesAnExistingCluster(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := cluster.Init(dir, cluster.Cluster{Name: "prod", Release: "1.2.3"}); err != nil {
+	if _, err := cluster.Init(dir, cluster.Cluster{Name: "prod", Release: "1.2.3"}, caCert); err != nil {
 		t.Fatal(err)
 	}
-	_, err := cluster.Init(dir, cluster.Cluster{Name: "other", Release: "2.0.0"})
+	_, err := cluster.Init(dir, cluster.Cluster{Name: "other", Release: "2.0.0"}, caCert)
 	if !errors.Is(err, fs.ErrExist) {
 		t.Errorf("second Init: %v, want an error that is fs.ErrExist", err)
 	}
@@ -42,10 +47,89 @@ func TestInitRefusesAnExistingCluster(t *testing.T) {
 	}
 }
 
+func TestInitWritesTheCACertificate(t *testing.T) {
+	dir := t.TempDir()
+	d, err := cluster.Init(dir, cluster.Cluster{Name: "prod", Release: "1.2.3"}, caCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dir, "ca.crt")); got != string(caCert) {
+		t.Errorf("ca.crt is %q, want %q", got, caCert)
+	}
+	if got, err := d.CACert(); err != nil || string(got) != string(caCert) {
+		t.Errorf("CACert is %q, %v, want %q", got, err, caCert)
+	}
+}
+
+func TestInitRefusesAnExistingCACertificate(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "ca.crt"), "other\n")
+	_, err := cluster.Init(dir, cluster.Cluster{Name: "prod", Release: "1.2.3"}, caCert)
+	if !errors.Is(err, fs.ErrExist) || !strings.Contains(err.Error(), "ca.crt") {
+		t.Errorf("Init over a ca.crt: %v, want an error that is fs.ErrExist and names ca.crt", err)
+	}
+	if got := readFile(t, filepath.Join(dir, "ca.crt")); got != "other\n" {
+		t.Errorf("Init changed ca.crt to %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "cluster.yml")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Init over a ca.crt wrote cluster.yml: %v", err)
+	}
+}
+
+func TestInitLosingTheClusterFileToAnotherWriterLeavesNoCACertificate(t *testing.T) {
+	// The other writer creates cluster.yml as soon as Init starts writing
+	// ca.crt, which is after Init checked for a cluster.yml. A large ca.crt
+	// keeps Init writing for a while, so the other writer usually wins,
+	// and Init must then fail and take ca.crt back. Each round that Init
+	// wins is tried again.
+	large := bytes.Repeat([]byte("a"), 8<<20)
+	for range 20 {
+		dir := t.TempDir()
+		initDone, writerDone := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(writerDone)
+			for !writingCACert(dir) {
+				select {
+				case <-initDone:
+					return
+				case <-time.After(100 * time.Microsecond):
+				}
+			}
+			os.WriteFile(filepath.Join(dir, "cluster.yml"), []byte("other\n"), 0o644)
+		}()
+		_, err := cluster.Init(dir, cluster.Cluster{Name: "prod", Release: "1.2.3"}, large)
+		close(initDone)
+		<-writerDone
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			t.Errorf("Init losing cluster.yml: %v, want an error that is fs.ErrExist", err)
+		}
+		if _, err := os.Lstat(filepath.Join(dir, "ca.crt")); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("Init losing cluster.yml left ca.crt behind: %v", err)
+		}
+		return
+	}
+	t.Fatal("Init never lost cluster.yml to the other writer")
+}
+
+// writingCACert reports whether Init has started writing ca.crt in dir:
+// whether ca.crt or its temporary file is there.
+func writingCACert(dir string) bool {
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.Name() == "ca.crt" || strings.HasPrefix(e.Name(), ".ca.crt.") {
+			return true
+		}
+	}
+	return false
+}
+
 func TestInitRefusesInvalidNames(t *testing.T) {
 	for _, name := range []string{"", "Prod", "prod_1", "-prod", "prod-", strings.Repeat("a", 64), "a.b"} {
 		dir := t.TempDir()
-		if _, err := cluster.Init(dir, cluster.Cluster{Name: name, Release: "1.2.3"}); err == nil {
+		if _, err := cluster.Init(dir, cluster.Cluster{Name: name, Release: "1.2.3"}, caCert); err == nil {
 			t.Errorf("Init accepted the name %q", name)
 		}
 		if _, err := os.Stat(filepath.Join(dir, "cluster.yml")); err == nil {
@@ -55,14 +139,14 @@ func TestInitRefusesInvalidNames(t *testing.T) {
 }
 
 func TestInitRefusesAnEmptyRelease(t *testing.T) {
-	if _, err := cluster.Init(t.TempDir(), cluster.Cluster{Name: "prod"}); err == nil {
+	if _, err := cluster.Init(t.TempDir(), cluster.Cluster{Name: "prod"}, caCert); err == nil {
 		t.Error("Init accepted an empty release")
 	}
 }
 
 func TestOpenReadsWhatInitWrote(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := cluster.Init(dir, cluster.Cluster{Name: "prod", Release: "1.2.3"}); err != nil {
+	if _, err := cluster.Init(dir, cluster.Cluster{Name: "prod", Release: "1.2.3"}, caCert); err != nil {
 		t.Fatal(err)
 	}
 	d, err := cluster.Open(dir)
@@ -267,7 +351,7 @@ func TestNodesRefusesBadNodeFiles(t *testing.T) {
 
 func newCluster(t *testing.T) *cluster.Dir {
 	t.Helper()
-	d, err := cluster.Init(t.TempDir(), cluster.Cluster{Name: "prod", Release: "1.2.3"})
+	d, err := cluster.Init(t.TempDir(), cluster.Cluster{Name: "prod", Release: "1.2.3"}, caCert)
 	if err != nil {
 		t.Fatal(err)
 	}

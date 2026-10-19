@@ -20,12 +20,6 @@ func secretCommand(env Env) *cli.Command {
 	return &cli.Command{
 		Name:  "secret",
 		Usage: "keep secrets in the cluster directory's secret store",
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:  "ssh-key",
-				Usage: "the private key file to read the secret store with, instead of finding one in ~/.ssh",
-			},
-		},
 		Commands: []*cli.Command{
 			{
 				Name:   "init",
@@ -76,12 +70,12 @@ func secretCommand(env Env) *cli.Command {
 }
 
 // secretSession is what a secret command works with: the Env, the
-// store's path, the --ssh-key flag, the operator's terminal and the
-// command's arguments.
+// command, the store's path, the operator's terminal and the command's
+// arguments.
 type secretSession struct {
 	env      Env
+	cmd      *cli.Command
 	path     string
-	sshKey   string
 	terminal terminal.Terminal
 	args     []string
 }
@@ -99,33 +93,23 @@ func secretAction(env Env, nargs int, run func(*secretSession) error) cli.Action
 				return err
 			}
 		}
-		s := &secretSession{
-			env:    env,
-			path:   filepath.Join(cmd.String("dir"), secretstore.FileName),
-			sshKey: cmd.String("ssh-key"),
-			args:   cmd.Args().Slice(),
-		}
-		if env.Terminal != nil {
-			t, closer := env.Terminal(env.Exit)
-			if t != nil {
-				s.terminal = t
-				defer closer.Close()
-			}
-		}
-		return run(s)
+		t, closeTerminal := openTerminal(env)
+		defer closeTerminal()
+		return run(&secretSession{
+			env:      env,
+			cmd:      cmd,
+			path:     filepath.Join(cmd.String("dir"), secretstore.FileName),
+			terminal: t,
+			args:     cmd.Args().Slice(),
+		})
 	}
-}
-
-// keyOptions are the options to choose or find the operator's key with.
-func (s *secretSession) keyOptions() secretstore.KeyOptions {
-	return secretstore.KeyOptions{Home: s.env.Home, SSHKey: s.sshKey, Terminal: s.terminal, Out: s.env.Stderr}
 }
 
 // open finds the operator's key, asking for its passphrase if needed,
 // and opens the store with it. Each command calls it once, so the
 // passphrase is asked for once.
 func (s *secretSession) open() (*secretstore.Store, error) {
-	store, err := secretstore.Unlock(s.path, s.keyOptions())
+	store, err := secretstore.Unlock(s.path, keyOptions(s.env, s.cmd, s.terminal))
 	if errors.Is(err, secretstore.ErrNoStore) {
 		return nil, fmt.Errorf("%w; create one with mooctl secret init", err)
 	}
@@ -148,7 +132,7 @@ func (s *secretSession) save(store *secretstore.Store, again string) error {
 
 // secretInit is mooctl secret init.
 func secretInit(s *secretSession) error {
-	r, err := secretstore.ChooseKey(s.path, s.keyOptions())
+	r, err := secretstore.ChooseKey(s.path, keyOptions(s.env, s.cmd, s.terminal))
 	if err != nil {
 		return err
 	}

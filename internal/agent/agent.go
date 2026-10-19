@@ -1,23 +1,30 @@
 //go:build linux
 
-// Package agent is the node component that serves the node API.
+// Package agent is the node component that serves the node API, and
+// listens for the node's peers with mTLS.
 package agent
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
 
 	versionv1 "github.com/containerd/containerd/api/services/version/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/hostlayout"
+	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/rootsocket"
 )
 
@@ -31,12 +38,25 @@ type Config struct {
 	NodeFile string
 	// ContainerdSocket is where containerd serves its API.
 	ContainerdSocket string
+	// Identity is the node's identity, which it proves to its peers.
+	Identity identity.Files
+	// PeerPort is the port to listen for peers on, at the node's private
+	// address.
+	PeerPort uint16
 }
+
+// StopTimeout bounds how long the agent waits, once told to stop, for
+// open calls to finish, such as a peer watching its health. Then it
+// closes them.
+const StopTimeout = 5 * time.Second
 
 // containerdTimeout bounds asking containerd for its version.
 const containerdTimeout = 2 * time.Second
 
-// Serve serves the node API on cfg.Socket until ctx ends.
+// Serve serves the node API on cfg.Socket, and listens for peers at the
+// node's private address, until ctx ends. Peers connect with mTLS, and
+// only those with an identity from the cluster CA are accepted. It won't
+// serve without a valid identity of its own.
 func Serve(ctx context.Context, cfg Config) error {
 	data, err := os.ReadFile(cfg.NodeFile)
 	if err != nil {
@@ -46,24 +66,64 @@ func Serve(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", cfg.NodeFile, err)
 	}
+	id, err := identity.Load(cfg.Identity)
+	if err != nil {
+		return err
+	}
 	containerd, err := grpc.NewClient("unix://"+cfg.ContainerdSocket, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return err
 	}
 	defer containerd.Close()
 
+	peerListener, err := net.Listen("tcp", netip.AddrPortFrom(node.PrivateAddress, cfg.PeerPort).String())
+	if err != nil {
+		return fmt.Errorf("listening for peers: %w", err)
+	}
+	defer peerListener.Close()
 	l, err := rootsocket.Listen(cfg.Socket)
 	if err != nil {
 		return err
 	}
 	server := grpc.NewServer()
 	nodev1.RegisterAgentServer(server, &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: versionv1.NewVersionClient(containerd)})
-	stop := context.AfterFunc(ctx, server.GracefulStop)
-	defer stop()
-	if err := server.Serve(l); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-		return err
+	peers := grpc.NewServer(grpc.Creds(credentials.NewTLS(id.ServerTLS())))
+	healthpb.RegisterHealthServer(peers, health.NewServer())
+	return serveAll(ctx, map[*grpc.Server]net.Listener{server: l, peers: peerListener})
+}
+
+// serveAll serves each server on its listener until ctx ends or one of
+// them fails, and then stops them all, giving open calls StopTimeout to
+// finish.
+func serveAll(ctx context.Context, servers map[*grpc.Server]net.Listener) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errs := make(chan error, len(servers))
+	for s, l := range servers {
+		go func() {
+			err := s.Serve(l)
+			if errors.Is(err, grpc.ErrServerStopped) {
+				err = nil
+			}
+			errs <- err
+			cancel()
+		}()
 	}
-	return nil
+	<-ctx.Done()
+	force := time.AfterFunc(StopTimeout, func() {
+		for s := range servers {
+			s.Stop()
+		}
+	})
+	defer force.Stop()
+	for s := range servers {
+		s.GracefulStop()
+	}
+	var err error
+	for range servers {
+		err = errors.Join(err, <-errs)
+	}
+	return err
 }
 
 // modes are the node API's modes by the node file's names for them.

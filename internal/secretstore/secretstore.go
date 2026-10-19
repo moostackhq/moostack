@@ -445,11 +445,9 @@ func (s *Store) Save() error {
 		return err
 	}
 	defer unlock()
-	current, err := os.ReadFile(s.path)
-	if err != nil {
+	if ok, err := s.Unchanged(); err != nil {
 		return err
-	}
-	if !bytes.Equal(current, s.saved) {
+	} else if !ok {
 		return fmt.Errorf("%s %w; nothing was saved", s.path, ErrChanged)
 	}
 	tmp, err := writeTemp(s.path, data)
@@ -462,6 +460,16 @@ func (s *Store) Save() error {
 	}
 	s.saved = data
 	return syncDir(s.path)
+}
+
+// Unchanged reports whether the store's file is still as s opened it or
+// last saved it, which Save checks before it saves.
+func (s *Store) Unchanged() (bool, error) {
+	current, err := os.ReadFile(s.path)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(current, s.saved), nil
 }
 
 // marshal encodes the store as its file, sealing the data key if it

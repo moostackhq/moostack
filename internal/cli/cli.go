@@ -16,6 +16,7 @@ import (
 	"github.com/moostackhq/moostack/internal/cluster"
 	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/release"
+	"github.com/moostackhq/moostack/internal/secretstore"
 	"github.com/moostackhq/moostack/internal/sshclient"
 	"github.com/moostackhq/moostack/internal/sshconfig"
 	"github.com/moostackhq/moostack/internal/terminal"
@@ -87,6 +88,10 @@ func New(env Env) *cli.Command {
 				Usage:   "the directory of Moostack releases to install from, such as the release build's dist/releases",
 				Sources: cli.EnvVars("MOOCTL_RELEASE_SOURCE"),
 			},
+			&cli.StringFlag{
+				Name:  "ssh-key",
+				Usage: "the private key file to read the secret store with, instead of finding one in ~/.ssh",
+			},
 		},
 		Commands: []*cli.Command{
 			clusterCommand(env),
@@ -125,6 +130,25 @@ func sshOptions(env Env) sshclient.Options {
 		},
 		Relay: nodeclient.Relay,
 	}
+}
+
+// openTerminal opens the operator's terminal, and returns it with the
+// function to close it with. The terminal is nil when there is none.
+func openTerminal(env Env) (terminal.Terminal, func()) {
+	if env.Terminal == nil {
+		return nil, func() {}
+	}
+	t, closer := env.Terminal(env.Exit)
+	if t == nil {
+		return nil, func() {}
+	}
+	return t, func() { closer.Close() }
+}
+
+// keyOptions are the options to choose or find the operator's key for
+// the secret store with, on the terminal t.
+func keyOptions(env Env, cmd *cli.Command, t terminal.Terminal) secretstore.KeyOptions {
+	return secretstore.KeyOptions{Home: env.Home, SSHKey: cmd.String("ssh-key"), Terminal: t, Out: env.Stderr}
 }
 
 // openRelease opens the cluster's pinned release in the release source.

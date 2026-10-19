@@ -5,9 +5,11 @@ package hostlayout
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/strictyaml"
 )
 
@@ -41,7 +43,19 @@ const (
 	ContainerdConfigFile = ConfigDir + "/containerd.toml"
 	// ContainerdSocket is where containerd serves its API.
 	ContainerdSocket = RunDir + "/containerd/containerd.sock"
+	// PeerPort is the port the agent listens for peers on, at the node's
+	// private address.
+	PeerPort = 7443
 )
+
+// Identity is where the node keeps its node identity, which the agent
+// and the updater share. The key is made on the node, in a directory of
+// root's alone, and never leaves it.
+var Identity = identity.Files{
+	Key:  StateDir + "/identity/node.key",
+	Cert: ConfigDir + "/node.crt",
+	CA:   ConfigDir + "/ca.crt",
+}
 
 // Server is the binary of the program that serves the node API on
 // socket, if one does.
@@ -95,6 +109,9 @@ type NodeConfig struct {
 	Node string `yaml:"node"`
 	// Mode is the mode of the node's cluster, ModeDirect for now.
 	Mode string `yaml:"mode"`
+	// PrivateAddress is the address other nodes reach the node at, where
+	// the agent listens for them.
+	PrivateAddress netip.Addr `yaml:"private_address"`
 }
 
 // Marshal is c as the node file holds it.
@@ -108,6 +125,9 @@ func ParseNodeConfig(data []byte) (NodeConfig, error) {
 	}
 	if c.Cluster == "" || c.Node == "" {
 		return NodeConfig{}, errors.New("node file: no cluster or node name")
+	}
+	if !c.PrivateAddress.IsValid() {
+		return NodeConfig{}, errors.New("node file: no private address")
 	}
 	if c.Mode != ModeDirect {
 		return NodeConfig{}, fmt.Errorf("node file: unknown mode %q", c.Mode)

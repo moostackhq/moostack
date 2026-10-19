@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"path/filepath"
 	"strings"
 
 	"github.com/urfave/cli/v3"
@@ -12,7 +13,9 @@ import (
 	"github.com/moostackhq/moostack/internal/bootstrap"
 	"github.com/moostackhq/moostack/internal/cluster"
 	"github.com/moostackhq/moostack/internal/hostlayout"
+	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/interrupt"
+	"github.com/moostackhq/moostack/internal/secretstore"
 	"github.com/moostackhq/moostack/internal/sshclient"
 	"github.com/moostackhq/moostack/internal/sshconfig"
 )
@@ -63,6 +66,10 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 		return err
 	}
 	rel, err := openRelease(cmd, d)
+	if err != nil {
+		return err
+	}
+	ca, err := openCA(env, cmd, d)
 	if err != nil {
 		return err
 	}
@@ -118,7 +125,7 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	// is recorded all the same.
 	ctx, stop := interrupt.Context(ctx, env.Exit)
 	defer stop()
-	err = bootstrap.Install(ctx, c, host, rel, hostlayout.NodeConfig{Cluster: d.Cluster.Name, Node: name, Mode: hostlayout.ModeDirect})
+	err = bootstrap.Install(ctx, c, host, rel, hostlayout.NodeConfig{Cluster: d.Cluster.Name, Node: name, Mode: hostlayout.ModeDirect, PrivateAddress: private}, ca)
 	if err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("adding %s: interrupted: %w", name, err)
@@ -130,6 +137,31 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	}
 	fmt.Fprintf(env.Stdout, "Added node %s\n", name)
 	return nil
+}
+
+// openCA opens the cluster CA of d, reading its key from the secret
+// store with the operator's key. An operator who isn't a recipient gets
+// an error that lists the recipients.
+func openCA(env Env, cmd *cli.Command, d *cluster.Dir) (*identity.CA, error) {
+	cert, err := d.CACert()
+	if err != nil {
+		return nil, fmt.Errorf("reading the cluster CA: %w", err)
+	}
+	t, closeTerminal := openTerminal(env)
+	defer closeTerminal()
+	store, err := secretstore.Unlock(filepath.Join(d.Path(), secretstore.FileName), keyOptions(env, cmd, t))
+	if err != nil {
+		return nil, err
+	}
+	key, err := store.Get(caKeySecret)
+	if err != nil {
+		return nil, fmt.Errorf("reading the cluster CA key, %s: %w", caKeySecret, err)
+	}
+	ca, err := identity.ParseCA(cert, []byte(key.Value))
+	if err != nil {
+		return nil, fmt.Errorf("the cluster CA: %w", err)
+	}
+	return ca, nil
 }
 
 // hostOf is the host that the SSH target user@host or host names.

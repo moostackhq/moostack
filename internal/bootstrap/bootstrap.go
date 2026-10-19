@@ -1,6 +1,7 @@
 // Package bootstrap turns a host into a node over SSH: it checks the
 // host, installs containerd, the updater and the agent from a release as
-// systemd units, and removes them again if anything fails.
+// systemd units, issues the node its identity, and removes them again if
+// anything fails.
 package bootstrap
 
 import (
@@ -17,6 +18,7 @@ import (
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/hostlayout"
+	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/release"
 	"github.com/moostackhq/moostack/internal/sshclient"
@@ -198,14 +200,20 @@ func checkNotNode(ctx context.Context, c *sshclient.Client) error {
 }
 
 // healthTimeout bounds waiting for the node components to become healthy.
+// A dev build can set another bound (healthWait).
 const healthTimeout = time.Minute
 
 // Install installs the components of rel for the host's architecture,
-// configured as node, starts them, and waits until the agent and the
-// updater report them healthy at rel's versions. The host must have
-// passed Check. If Install fails, it rolls back.
-func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig) error {
-	if err := install(ctx, c, h, rel, node); err != nil {
+// configured as node, with the node identity that ca issues it, starts
+// them, and waits until the agent and the updater report them healthy at
+// rel's versions. The node's key is made on the host, and never leaves
+// it. The host must have passed Check. If Install fails, it rolls back.
+func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig, ca *identity.CA) error {
+	wait, err := healthWait()
+	if err != nil {
+		return err
+	}
+	if err := install(ctx, c, h, rel, node, ca, wait); err != nil {
 		return Rollback(ctx, c, err)
 	}
 	return nil
@@ -222,7 +230,7 @@ func Rollback(ctx context.Context, c *sshclient.Client, err error) error {
 	return err
 }
 
-func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig) error {
+func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig, ca *identity.CA, wait time.Duration) error {
 	if _, err := output(ctx, c, "mkdir -p "+hostlayout.BinDir+" "+hostlayout.ConfigDir); err != nil {
 		return err
 	}
@@ -237,6 +245,14 @@ func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 			}
 		}
 	}
+	request, err := output(ctx, c, hostlayout.Agent+" request-identity")
+	if err != nil {
+		return fmt.Errorf("making the node's key: %w", err)
+	}
+	cert, err := ca.Issue([]byte(request), node.Node)
+	if err != nil {
+		return fmt.Errorf("issuing the node's identity: %w", err)
+	}
 	nodeFile, err := node.Marshal()
 	if err != nil {
 		return err
@@ -244,6 +260,8 @@ func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 	files := append([]hostFile{
 		{hostlayout.NodeFile, string(nodeFile)},
 		{hostlayout.ContainerdConfigFile, hostlayout.ContainerdConfig},
+		{hostlayout.Identity.Cert, string(cert)},
+		{hostlayout.Identity.CA, string(ca.CertPEM())},
 	}, unitFiles...)
 	for _, f := range files {
 		if err := c.Upload(ctx, f.path, strings.NewReader(f.content), 0o644, "root:root"); err != nil {
@@ -253,19 +271,19 @@ func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 	if _, err := output(ctx, c, "systemctl daemon-reload && systemctl enable --now "+strings.Join(units, " ")); err != nil {
 		return err
 	}
-	return waitHealthy(ctx, c, rel)
+	return waitHealthy(ctx, c, rel, wait)
 }
 
 // waitHealthy waits until the agent and the updater report every
-// component healthy at the version rel pins, for up to healthTimeout, or
-// until ctx ends.
-func waitHealthy(parent context.Context, c *sshclient.Client, rel *release.Release) error {
+// component healthy at the version rel pins, for up to wait, or until ctx
+// ends.
+func waitHealthy(parent context.Context, c *sshclient.Client, rel *release.Release, wait time.Duration) error {
 	node, err := nodeclient.Dial(c)
 	if err != nil {
 		return err
 	}
 	defer node.Close()
-	ctx, cancel := context.WithTimeout(parent, healthTimeout)
+	ctx, cancel := context.WithTimeout(parent, wait)
 	defer cancel()
 	for {
 		err := healthy(ctx, node, rel)
@@ -277,7 +295,7 @@ func waitHealthy(parent context.Context, c *sshclient.Client, rel *release.Relea
 			if parent.Err() != nil {
 				return fmt.Errorf("waiting for the node to become healthy: %w", parent.Err())
 			}
-			return fmt.Errorf("the node didn't become healthy within %s: %w", healthTimeout, err)
+			return fmt.Errorf("the node didn't become healthy within %s: %w", wait, err)
 		case <-time.After(500 * time.Millisecond):
 		}
 	}

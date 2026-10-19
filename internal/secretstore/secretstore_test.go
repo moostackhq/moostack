@@ -836,6 +836,35 @@ func TestSaveRefusesAFileChangedSinceOpen(t *testing.T) {
 	save(t, first)
 }
 
+func TestUnchangedSaysWhetherTheFileIsAsTheStoreLeftIt(t *testing.T) {
+	alice := newOperator(t, "alice")
+	path := initStore(t, alice, nil)
+	first, second := open(t, path, alice), open(t, path, alice)
+	if !unchanged(t, first) || !unchanged(t, second) {
+		t.Fatal("a store just opened says its file changed")
+	}
+	if err := first.Put("a", secretstore.Secret{Value: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	save(t, first)
+	if !unchanged(t, first) {
+		t.Error("the store that saved says its file changed")
+	}
+	if unchanged(t, second) {
+		t.Error("the other store says its file is unchanged after a save")
+	}
+}
+
+// unchanged is s.Unchanged, which must not fail.
+func unchanged(t *testing.T, s *secretstore.Store) bool {
+	t.Helper()
+	ok, err := s.Unchanged()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ok
+}
+
 func TestConcurrentSavesNeverBothSucceed(t *testing.T) {
 	alice := newOperator(t, "alice")
 	path := initStore(t, alice, nil)

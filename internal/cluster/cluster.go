@@ -22,6 +22,10 @@ import (
 // FileName is the cluster file's name in the cluster directory.
 const FileName = "cluster.yml"
 
+// CAFileName is the cluster CA certificate's file name in the cluster
+// directory. Its key is in the secret store.
+const CAFileName = "ca.crt"
+
 // nodesDir is the directory of node files, one per node, each named for
 // its node.
 const nodesDir = "nodes"
@@ -118,10 +122,12 @@ type Dir struct {
 // Path is the directory's path.
 func (d *Dir) Path() string { return d.path }
 
-// Init makes path a cluster directory for c, creating the directory if
-// needed, at generation 1. It refuses a directory that already has a
-// cluster file, with an error that is fs.ErrExist.
-func Init(path string, c Cluster) (*Dir, error) {
+// Init makes path a cluster directory for c, with the cluster CA
+// certificate caCert, creating the directory if needed, at generation 1.
+// It refuses a directory that already has a cluster file or a CA
+// certificate, with an error that is fs.ErrExist. If it fails, it leaves
+// neither behind.
+func Init(path string, c Cluster, caCert []byte) (*Dir, error) {
 	c.Generation = 1
 	if err := c.check(); err != nil {
 		return nil, err
@@ -133,13 +139,53 @@ func Init(path string, c Cluster) (*Dir, error) {
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return nil, err
 	}
-	if err := createFile(filepath.Join(path, FileName), data); err != nil {
+	if err := CheckInit(path); err != nil {
+		return nil, err
+	}
+	file := filepath.Join(path, FileName)
+	caFile := filepath.Join(path, CAFileName)
+	if err := createFile(caFile, caCert); err != nil {
 		if errors.Is(err, fs.ErrExist) {
-			return nil, fmt.Errorf("%s is already a cluster directory: %w", path, err)
+			return nil, caExistsError(path)
+		}
+		return nil, err
+	}
+	if err := createFile(file, data); err != nil {
+		os.Remove(caFile)
+		if errors.Is(err, fs.ErrExist) {
+			return nil, existsError(path)
 		}
 		return nil, err
 	}
 	return &Dir{path: path, Cluster: c}, nil
+}
+
+// CheckInit checks that Init would accept path, as far as it is now:
+// that it has neither a cluster file nor a CA certificate.
+func CheckInit(path string) error {
+	if _, err := os.Lstat(filepath.Join(path, FileName)); err == nil {
+		return existsError(path)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if _, err := os.Lstat(filepath.Join(path, CAFileName)); err == nil {
+		return caExistsError(path)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// caExistsError says that path already has a CA certificate. It is
+// fs.ErrExist.
+func caExistsError(path string) error {
+	return fmt.Errorf("%s already has a cluster CA, %s: %w", path, CAFileName, fs.ErrExist)
+}
+
+// existsError says that path is already a cluster directory. It is
+// fs.ErrExist.
+func existsError(path string) error {
+	return fmt.Errorf("%s is already a cluster directory: %w", path, fs.ErrExist)
 }
 
 // Open opens the cluster directory at path. If it has no cluster file,
@@ -161,6 +207,11 @@ func Open(path string) (*Dir, error) {
 		return nil, fmt.Errorf("%s: %w", file, err)
 	}
 	return &Dir{path: path, Cluster: c}, nil
+}
+
+// CACert is the cluster CA certificate, PEM.
+func (d *Dir) CACert() ([]byte, error) {
+	return os.ReadFile(filepath.Join(d.path, CAFileName))
 }
 
 // Nodes are the nodes in the directory, by name.

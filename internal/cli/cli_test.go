@@ -169,6 +169,19 @@ func (o *operator) open() *secretstore.Store {
 	return s
 }
 
+// putSecret sets the secret called name to value in the operator's
+// secret store.
+func (o *operator) putSecret(name, value string) {
+	o.t.Helper()
+	s := o.open()
+	if err := s.Put(name, secretstore.Secret{Value: value}); err != nil {
+		o.t.Fatal(err)
+	}
+	if err := s.Save(); err != nil {
+		o.t.Fatal(err)
+	}
+}
+
 // scriptedTerminal is a scripted terminal. It answers lines from its queue and
 // records what was written to it.
 type scriptedTerminal struct {
