@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+// What every cluster service's API has in common, which is all the agent
+// knows of them. The agent routes a call to a service by the gRPC service
+// name of its API, and calls the service's Health and Describe as
+// "/<service name>/Health" and "/<service name>/Describe", whatever the
+// service's package.
+package moostack.service.v1;
+
+option go_package = "github.com/moostackhq/moostack/api/service/v1;servicev1";
+
+message HealthRequest {}
+
+message HealthResponse {
+  // Problem says why the service is unhealthy, empty if it is healthy.
+  string problem = 1;
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  // Methods are every method of the service's API. The agent refuses a
+  // call of any method not among them.
+  repeated Method methods = 1;
+}
+
+// Method is a method of a service's API, with who may call it.
+message Method {
+  // Name is the method's name, without its service's, such as "Health".
+  string name = 1;
+  // Callers are the caller kinds allowed to call the method. The agent
+  // refuses a call from any other, and the service never sees it.
+  repeated CallerKind callers = 2;
+}
+
+// CallerKind is who a call to a node comes from. The agent tells a
+// service in each call's metadata, under the key CallerKindKey, as the
+// value's name, such as "CALLER_KIND_OPERATOR".
+enum CallerKind {
+  CALLER_KIND_UNSPECIFIED = 0;
+  // CALLER_KIND_OPERATOR is an operator, through mooctl, on the node's
+  // own socket.
+  CALLER_KIND_OPERATOR = 1;
+  // CALLER_KIND_CONTROL_PLANE is the control plane.
+  CALLER_KIND_CONTROL_PLANE = 2;
+  // CALLER_KIND_PEER_NODE is the same service on another node.
+  CALLER_KIND_PEER_NODE = 3;
+  // CALLER_KIND_LOCAL_SERVICE is another cluster service on the same
+  // node.
+  CALLER_KIND_LOCAL_SERVICE = 4;
+}

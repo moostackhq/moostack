@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+prost = "0.14.4"
+tokio = { version = "1.54.0", features = ["rt", "macros", "net", "signal"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tonic = { version = "0.14.6", default-features = false, features = ["codegen", "router", "server", "transport"] }
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
