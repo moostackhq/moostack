@@ -37,6 +37,20 @@ service Agent {
   // BreakLock releases the operation lock, whichever lease holds it, and
   // answers with the lock it broke.
   rpc BreakLock(BreakLockRequest) returns (BreakLockResponse);
+  // ImportImage imports an image into the node's containerd, from an OCI
+  // image layout archive that the requests carry in chunks, in order. It
+  // answers with the names of the images it imported. Importing an image
+  // the node has changes nothing.
+  rpc ImportImage(stream ImportImageRequest) returns (ImportImageResponse);
+  // RunService runs a cluster service from its image, which the node must
+  // have imported, and routes calls of its API to it from then on, across
+  // restarts of the agent and the node. Running a service that already
+  // runs as asked changes nothing; running a service of a name the node
+  // runs already, at another version, from another image or of another
+  // API, replaces it, and the API it served before is routed no more. It
+  // refuses a service whose API a service of another name serves, with
+  // FAILED_PRECONDITION.
+  rpc RunService(RunServiceRequest) returns (RunServiceResponse);
 }
 
 // Updater is the node API that the updater serves, on its own socket, so
@@ -65,6 +79,10 @@ message StatusResponse {
   string generation_unknown = 5;
   // Lock is the operation lock, unset if no lease holds it.
   Lock lock = 6;
+  // Services are the cluster services the node runs, each at the version
+  // it was run at, and healthy if it answers its health call without a
+  // problem.
+  repeated Component services = 7;
 }
 
 // RecordGenerationRequest is a generation of the cluster directory that
@@ -129,6 +147,34 @@ message BreakLockResponse {
   Lock broken = 1;
 }
 
+message ImportImageRequest {
+  // Chunk is the archive's next bytes.
+  bytes chunk = 1;
+}
+
+message ImportImageResponse {
+  // Images are the names of the images imported.
+  repeated string images = 1;
+}
+
+// Service is a cluster service as a node runs it.
+message Service {
+  // Name is the service's, such as registry.
+  string name = 1;
+  string version = 2;
+  // Api is the gRPC service name of the service's API, which the agent
+  // routes calls to the service by.
+  string api = 3;
+  // Image is the name of the service's image in the node's containerd.
+  string image = 4;
+}
+
+message RunServiceRequest {
+  Service service = 1;
+}
+
+message RunServiceResponse {}
+
 message UpdaterStatusRequest {}
 
 message UpdaterStatusResponse {
@@ -145,9 +191,10 @@ enum Mode {
   MODE_CONTROL_PLANE = 2;
 }
 
-// Component is a node component as the agent or the updater sees it.
+// Component is a node component or a cluster service as the agent or the
+// updater sees it.
 message Component {
-  // Name is agent, updater or containerd.
+  // Name is agent, updater or containerd, or the cluster service's.
   string name = 1;
   // Version is empty when the agent can't tell it.
   string version = 2;

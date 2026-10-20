@@ -1,0 +1,20 @@
+[package]
+name = "moostack-registry"
+description = "The registry"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "registry"
+path = "src/main.rs"
+
+[dependencies]
+moostack-service = { path = "../service" }
+prost.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true

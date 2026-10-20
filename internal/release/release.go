@@ -1,6 +1,6 @@
 // Package release reads and writes Moostack releases: a manifest that
-// pins each node component's version, the components' files for each
-// architecture, and their checksums.
+// pins the version of each node component and cluster service, their
+// files for each architecture, and the files' checksums.
 //
 // A release source is a directory holding one directory per release,
 // named for its version:
@@ -36,10 +36,12 @@ const (
 // Architectures are the architectures every release has files for.
 var Architectures = []string{"amd64", "arm64"}
 
-// Manifest pins the version of each node component.
+// Manifest pins the version of each node component and cluster
+// service.
 type Manifest struct {
 	Version    string      `yaml:"version"`
 	Components []Component `yaml:"components"`
+	Services   []Service   `yaml:"services,omitempty"`
 }
 
 // Component is a node component in a release.
@@ -49,6 +51,74 @@ type Component struct {
 	// Files are the component's files, the same for every architecture.
 	Files []string `yaml:"files"`
 }
+
+// Service is a cluster service in a release.
+type Service struct {
+	Name    string `yaml:"name"`
+	Version string `yaml:"version"`
+	// API is the gRPC service name of the service's API, which the agent
+	// routes calls to the service by.
+	API string `yaml:"api"`
+	// Image is the file of the service's image, an OCI image layout
+	// archive, for every architecture. It names the image ImageRef.
+	Image string `yaml:"image"`
+}
+
+// ImageRef is the name of the image of version of the service called
+// name, which containerd knows it by once imported.
+func ImageRef(name, version string) string {
+	return "moostack.local/" + name + ":" + version
+}
+
+// Service returns the service called name.
+func (m Manifest) Service(name string) (Service, bool) {
+	i := slices.IndexFunc(m.Services, func(s Service) bool { return s.Name == name })
+	if i < 0 {
+		return Service{}, false
+	}
+	return m.Services[i], true
+}
+
+// Pin is the version that a release pins a component or a cluster
+// service at, by its name.
+type Pin struct{ Name, Version string }
+
+// PinnedComponents are the versions m pins its components at.
+func (m Manifest) PinnedComponents() []Pin {
+	var pins []Pin
+	for _, c := range m.Components {
+		pins = append(pins, Pin{c.Name, c.Version})
+	}
+	return pins
+}
+
+// PinnedServices are the versions m pins its cluster services at.
+func (m Manifest) PinnedServices() []Pin {
+	var pins []Pin
+	for _, s := range m.Services {
+		pins = append(pins, Pin{s.Name, s.Version})
+	}
+	return pins
+}
+
+// files are the files of every component and service, each with what it
+// belongs to.
+func (m Manifest) files() []ownedFile {
+	var files []ownedFile
+	for _, c := range m.Components {
+		for _, f := range c.Files {
+			files = append(files, ownedFile{c.Name, f})
+		}
+	}
+	for _, s := range m.Services {
+		files = append(files, ownedFile{s.Name, s.Image})
+	}
+	return files
+}
+
+// ownedFile is a file of a release, with the component or service it
+// belongs to.
+type ownedFile struct{ owner, name string }
 
 // Component returns the component called name.
 func (m Manifest) Component(name string) (Component, bool) {
@@ -107,16 +177,24 @@ func Open(source, version string) (*Release, error) {
 		if c.Name == "" || c.Version == "" || len(c.Files) == 0 {
 			return nil, fmt.Errorf("release %s: a component without a name, version or files", version)
 		}
-		for _, f := range c.Files {
-			if f == "" || f == "." || f == ".." || strings.ContainsAny(f, `/\`) {
-				return nil, fmt.Errorf("release %s: %s's file %q isn't a plain file name", version, c.Name, f)
-			}
+	}
+	names, apis := map[string]bool{}, map[string]bool{}
+	for _, s := range r.Services {
+		if s.Name == "" || s.Version == "" || s.API == "" || s.Image == "" {
+			return nil, fmt.Errorf("release %s: a service without a name, version, API or image", version)
+		}
+		if names[s.Name] || apis[s.API] {
+			return nil, fmt.Errorf("release %s: two services called %s or serving %s", version, s.Name, s.API)
+		}
+		names[s.Name], apis[s.API] = true, true
+	}
+	for _, f := range r.files() {
+		if f.name == "" || f.name == "." || f.name == ".." || strings.ContainsAny(f.name, `/\`) {
+			return nil, fmt.Errorf("release %s: %s's file %q isn't a plain file name", version, f.owner, f.name)
 		}
 		for _, arch := range Architectures {
-			for _, f := range c.Files {
-				if _, ok := r.sums[filePath(arch, f)]; !ok {
-					return nil, fmt.Errorf("release %s: %s has no checksum", version, filePath(arch, f))
-				}
+			if _, ok := r.sums[filePath(arch, f.name)]; !ok {
+				return nil, fmt.Errorf("release %s: %s has no checksum", version, filePath(arch, f.name))
 			}
 		}
 	}
@@ -160,20 +238,18 @@ func (r *Release) ReadFile(arch, file string) ([]byte, error) {
 }
 
 // Write writes m's manifest and checksums into dir, whose linux-<arch>
-// directories already hold each component's files.
+// directories already hold each component's files and service's image.
 func Write(dir string, m Manifest) error {
 	var sums bytes.Buffer
 	for _, arch := range Architectures {
-		for _, c := range m.Components {
-			for _, f := range c.Files {
-				p := filePath(arch, f)
-				data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(p)))
-				if err != nil {
-					return err
-				}
-				sum := sha256.Sum256(data)
-				fmt.Fprintf(&sums, "%s  %s\n", hex.EncodeToString(sum[:]), p)
+		for _, f := range m.files() {
+			p := filePath(arch, f.name)
+			data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(p)))
+			if err != nil {
+				return err
 			}
+			sum := sha256.Sum256(data)
+			fmt.Fprintf(&sums, "%s  %s\n", hex.EncodeToString(sum[:]), p)
 		}
 	}
 	data, err := yaml.Marshal(m)

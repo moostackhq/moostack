@@ -333,7 +333,7 @@ func printStatus(env Env, view statusView) error {
 			problems = append(problems, fmt.Sprintf("%s: %s", n.Name, n.Error))
 			continue
 		}
-		for _, c := range n.Components {
+		for _, c := range append(slices.Clone(n.Components), n.Services...) {
 			fmt.Fprintf(w, "%s\tyes\t%s\t%s\t%s\t%s\t%s\n", n.Name, dash(n.Mode), c.Name, dash(c.Running), dash(c.Pinned), c.Health)
 			if c.Problem != "" {
 				problems = append(problems, fmt.Sprintf("%s: %s: %s", n.Name, c.Name, c.Problem))
@@ -477,11 +477,14 @@ type nodeStatusView struct {
 	// cluster directory's, or why the node can't tell it.
 	GenerationProblem string                `json:"generation_problem,omitempty"`
 	Components        []componentStatusView `json:"components,omitempty"`
+	// Services are the cluster services, as Components are the node
+	// components.
+	Services []componentStatusView `json:"services,omitempty"`
 }
 
-// componentStatusView is a component in cluster status: one for each
-// component the release pins, in its order, then one for each component
-// it doesn't. Running is empty if the node didn't report a version, and
+// componentStatusView is a component or a cluster service in cluster
+// status: one for each that the release pins, in its order, then one for
+// each it doesn't. Running is empty if the node didn't report a version, and
 // Pinned if the release doesn't pin the component. A pinned component
 // the node didn't report is of unknown health.
 type componentStatusView struct {
@@ -515,7 +518,8 @@ func statusOf(d *cluster.Dir, rel *release.Release, reached []orchestrate.Reache
 		if err := r.GenerationProblem(d.Cluster.Generation); err != nil {
 			n.GenerationProblem = err.Error()
 		}
-		n.Components = componentsOf(rel, r.Status.Components)
+		n.Components = componentsOf(rel.PinnedComponents(), r.Status.Components)
+		n.Services = componentsOf(rel.PinnedServices(), r.Status.Services)
 		view.Nodes = append(view.Nodes, n)
 	}
 	return view
@@ -529,24 +533,24 @@ func dash(s string) string {
 	return s
 }
 
-// componentsOf are the components of a node that reported components,
-// pinned at rel.
-func componentsOf(rel *release.Release, components []*nodev1.Component) []componentStatusView {
-	reported := map[string]*nodev1.Component{}
-	for _, c := range components {
-		reported[c.Name] = c
+// componentsOf are the components or cluster services that a node
+// reported, pinned as pinned.
+func componentsOf(pinned []release.Pin, reported []*nodev1.Component) []componentStatusView {
+	byName := map[string]*nodev1.Component{}
+	for _, c := range reported {
+		byName[c.Name] = c
 	}
 	var views []componentStatusView
-	for _, p := range rel.Components {
-		c, ok := reported[p.Name]
+	for _, p := range pinned {
+		c, ok := byName[p.Name]
 		if !ok {
 			views = append(views, componentStatusView{Name: p.Name, Pinned: p.Version, Health: nodeclient.HealthName(nodev1.Health_HEALTH_UNSPECIFIED)})
 			continue
 		}
 		views = append(views, reportedComponent(c, p.Version))
 	}
-	for _, c := range components {
-		if _, ok := rel.Component(c.Name); !ok {
+	for _, c := range reported {
+		if !slices.ContainsFunc(pinned, func(p release.Pin) bool { return p.Name == c.Name }) {
 			views = append(views, reportedComponent(c, ""))
 		}
 	}

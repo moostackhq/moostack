@@ -1,7 +1,8 @@
 //go:build linux
 
-// Package agent is the node component that serves the node API, and
-// listens for the node's peers with mTLS.
+// Package agent is the node component that serves the node API, runs
+// the cluster services and carries calls to them, and listens for the
+// node's peers with mTLS.
 package agent
 
 import (
@@ -9,25 +10,27 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
-	versionv1 "github.com/containerd/containerd/api/services/version/v1"
+	containerd "github.com/containerd/containerd/v2/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
+	servicev1 "github.com/moostackhq/moostack/api/service/v1"
+	"github.com/moostackhq/moostack/internal/gateway"
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/rootsocket"
@@ -49,6 +52,15 @@ type Config struct {
 	LockFile string
 	// ContainerdSocket is where containerd serves its API.
 	ContainerdSocket string
+	// Runc is runc's binary, whose version the agent reports. containerd
+	// finds it on the PATH its unit gives it.
+	Runc string
+	// ServicesFile keeps the cluster services the node runs. Its
+	// directory must exist.
+	ServicesFile string
+	// ServicesDir holds each cluster service's socket directory, and
+	// ServiceLogDir their output.
+	ServicesDir, ServiceLogDir string
 	// Identity is the node's identity, which it proves to its peers.
 	Identity identity.Files
 	// PeerPort is the port to listen for peers on, at the node's private
@@ -67,7 +79,9 @@ const containerdTimeout = 2 * time.Second
 // Serve serves the node API on cfg.Socket, and listens for peers at the
 // node's private address, until ctx ends. Peers connect with mTLS, and
 // only those with an identity from the cluster CA are accepted. It won't
-// serve without a valid identity of its own.
+// serve without a valid identity of its own. Calls on cfg.Socket that
+// aren't the node API's go to the cluster services, as an operator's,
+// and the services that aren't running are started.
 func Serve(ctx context.Context, cfg Config) error {
 	data, err := os.ReadFile(cfg.NodeFile)
 	if err != nil {
@@ -81,11 +95,17 @@ func Serve(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	containerd, err := grpc.NewClient("unix://"+cfg.ContainerdSocket, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	client, err := containerd.New(cfg.ContainerdSocket, containerd.WithTimeout(containerdTimeout))
 	if err != nil {
 		return err
 	}
-	defer containerd.Close()
+	defer client.Close()
+	gw := gateway.New()
+	defer gw.Close()
+	services, err := loadServices(ctx, client, gw, cfg.ServicesFile, cfg.ServicesDir, cfg.ServiceLogDir)
+	if err != nil {
+		return err
+	}
 
 	peerListener, err := net.Listen("tcp", netip.AddrPortFrom(node.PrivateAddress, cfg.PeerPort).String())
 	if err != nil {
@@ -96,10 +116,11 @@ func Serve(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	server := grpc.NewServer()
-	nodev1.RegisterAgentServer(server, &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: versionv1.NewVersionClient(containerd), generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile)})
+	server := grpc.NewServer(gw.ServerOptions(servicev1.CallerKind_CALLER_KIND_OPERATOR)...)
+	nodev1.RegisterAgentServer(server, &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: client, runc: cfg.Runc, services: services, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile)})
 	peers := grpc.NewServer(grpc.Creds(credentials.NewTLS(id.ServerTLS())))
 	healthpb.RegisterHealthServer(peers, health.NewServer())
+	go services.StartAll(ctx)
 	return serveAll(ctx, map[*grpc.Server]net.Listener{server: l, peers: peerListener})
 }
 
@@ -144,7 +165,9 @@ type agentServer struct {
 	nodev1.UnimplementedAgentServer
 	version        string
 	mode           nodev1.Mode
-	containerd     versionv1.VersionClient
+	containerd     *containerd.Client
+	runc           string
+	services       *services
 	generationFile string
 	lock           *operationLock
 }
@@ -155,8 +178,10 @@ func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nod
 		Components: []*nodev1.Component{
 			{Name: "agent", Version: s.version, Health: nodev1.Health_HEALTH_HEALTHY},
 			s.containerdStatus(ctx),
+			s.runcStatus(ctx),
 		},
-		Lock: s.lockStatus(),
+		Lock:     s.lockStatus(),
+		Services: s.services.Status(ctx),
 	}
 	if applied, err := s.applied(); err != nil {
 		res.GenerationUnknown = err.Error()
@@ -260,7 +285,7 @@ func (s *agentServer) containerdStatus(ctx context.Context) *nodev1.Component {
 	ctx, cancel := context.WithTimeout(ctx, containerdTimeout)
 	defer cancel()
 	c := &nodev1.Component{Name: "containerd"}
-	v, err := s.containerd.Version(ctx, &emptypb.Empty{})
+	v, err := s.containerd.Version(ctx)
 	if err != nil {
 		c.Health = nodev1.Health_HEALTH_UNHEALTHY
 		c.Problem = err.Error()
@@ -269,4 +294,67 @@ func (s *agentServer) containerdStatus(ctx context.Context) *nodev1.Component {
 	c.Version = strings.TrimPrefix(v.Version, "v")
 	c.Health = nodev1.Health_HEALTH_HEALTHY
 	return c
+}
+
+// runcTimeout bounds asking runc for its version.
+const runcTimeout = 2 * time.Second
+
+// runcStatus is runc's version, as it says when run, healthy if it runs.
+func (s *agentServer) runcStatus(ctx context.Context) *nodev1.Component {
+	ctx, cancel := context.WithTimeout(ctx, runcTimeout)
+	defer cancel()
+	c := &nodev1.Component{Name: "runc", Health: nodev1.Health_HEALTH_UNHEALTHY}
+	out, err := exec.CommandContext(ctx, s.runc, "--version").Output()
+	if err != nil {
+		c.Problem = fmt.Sprintf("running %s --version: %v", s.runc, err)
+		return c
+	}
+	first, _, _ := strings.Cut(string(out), "\n")
+	version, ok := strings.CutPrefix(first, "runc version ")
+	if !ok {
+		c.Problem = fmt.Sprintf("%s --version says %q", s.runc, first)
+		return c
+	}
+	c.Version, c.Health = version, nodev1.Health_HEALTH_HEALTHY
+	return c
+}
+
+func (s *agentServer) ImportImage(stream nodev1.Agent_ImportImageServer) error {
+	r, w := io.Pipe()
+	go func() {
+		for {
+			req, err := stream.Recv()
+			if err == io.EOF {
+				w.Close()
+				return
+			}
+			if err != nil {
+				w.CloseWithError(err)
+				return
+			}
+			if _, err := w.Write(req.Chunk); err != nil {
+				return
+			}
+		}
+	}()
+	images, err := s.services.Import(stream.Context(), r)
+	// An import that stopped early leaves the rest of the stream unread.
+	r.CloseWithError(errors.New("the import ended"))
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "importing the image: %v", err)
+	}
+	return stream.SendAndClose(&nodev1.ImportImageResponse{Images: images})
+}
+
+func (s *agentServer) RunService(ctx context.Context, req *nodev1.RunServiceRequest) (*nodev1.RunServiceResponse, error) {
+	if req.Service == nil {
+		return nil, status.Error(codes.InvalidArgument, "no service")
+	}
+	if err := s.services.Run(ctx, req.Service); err != nil {
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
+		return nil, status.Errorf(codes.Internal, "running %s: %v", req.Service.Name, err)
+	}
+	return &nodev1.RunServiceResponse{}, nil
 }

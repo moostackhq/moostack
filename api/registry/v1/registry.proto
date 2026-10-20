@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+// The registry's service API. For now it is a skeleton: a health call, a
+// description of its methods, and the sample methods Echo and Ping.
+package moostack.registry.v1;
+
+import "api/service/v1/service.proto";
+
+service Registry {
+  // Health answers whether the service is healthy. Every caller kind may
+  // call it.
+  rpc Health(moostack.service.v1.HealthRequest) returns (moostack.service.v1.HealthResponse);
+  // Describe describes the service's methods. Every caller kind may call
+  // it.
+  rpc Describe(moostack.service.v1.DescribeRequest) returns (moostack.service.v1.DescribeResponse);
+  // Echo answers with the request's payload and who called. Every caller
+  // kind may call it.
+  rpc Echo(EchoRequest) returns (EchoResponse);
+  // Ping is Echo for peer nodes alone.
+  rpc Ping(EchoRequest) returns (EchoResponse);
+}
+
+message EchoRequest {
+  bytes payload = 1;
+}
+
+// EchoResponse is the request's payload, with who the call came from, as
+// the agent said in its metadata.
+message EchoResponse {
+  bytes payload = 1;
+  // CallerKind is the moostack.service.v1.CallerKind's name, and
+  // CallerNode the calling node's name, as the call's metadata gave
+  // them, empty if it gave none.
+  string caller_kind = 2;
+  string caller_node = 3;
+  // Calls is how many calls of Echo and Ping the service has received
+  // since it started, this one among them.
+  int64 calls = 4;
+}

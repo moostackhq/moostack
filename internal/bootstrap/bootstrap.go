@@ -1,7 +1,8 @@
 // Package bootstrap turns a host into a node over SSH: it checks the
 // host, installs containerd, the updater and the agent from a release as
-// systemd units, issues the node its identity, and removes them again if
-// anything fails.
+// systemd units, issues the node its identity, seeds the release's
+// cluster services into containerd through the agent and starts them,
+// and removes it all again if anything fails.
 package bootstrap
 
 import (
@@ -33,7 +34,7 @@ const (
 
 // units are the systemd units. systemd starts them together, the agent
 // after containerd. Uninstall stops them one by one in the reverse order,
-// the agent first.
+// the agent first, and containerd once the cluster services are gone.
 var units = []string{containerdUnit, updaterUnit, agentUnit}
 
 // hostFile is a file to write on the host.
@@ -47,7 +48,7 @@ var unitTemplates embed.FS
 
 // unitData is what the unit templates are executed with.
 type unitData struct {
-	BinDir, AgentBinary, UpdaterBinary, ContainerdConfigFile, ContainerdUnit string
+	BinDir, AgentBinary, UpdaterBinary, ContainerdConfigFile, ContainerdUnit, ContainerdPath string
 }
 
 // unitFiles are the unit files to install, rendered from unitTemplates,
@@ -63,6 +64,7 @@ func renderUnits() []hostFile {
 		UpdaterBinary:        hostlayout.Updater,
 		ContainerdConfigFile: hostlayout.ContainerdConfigFile,
 		ContainerdUnit:       containerdUnit,
+		ContainerdPath:       hostlayout.ContainerdPath,
 	}
 	var files []hostFile
 	for _, t := range tmpl.Templates() {
@@ -206,9 +208,16 @@ const healthTimeout = time.Minute
 // Install installs the components of rel for the host's architecture,
 // configured as node, with the node identity that ca issues it, starts
 // them, and waits until the agent and the updater report them healthy at
-// rel's versions. The node's key is made on the host, and never leaves
-// it. The host must have passed Check. If Install fails, it rolls back.
+// rel's versions. Then it has the agent import rel's cluster services'
+// images and run them, and waits until the agent reports them healthy at
+// rel's versions too. The node's key is made on the host, and never
+// leaves it. The host must have passed Check. Install refuses a release
+// without the cluster services before it changes the host. If Install
+// fails after that, it rolls back.
 func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig, ca *identity.CA) error {
+	if err := rel.CheckClusterServices(); err != nil {
+		return err
+	}
 	wait, err := healthWait()
 	if err != nil {
 		return err
@@ -271,22 +280,54 @@ func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 	if _, err := output(ctx, c, "systemctl daemon-reload && systemctl enable --now "+strings.Join(units, " ")); err != nil {
 		return err
 	}
-	return waitHealthy(ctx, c, rel, wait)
-}
-
-// waitHealthy waits until the agent and the updater report every
-// component healthy at the version rel pins, for up to wait, or until ctx
-// ends.
-func waitHealthy(parent context.Context, c *sshclient.Client, rel *release.Release, wait time.Duration) error {
-	node, err := nodeclient.Dial(c)
+	api, err := nodeclient.Dial(c)
 	if err != nil {
 		return err
 	}
-	defer node.Close()
+	defer api.Close()
+	if err := waitHealthy(ctx, api, wait, func(s nodeclient.Status) error { return componentsHealthy(s, rel) }); err != nil {
+		return err
+	}
+	if err := startServices(ctx, api, h, rel); err != nil {
+		return err
+	}
+	return waitHealthy(ctx, api, wait, func(s nodeclient.Status) error { return servicesHealthy(s, rel) })
+}
+
+// startServices has the agent import the image of each of rel's cluster
+// services for the host's architecture, checked against rel's checksums,
+// and run the service.
+func startServices(ctx context.Context, node *nodeclient.Node, h Host, rel *release.Release) error {
+	for _, s := range rel.Services {
+		data, err := rel.ReadFile(h.Architecture, s.Image)
+		if err != nil {
+			return err
+		}
+		ref := release.ImageRef(s.Name, s.Version)
+		images, err := nodeclient.ImportImage(ctx, node.Agent, data)
+		if err != nil {
+			return fmt.Errorf("seeding %s's image: %w", s.Name, err)
+		}
+		if !slices.Contains(images, ref) {
+			return fmt.Errorf("seeding %s's image imported %s, not %s", s.Name, strings.Join(images, ", "), ref)
+		}
+		_, err = node.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: &nodev1.Service{Name: s.Name, Version: s.Version, Api: s.API, Image: ref}})
+		if err != nil {
+			return fmt.Errorf("starting %s: %w", s.Name, err)
+		}
+	}
+	return nil
+}
+
+// waitHealthy waits until the status the agent and the updater report
+// passes check, for up to wait, or until ctx ends.
+func waitHealthy(parent context.Context, node *nodeclient.Node, wait time.Duration, check func(nodeclient.Status) error) error {
 	ctx, cancel := context.WithTimeout(parent, wait)
 	defer cancel()
 	for {
-		err := healthy(ctx, node, rel)
+		callCtx, cancelCall := context.WithTimeout(ctx, 5*time.Second)
+		err := check(node.Status(callCtx))
+		cancelCall()
 		if err == nil {
 			return nil
 		}
@@ -301,17 +342,29 @@ func waitHealthy(parent context.Context, c *sshclient.Client, rel *release.Relea
 	}
 }
 
-// healthy fails unless the agent and the updater report every component
-// of rel healthy at its pinned version.
-func healthy(ctx context.Context, node *nodeclient.Node, rel *release.Release) error {
-	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	status := node.Status(callCtx)
+// componentsHealthy fails unless status reports every component of rel
+// healthy at its pinned version.
+func componentsHealthy(status nodeclient.Status, rel *release.Release) error {
+	return reportedHealthy(status.Components, rel.PinnedComponents())
+}
+
+// servicesHealthy fails unless status reports every cluster service of
+// rel healthy at its pinned version.
+func servicesHealthy(status nodeclient.Status, rel *release.Release) error {
+	if status.AgentErr != nil {
+		return fmt.Errorf("the agent doesn't answer: %w", status.AgentErr)
+	}
+	return reportedHealthy(status.Services, rel.PinnedServices())
+}
+
+// reportedHealthy fails unless reported has each of pinned, healthy at
+// its version.
+func reportedHealthy(reported []*nodev1.Component, pinned []release.Pin) error {
 	running := map[string]*nodev1.Component{}
-	for _, comp := range status.Components {
+	for _, comp := range reported {
 		running[comp.Name] = comp
 	}
-	for _, want := range rel.Components {
+	for _, want := range pinned {
 		got := running[want.Name]
 		switch {
 		case got == nil:
@@ -328,10 +381,11 @@ func healthy(ctx context.Context, node *nodeclient.Node, rel *release.Release) e
 // uninstallTimeout bounds removing an install.
 const uninstallTimeout = 2 * time.Minute
 
-// Uninstall stops and removes the node components and everything an
-// install created. A unit that systemd doesn't know is fine, but a unit
-// that doesn't stop fails it before anything is removed, since its
-// program would keep running from the files. It goes ahead after ctx
+// Uninstall stops and removes the node components, the cluster
+// services' containers, and everything an install created. A unit that
+// systemd doesn't know is fine, but a unit that doesn't stop fails it
+// before anything is removed, since its program would keep running from
+// the files, and so do containers that don't end. It goes ahead after ctx
 // ends, within its own timeout.
 func Uninstall(ctx context.Context, c *sshclient.Client) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), uninstallTimeout)
@@ -339,17 +393,40 @@ func Uninstall(ctx context.Context, c *sshclient.Client) error {
 	stopOrder := slices.Clone(units)
 	slices.Reverse(stopOrder)
 	stopping := strings.Join(stopOrder, " ")
+	cgroup := hostlayout.CgroupDir
 	res, err := c.Run(ctx, `set -e
-for unit in `+stopping+`; do
-	if [ "$(systemctl show -p LoadState --value "$unit")" != not-found ]; then
-		systemctl disable --now "$unit"
+loaded() { [ "$(systemctl show -p LoadState --value "$1")" != not-found ]; }
+stop() {
+	if loaded "$1"; then
+		systemctl disable --now "$1"
 	fi
-	state=$(systemctl show -p ActiveState --value "$unit")
+	state=$(systemctl show -p ActiveState --value "$1")
 	case $state in
 	inactive|failed) ;;
-	*) echo "$unit is still $state" >&2; exit 1 ;;
+	*) echo "$1 is still $state" >&2; exit 1 ;;
 	esac
-done
+}
+stop `+agentUnit+`
+stop `+updaterUnit+`
+# The cluster services' containers, and containerd's shims, outlive
+# containerd's unit stopping, by its KillMode, so they are killed first.
+if [ -d `+cgroup+` ]; then
+	find `+cgroup+` -name cgroup.kill | while read -r kill; do echo 1 > "$kill"; done
+	for i in $(seq 50); do
+		find `+cgroup+` -depth -type d -exec rmdir {} + 2>/dev/null || true
+		[ -d `+cgroup+` ] || break
+		sleep 0.1
+	done
+	if [ -d `+cgroup+` ]; then
+		echo "the cluster services' containers in `+cgroup+` didn't end" >&2; exit 1
+	fi
+fi
+if loaded `+containerdUnit+`; then
+	systemctl kill --kill-whom=all --signal=SIGKILL `+containerdUnit+` 2>/dev/null || true
+fi
+stop `+containerdUnit+`
+# The containers' root filesystems stay mounted once they are killed.
+awk '{print $2}' /proc/self/mounts | grep -E '^(`+strings.Join(hostlayout.Dirs, "|")+`)(/|$)' | sort -r | while read -r m; do umount -l "$m"; done
 rm -f `+strings.Join(unitPaths(), " ")+`
 systemctl daemon-reload
 systemctl reset-failed `+stopping+` 2>/dev/null || true

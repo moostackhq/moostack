@@ -7,6 +7,7 @@
 package nodetest
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +29,8 @@ import (
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/identity"
+	"github.com/moostackhq/moostack/internal/nodeclient"
+	"github.com/moostackhq/moostack/internal/ociimage"
 	"github.com/moostackhq/moostack/internal/release"
 )
 
@@ -56,8 +60,9 @@ type Node struct {
 
 // programs are the node's programs, each started in the background with
 // its pid in /run/<name>.pid and its output in /var/log/<name>.log.
+// containerd has the PATH its unit gives it.
 var programs = []struct{ name, command string }{
-	{"containerd", hostlayout.BinDir + "/containerd --config " + hostlayout.ContainerdConfigFile},
+	{"containerd", "env PATH=" + hostlayout.ContainerdPath + " " + hostlayout.BinDir + "/containerd --config " + hostlayout.ContainerdConfigFile},
 	{"updater", hostlayout.Updater + " serve"},
 	{"agent", hostlayout.Agent + " serve"},
 }
@@ -74,9 +79,12 @@ func Start(t *testing.T) *Node {
 	t.Parallel()
 	bin := binaries(t)
 	n := &Node{NodeName: "node-1", config: t.TempDir()}
+	// The state directory is a volume of its own, since containerd's
+	// snapshots can't be overlays on the container's overlay.
 	out, err := exec.Command("docker", "run", "-d", "--rm", "--privileged",
 		"-v", bin+":"+hostlayout.BinDir+":ro",
 		"-v", n.config+":"+hostlayout.ConfigDir+":ro",
+		"-v", hostlayout.StateDir,
 		"debian:13-slim", "sleep", "infinity").Output()
 	if err != nil {
 		t.Fatalf("starting the node: %v\n%s", err, stderr(err))
@@ -88,8 +96,12 @@ func Start(t *testing.T) *Node {
 				log, _ := exec.Command("docker", "exec", n.Name, "cat", "/var/log/"+p.name+".log").CombinedOutput()
 				t.Logf("%s's log:\n%s", p.name, log)
 			}
+			for _, s := range release.ClusterServices {
+				log, _ := exec.Command("docker", "exec", n.Name, "cat", hostlayout.ServiceLogDir+"/"+s.Name+".log").CombinedOutput()
+				t.Logf("%s's log:\n%s", s.Name, log)
+			}
 		}
-		exec.Command("docker", "rm", "-f", n.Name).Run()
+		exec.Command("docker", "rm", "-f", "-v", n.Name).Run()
 	})
 	out, err = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", n.Name).Output()
 	if err != nil {
@@ -291,7 +303,7 @@ func (n *Node) EventuallyHealthy(t *testing.T) *nodev1.StatusResponse {
 		if status, err = n.Status(t); err != nil {
 			return err
 		}
-		for _, c := range status.Components {
+		for _, c := range append(slices.Clone(status.Components), status.Services...) {
 			if c.Health != nodev1.Health_HEALTH_HEALTHY {
 				return fmt.Errorf("%s is %s: %s", c.Name, c.Health, c.Problem)
 			}
@@ -299,6 +311,119 @@ func (n *Node) EventuallyHealthy(t *testing.T) *nodev1.StatusResponse {
 		return nil
 	})
 	return status
+}
+
+// StartServices has the agent import the cluster services' images and
+// run them, as node add does, and waits until the agent reports every
+// component and service healthy.
+func (n *Node) StartServices(t *testing.T) *nodev1.StatusResponse {
+	t.Helper()
+	for _, s := range release.ClusterServices {
+		n.ImportImage(t, s.Name)
+		n.RunService(t, s.Name)
+	}
+	return n.EventuallyHealthy(t)
+}
+
+// ImportImage has the agent import the image of the cluster service
+// called name, within a minute.
+func (n *Node) ImportImage(t *testing.T, name string) {
+	t.Helper()
+	n.importImage(t, name+".tar", release.ImageRef(name, Version))
+}
+
+// ImportFixtures has the agent import the images of Fixture and Broken.
+func (n *Node) ImportFixtures(t *testing.T) {
+	t.Helper()
+	n.importImage(t, fixtureImage, Fixture().Image)
+	n.importImage(t, brokenImage, Broken().Image)
+}
+
+// ImportFixtureAs has the agent import an image of fixtureservice that
+// serves svc's API, named as svc's image.
+func (n *Node) ImportFixtureAs(t *testing.T, svc *nodev1.Service) {
+	t.Helper()
+	program, err := os.ReadFile(filepath.Join(binaries(t), imagesDir, fixtureProgram))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	if err := ociimage.Write(&archive, fixtureImageOf(program, svc)); err != nil {
+		t.Fatal(err)
+	}
+	n.importArchive(t, svc.Image, archive.Bytes(), svc.Image)
+}
+
+// importImage has the agent import the image archive file in
+// imagesDir, which holds the image want, within a minute.
+func (n *Node) importImage(t *testing.T, file, want string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(binaries(t), imagesDir, file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.importArchive(t, file, data, want)
+}
+
+// importArchive has the agent import the image archive data, which
+// holds the image want, within a minute. what names the archive in a
+// failure.
+func (n *Node) importArchive(t *testing.T, what string, data []byte, want string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	images, err := nodeclient.ImportImage(ctx, n.Agent, data)
+	if err != nil {
+		t.Fatalf("importing %s: %v", what, err)
+	}
+	if !slices.Contains(images, want) {
+		t.Fatalf("importing %s imported %v, want %s", what, images, want)
+	}
+}
+
+// Fixture is the dns service as the test program fixtureservice serves
+// it: the same API, but every caller kind may call each method, Ping
+// too.
+func Fixture() *nodev1.Service {
+	s := Service("dns")
+	s.Version = "fixture"
+	s.Image = release.ImageRef(s.Name, s.Version)
+	return s
+}
+
+// Broken is a service whose image has no program, so that it never
+// starts.
+func Broken() *nodev1.Service {
+	return &nodev1.Service{Name: "broken", Version: Version, Api: "moostack.broken.v1.Broken", Image: release.ImageRef("broken", Version)}
+}
+
+// RunService has the agent run the cluster service called name, as the
+// release pins it, within a minute.
+func (n *Node) RunService(t *testing.T, name string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: Service(name)}); err != nil {
+		t.Fatalf("running %s: %v", name, err)
+	}
+}
+
+// Service is the cluster service called name, as the release under test
+// pins it.
+func Service(name string) *nodev1.Service {
+	for _, s := range release.ClusterServices {
+		if s.Name == name {
+			return &nodev1.Service{Name: s.Name, Version: Version, Api: s.API, Image: release.ImageRef(s.Name, Version)}
+		}
+	}
+	panic("nodetest: no cluster service " + name)
+}
+
+// AgentConn is a connection to the agent's socket, through its relay,
+// for calls to the cluster services.
+func (n *Node) AgentConn(t *testing.T) *grpc.ClientConn {
+	t.Helper()
+	return n.dial(t, hostlayout.AgentSocket)
 }
 
 // Kill kills one of the node's programs: containerd, updater or agent.
@@ -352,9 +477,21 @@ var (
 	binErr  error
 )
 
+// imagesDir is the directory, in binaries', of the cluster services'
+// images, and of fixtureImage and brokenImage.
+const imagesDir = "images"
+
+// The image archives of Fixture and Broken, in imagesDir.
+const (
+	fixtureImage = "fixture.tar"
+	brokenImage  = "broken.tar"
+)
+
 // binaries returns a directory holding the agent and the updater, built
 // from this checkout with Version, and the release's containerd binaries
-// for this machine's architecture. Cleanup removes it.
+// and runc for this machine's architecture, with the cluster services'
+// images in imagesDir, also built with Version, and Fixture's and
+// Broken's. Cleanup removes it.
 func binaries(t *testing.T) string {
 	t.Helper()
 	binOnce.Do(func() {
@@ -368,6 +505,16 @@ func binaries(t *testing.T) string {
 			return
 		}
 		if binErr = release.FetchContainerd(context.Background(), runtime.GOARCH, filepath.Join(cache, "moostack-release"), binDir); binErr != nil {
+			return
+		}
+		if binErr = release.FetchRunc(context.Background(), runtime.GOARCH, filepath.Join(cache, "moostack-release"), binDir); binErr != nil {
+			return
+		}
+		if _, binErr = release.BuildServices(context.Background(), checkout(), runtime.GOARCH, Version, filepath.Join(binDir, imagesDir)); binErr != nil {
+			return
+		}
+		binErr = writeFixtureImages(filepath.Join(binDir, imagesDir))
+		if binErr != nil {
 			return
 		}
 		for _, program := range []string{"agent", "updater"} {
@@ -384,6 +531,51 @@ func binaries(t *testing.T) string {
 		t.Fatal(binErr)
 	}
 	return binDir
+}
+
+// fixtureProgram is fixtureservice's binary, in imagesDir.
+const fixtureProgram = "fixtureservice"
+
+// fixtureImageOf is an image of fixtureservice, program, that serves
+// svc's API, named as svc's image.
+func fixtureImageOf(program []byte, svc *nodev1.Service) ociimage.Image {
+	return ociimage.Image{Name: svc.Image, Architecture: runtime.GOARCH, Entrypoint: []string{"/fixtureservice", svc.Api},
+		Files: []ociimage.File{{Name: "fixtureservice", Mode: 0o755, Data: program}}}
+}
+
+// writeFixtureImages builds fixtureservice into dir, as fixtureProgram,
+// and writes Fixture's image of it there, and Broken's, which has no
+// program.
+func writeFixtureImages(dir string) error {
+	program := filepath.Join(dir, fixtureProgram)
+	cmd := exec.Command("go", "build", "-o", program, "github.com/moostackhq/moostack/internal/nodetest/fixtureservice")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("building fixtureservice: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(program)
+	if err != nil {
+		return err
+	}
+	images := []struct {
+		file  string
+		image ociimage.Image
+	}{
+		{fixtureImage, fixtureImageOf(data, Fixture())},
+		{brokenImage, ociimage.Image{Name: Broken().Image, Architecture: runtime.GOARCH, Entrypoint: []string{"/missing"}}},
+	}
+	for _, img := range images {
+		if err := ociimage.WriteFile(filepath.Join(dir, img.file), img.image); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkout is the root of this checkout.
+func checkout() string {
+	_, file, _, _ := runtime.Caller(0)
+	return filepath.Join(filepath.Dir(file), "..", "..")
 }
 
 // Cleanup removes what the package's tests left behind. Call it from

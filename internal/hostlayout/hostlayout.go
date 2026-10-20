@@ -34,6 +34,12 @@ const (
 	AgentSocket = RunDir + "/agent.sock"
 	// Updater is the updater's binary.
 	Updater = BinDir + "/updater"
+	// Runc is runc's binary, which containerd's shim runs each container
+	// with.
+	Runc = BinDir + "/runc"
+	// ContainerdPath is containerd's PATH, where it finds its shim and
+	// the shim finds runc: BinDir first.
+	ContainerdPath = BinDir + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	// UpdaterSocket is where the updater serves its node API, to root
 	// only.
 	UpdaterSocket = RunDir + "/updater.sock"
@@ -52,6 +58,29 @@ const (
 	// PeerPort is the port the agent listens for peers on, at the node's
 	// private address.
 	PeerPort = 7443
+	// ServicesFile holds the cluster services the node runs, as JSON,
+	// which are the agent's routes.
+	ServicesFile = StateDir + "/services"
+	// ServicesDir holds a directory for each cluster service, named for
+	// it, which the agent mounts in the service's container, where the
+	// service serves its API. It is root's alone, so that no other user
+	// of the host reaches a service around the agent.
+	ServicesDir = RunDir + "/services"
+	// ServiceLogDir holds each cluster service's output, as <name>.log.
+	ServiceLogDir = StateDir + "/logs"
+	// ContainerdNamespace is the containerd namespace of Moostack's
+	// containers and images.
+	ContainerdNamespace = "moostack"
+	// RuncRoot is where runc keeps the state of Moostack's containers.
+	RuncRoot = RunDir + "/runc"
+	// CgroupParent is the cgroup, under the host's cgroup root, of the
+	// cluster services' containers, each in one of its own.
+	CgroupParent = "/moostack"
+	// CgroupDir is CgroupParent in the host's cgroup filesystem.
+	CgroupDir = "/sys/fs/cgroup" + CgroupParent
+	// ServiceUser is the user and group, by ID, that the cluster services
+	// run as: nobody.
+	ServiceUser = 65534
 )
 
 // Identity is where the node keeps its node identity, which the agent
@@ -76,8 +105,9 @@ func Server(socket string) (string, bool) {
 }
 
 // ContainerdConfig keeps containerd's files and sockets under Moostack's
-// directories, and reads no other config, so it doesn't clash with
-// another containerd on the host. Kubernetes' CRI and NRI are off.
+// directories, and its shims' sockets too, and reads no other config, so
+// it doesn't clash with another containerd on the host. Kubernetes' CRI
+// and NRI are off.
 const ContainerdConfig = `version = 4
 root = "` + StateDir + `/containerd"
 state = "` + RunDir + `/containerd"
@@ -102,6 +132,9 @@ disabled_plugins = [
 
 [plugins."io.containerd.internal.v1.opt"]
   path = "` + StateDir + `/containerd-opt"
+
+[plugins."io.containerd.shim.v1.manager"]
+  socket_dir = "` + RunDir + `/containerd/s"
 `
 
 // ModeDirect is the mode of a node operated by mooctl over SSH.

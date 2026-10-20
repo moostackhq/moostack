@@ -99,6 +99,9 @@ type Status struct {
 	// or the updater that didn't answer is unhealthy, with why as its
 	// problem, and the components only the agent reports are missing.
 	Components []*nodev1.Component
+	// Services are the cluster services the node runs, none if the agent
+	// didn't answer.
+	Services []*nodev1.Component
 }
 
 // Status asks the agent and the updater for their status, both at once,
@@ -125,6 +128,7 @@ func (n *Node) Status(ctx context.Context) Status {
 		s.Generation, s.Nodes, s.GenerationUnknown = agent.Generation, agent.Nodes, agent.GenerationUnknown
 		s.Lock = lockOf(agent.Lock)
 		s.Components = append(s.Components, agent.Components...)
+		s.Services = agent.Services
 	}
 	if updaterErr != nil {
 		s.UpdaterErr = updaterErr
@@ -237,4 +241,29 @@ func HealthName(h nodev1.Health) string {
 		return "unknown"
 	}
 	return strings.ToLower(strings.TrimPrefix(h.String(), "HEALTH_"))
+}
+
+// importChunk is how much of an image archive each request carries.
+const importChunk = 1 << 20
+
+// ImportImage has agent import the OCI image layout archive data into
+// the node's containerd, and returns the names of the images imported.
+func ImportImage(ctx context.Context, agent nodev1.AgentClient, data []byte) ([]string, error) {
+	stream, err := agent.ImportImage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for len(data) > 0 {
+		n := min(len(data), importChunk)
+		if err := stream.Send(&nodev1.ImportImageRequest{Chunk: data[:n]}); err != nil {
+			// The agent ended the call; CloseAndRecv says why.
+			break
+		}
+		data = data[n:]
+	}
+	res, err := stream.CloseAndRecv()
+	if err != nil {
+		return nil, err
+	}
+	return res.Images, nil
 }

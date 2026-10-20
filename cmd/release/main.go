@@ -1,5 +1,6 @@
 // Command release builds a Moostack release from this checkout, and the
-// mooctl that belongs to it. Run it from the checkout's root:
+// mooctl that belongs to it. Run it from the checkout's root, with Go and
+// cargo:
 //
 //	go run ./cmd/release -version 0.1.0 [-out dist] [-dev]
 //
@@ -49,6 +50,7 @@ func build(ctx context.Context, version, out string, dev bool) error {
 	if err := os.RemoveAll(dir); err != nil {
 		return err
 	}
+	var services []release.Service
 	for _, arch := range release.Architectures {
 		archDir := filepath.Join(dir, "linux-"+arch)
 		for _, program := range []string{"agent", "updater"} {
@@ -59,6 +61,12 @@ func build(ctx context.Context, version, out string, dev bool) error {
 		if err := release.FetchContainerd(ctx, arch, cache, archDir); err != nil {
 			return err
 		}
+		if err := release.FetchRunc(ctx, arch, cache, archDir); err != nil {
+			return err
+		}
+		if services, err = release.BuildServices(ctx, ".", arch, version, archDir); err != nil {
+			return err
+		}
 	}
 	err = release.Write(dir, release.Manifest{
 		Version: version,
@@ -66,7 +74,9 @@ func build(ctx context.Context, version, out string, dev bool) error {
 			{Name: "agent", Version: version, Files: []string{"agent"}},
 			{Name: "updater", Version: version, Files: []string{"updater"}},
 			{Name: "containerd", Version: release.ContainerdVersion, Files: release.ContainerdFiles},
+			{Name: "runc", Version: release.RuncVersion, Files: []string{"runc"}},
 		},
+		Services: services,
 	})
 	if err != nil {
 		return err

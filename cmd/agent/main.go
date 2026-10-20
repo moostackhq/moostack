@@ -41,6 +41,10 @@ func run(args []string) error {
 			GenerationFile:   hostlayout.GenerationFile,
 			LockFile:         hostlayout.LockFile,
 			ContainerdSocket: hostlayout.ContainerdSocket,
+			Runc:             hostlayout.Runc,
+			ServicesFile:     hostlayout.ServicesFile,
+			ServicesDir:      hostlayout.ServicesDir,
+			ServiceLogDir:    hostlayout.ServiceLogDir,
 			Identity:         hostlayout.Identity,
 			PeerPort:         hostlayout.PeerPort,
 		})

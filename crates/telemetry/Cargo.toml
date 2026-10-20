@@ -1,0 +1,20 @@
+[package]
+name = "moostack-telemetry"
+description = "The telemetry service"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "telemetry"
+path = "src/main.rs"
+
+[dependencies]
+moostack-service = { path = "../service" }
+prost.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
