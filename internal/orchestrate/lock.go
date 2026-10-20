@@ -104,7 +104,7 @@ func (c *Cluster) takeLease(ctx context.Context, timeout time.Duration) []error 
 		wg.Go(func() {
 			sent, err := c.take(ctx, n.conn, timeout)
 			if err != nil {
-				errs[i] = fmt.Errorf("%s: %w", n.name, err)
+				errs[i] = &NodeError{Node: n.name, Err: err}
 				return
 			}
 			c.mu.Lock()

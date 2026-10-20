@@ -1,8 +1,9 @@
-// Package cluster reads and writes a cluster directory: the cluster file
-// and one file per node.
+// Package cluster reads and writes a cluster directory: the cluster file,
+// one file per node, and the list of removed node identities.
 package cluster
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -25,6 +26,11 @@ const FileName = "cluster.yml"
 // CAFileName is the cluster CA certificate's file name in the cluster
 // directory. Its key is in the secret store.
 const CAFileName = "ca.crt"
+
+// RemovedFileName is the file in the cluster directory that lists the
+// identities of the nodes removed from the cluster, which the nodes
+// refuse as peers.
+const RemovedFileName = "removed-identities.yml"
 
 // nodesDir is the directory of node files, one per node, each named for
 // its node.
@@ -66,6 +72,9 @@ type Node struct {
 	PrivateAddress netip.Addr
 	// Architecture is amd64 or arm64.
 	Architecture string
+	// Identity is the fingerprint of the node identity the cluster CA
+	// issued the node, which removing the node lists as removed.
+	Identity string
 }
 
 // nodeFile is a node file's content.
@@ -75,6 +84,7 @@ type nodeFile struct {
 	HostKey        string `yaml:"host_key"`
 	PrivateAddress string `yaml:"private_address"`
 	Architecture   string `yaml:"architecture"`
+	Identity       string `yaml:"identity"`
 }
 
 func (n Node) check() error {
@@ -92,6 +102,25 @@ func (n Node) check() error {
 		return errors.New("no private address")
 	case n.Architecture == "":
 		return errors.New("no architecture")
+	}
+	return nil
+}
+
+// checkIdentity checks n's identity, which an install issues after
+// CheckNewNode.
+func (n Node) checkIdentity() error {
+	if err := checkFingerprint(n.Identity); err != nil {
+		return fmt.Errorf("identity: %w", err)
+	}
+	return nil
+}
+
+// checkFingerprint checks that fp is a node identity's fingerprint: the
+// SHA-256 of its certificate, hex, after "sha256:".
+func checkFingerprint(fp string) error {
+	sum, ok := strings.CutPrefix(fp, "sha256:")
+	if _, err := hex.DecodeString(sum); !ok || err != nil || len(sum) != 64 || strings.ToLower(sum) != sum {
+		return fmt.Errorf("%q isn't sha256: and 64 lowercase hex digits", fp)
 	}
 	return nil
 }
@@ -249,7 +278,7 @@ func (d *Dir) readNode(name string) (Node, error) {
 	if err := strictyaml.Unmarshal(data, &f); err != nil {
 		return Node{}, err
 	}
-	n := Node{Name: name, Address: f.Address, User: f.User, Architecture: f.Architecture}
+	n := Node{Name: name, Address: f.Address, User: f.User, Architecture: f.Architecture, Identity: f.Identity}
 	if f.HostKey != "" {
 		if n.HostKey, _, _, _, err = ssh.ParseAuthorizedKey([]byte(f.HostKey)); err != nil {
 			return Node{}, fmt.Errorf("host_key: %w", err)
@@ -260,7 +289,10 @@ func (d *Dir) readNode(name string) (Node, error) {
 			return Node{}, fmt.Errorf("private_address: %w", err)
 		}
 	}
-	return n, n.check()
+	if err := n.check(); err != nil {
+		return Node{}, err
+	}
+	return n, n.checkIdentity()
 }
 
 // FreeNodeName is the first of node1, node2 and so on that no node in
@@ -282,7 +314,7 @@ func (d *Dir) FreeNodeName() (string, error) {
 }
 
 // CheckNewNode checks that AddNode would accept n, as far as the
-// directory is now.
+// directory is now, apart from its identity, which the install issues.
 func (d *Dir) CheckNewNode(n Node) error {
 	if err := n.check(); err != nil {
 		return err
@@ -302,12 +334,16 @@ func (d *Dir) AddNode(n Node, generation int64) error {
 	if err := d.CheckNewNode(n); err != nil {
 		return err
 	}
+	if err := n.checkIdentity(); err != nil {
+		return err
+	}
 	data, err := yaml.Marshal(nodeFile{
 		Address:        n.Address,
 		User:           n.User,
 		HostKey:        strings.TrimSpace(string(ssh.MarshalAuthorizedKey(n.HostKey))),
 		PrivateAddress: n.PrivateAddress.String(),
 		Architecture:   n.Architecture,
+		Identity:       n.Identity,
 	})
 	if err != nil {
 		return err
@@ -323,6 +359,114 @@ func (d *Dir) AddNode(n Node, generation int64) error {
 	}
 	if err := d.setGeneration(generation); err != nil {
 		os.Remove(d.nodePath(n.Name))
+		return err
+	}
+	return nil
+}
+
+// Node is the node called name. If the directory has none, the error is
+// fs.ErrNotExist.
+func (d *Dir) Node(name string) (Node, error) {
+	if err := CheckName(name); err != nil {
+		return Node{}, fmt.Errorf("node name: %w", err)
+	}
+	n, err := d.readNode(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return Node{}, fmt.Errorf("the cluster has no node called %s: %w", name, err)
+	}
+	if err != nil {
+		return Node{}, fmt.Errorf("%s: %w", d.nodePath(name), err)
+	}
+	return n, nil
+}
+
+// RemovedIdentity is a removed node's identity, as the cluster directory
+// lists it.
+type RemovedIdentity struct {
+	// Node is the name the node had.
+	Node string `yaml:"node"`
+	// Identity is the fingerprint of its identity.
+	Identity string `yaml:"identity"`
+}
+
+// RemovedIdentities are the identities of the nodes removed from the
+// cluster, in the order they were removed.
+func (d *Dir) RemovedIdentities() ([]RemovedIdentity, error) {
+	path := filepath.Join(d.path, RemovedFileName)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var removed []RemovedIdentity
+	if err := strictyaml.Unmarshal(data, &removed); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	for _, r := range removed {
+		if err := checkFingerprint(r.Identity); err != nil {
+			return nil, fmt.Errorf("%s: %s: %w", path, r.Node, err)
+		}
+	}
+	return removed, nil
+}
+
+// Fingerprints are the fingerprints of removed, in order.
+func Fingerprints(removed []RemovedIdentity) []string {
+	fps := make([]string, len(removed))
+	for i, r := range removed {
+		fps[i] = r.Identity
+	}
+	return fps
+}
+
+// RemoveNode lists the identity of the node called name as removed,
+// removes its node file, and writes the cluster file at generation. If
+// the directory has no such node, the error is fs.ErrNotExist. If it
+// fails, it leaves the directory as it was.
+func (d *Dir) RemoveNode(name string, generation int64) error {
+	n, err := d.Node(name)
+	if err != nil {
+		return err
+	}
+	removed, err := d.RemovedIdentities()
+	if err != nil {
+		return err
+	}
+	listPath := filepath.Join(d.path, RemovedFileName)
+	listBefore, err := os.ReadFile(listPath)
+	listExisted := err == nil
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	nodeBefore, err := os.ReadFile(d.nodePath(name))
+	if err != nil {
+		return err
+	}
+	data, err := yaml.Marshal(append(removed, RemovedIdentity{Node: n.Name, Identity: n.Identity}))
+	if err != nil {
+		return err
+	}
+	// The identity is listed first, so that a node file is never gone
+	// while its identity isn't listed.
+	if err := writeFile(listPath, data, os.Rename); err != nil {
+		return err
+	}
+	putListBack := func() {
+		if listExisted {
+			writeFile(listPath, listBefore, os.Rename)
+		} else {
+			os.Remove(listPath)
+		}
+	}
+	if err := os.Remove(d.nodePath(name)); err != nil {
+		putListBack()
+		return err
+	}
+	if err := d.setGeneration(generation); err != nil {
+		createFile(d.nodePath(name), nodeBefore)
+		putListBack()
 		return err
 	}
 	return nil

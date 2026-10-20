@@ -3,16 +3,19 @@
 // node's agent and updater prove who they are.
 //
 // Certificates never expire. A node's identity is revoked by removing
-// the node, not by letting it run out.
+// the node, not by letting it run out: the cluster lists the removed
+// identities by their fingerprints, and peers refuse them.
 package identity
 
 import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -238,27 +241,70 @@ func Load(files Files) (*Identity, error) {
 	}, nil
 }
 
+// Fingerprint is the fingerprint of the node's identity, by which a list
+// of removed identities names it.
+func (id *Identity) Fingerprint() string { return CertFingerprint(id.cert.Leaf) }
+
+// IsRemoved says whether the identity of fingerprint is removed from the
+// cluster. A nil IsRemoved says none is.
+type IsRemoved func(fingerprint string) bool
+
 // ServerTLS is the TLS config to serve peers with: it proves this node's
-// identity, and accepts only a peer with an identity from the cluster CA.
-func (id *Identity) ServerTLS() *tls.Config {
+// identity, and accepts only a peer with an identity from the cluster CA
+// that removed doesn't say is removed.
+func (id *Identity) ServerTLS(removed IsRemoved) *tls.Config {
 	return &tls.Config{
-		MinVersion:   tls.VersionTLS13,
-		Certificates: []tls.Certificate{id.cert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    id.cas,
+		MinVersion:            tls.VersionTLS13,
+		Certificates:          []tls.Certificate{id.cert},
+		ClientAuth:            tls.RequireAndVerifyClientCert,
+		ClientCAs:             id.cas,
+		VerifyPeerCertificate: refuseRemoved(removed),
 	}
 }
 
 // ClientTLS is the TLS config to call the node called peer with: it
 // proves this node's identity, and accepts only peer's identity from the
-// cluster CA.
-func (id *Identity) ClientTLS(peer string) *tls.Config {
+// cluster CA, unless removed says it is removed.
+func (id *Identity) ClientTLS(peer string, removed IsRemoved) *tls.Config {
 	return &tls.Config{
-		MinVersion:   tls.VersionTLS13,
-		Certificates: []tls.Certificate{id.cert},
-		RootCAs:      id.cas,
-		ServerName:   peer,
+		MinVersion:            tls.VersionTLS13,
+		Certificates:          []tls.Certificate{id.cert},
+		RootCAs:               id.cas,
+		ServerName:            peer,
+		VerifyPeerCertificate: refuseRemoved(removed),
 	}
+}
+
+// refuseRemoved checks, once the peer's certificate has verified against
+// the cluster CA, that removed doesn't say it is removed.
+func refuseRemoved(removed IsRemoved) func([][]byte, [][]*x509.Certificate) error {
+	return func(_ [][]byte, chains [][]*x509.Certificate) error {
+		if removed == nil {
+			return nil
+		}
+		for _, chain := range chains {
+			if leaf := chain[0]; removed(CertFingerprint(leaf)) {
+				return fmt.Errorf("the identity of %s, %s, is removed from the cluster", leaf.Subject.CommonName, CertFingerprint(leaf))
+			}
+		}
+		return nil
+	}
+}
+
+// CertFingerprint is cert's fingerprint: the SHA-256 of its DER, hex,
+// after "sha256:".
+func CertFingerprint(cert *x509.Certificate) string {
+	sum := sha256.Sum256(cert.Raw)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// Fingerprint is the fingerprint of the PEM certificate certPEM.
+func Fingerprint(certPEM []byte) (string, error) {
+	cert, err := parseCert(certPEM)
+	if err != nil {
+		return "", err
+	}
+	return CertFingerprint(cert), nil
 }
 
 // decodeOne is the DER of data, which must be one PEM block of type

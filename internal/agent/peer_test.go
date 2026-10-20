@@ -28,7 +28,7 @@ func TestThePeerListenerAcceptsAnIdentityOfTheCluster(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
 	peer := nodetest.PeerIdentity(t, n.CA, "node-2")
-	if err := checkPeer(t, n, peer.ClientTLS(n.NodeName)); err != nil {
+	if err := checkPeer(t, n, peer.ClientTLS(n.NodeName, nil)); err != nil {
 		t.Errorf("a peer of the cluster was refused: %v", err)
 	}
 }
@@ -39,7 +39,7 @@ func TestThePeerListenerProvesTheNodesIdentity(t *testing.T) {
 	peer := nodetest.PeerIdentity(t, n.CA, "node-2")
 	// The node's identity is node-1's, so a peer that expects another
 	// node refuses it.
-	err := checkPeer(t, n, peer.ClientTLS("node-3"))
+	err := checkPeer(t, n, peer.ClientTLS("node-3", nil))
 	if err == nil || !strings.Contains(err.Error(), "node-3") {
 		t.Errorf("a peer expecting node-3 at node-1's address: %v, want a certificate error naming node-3", err)
 	}
@@ -53,7 +53,7 @@ func TestThePeerListenerRefusesAnIdentityOfAnotherCluster(t *testing.T) {
 		t.Fatal(err)
 	}
 	peer := nodetest.PeerIdentity(t, other, "node-2")
-	cfg := peer.ClientTLS(n.NodeName)
+	cfg := peer.ClientTLS(n.NodeName, nil)
 	// The peer trusts this cluster's CA, so only the node can refuse it.
 	cfg.RootCAs = caPool(t, n.CA)
 	if err := checkPeer(t, n, cfg); err == nil {
@@ -102,7 +102,7 @@ func TestAnOpenHealthWatchDoesntKeepTheAgentFromStopping(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
 	peer := nodetest.PeerIdentity(t, n.CA, "node-2")
-	conn, err := grpc.NewClient(n.PeerAddress.String(), grpc.WithTransportCredentials(credentials.NewTLS(peer.ClientTLS(n.NodeName))))
+	conn, err := grpc.NewClient(n.PeerAddress.String(), grpc.WithTransportCredentials(credentials.NewTLS(peer.ClientTLS(n.NodeName, nil))))
 	if err != nil {
 		t.Fatal(err)
 	}

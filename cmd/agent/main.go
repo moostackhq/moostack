@@ -35,18 +35,19 @@ func run(args []string) error {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		return agent.Serve(ctx, agent.Config{
-			Version:          buildinfo.Version,
-			Socket:           hostlayout.AgentSocket,
-			NodeFile:         hostlayout.NodeFile,
-			GenerationFile:   hostlayout.GenerationFile,
-			LockFile:         hostlayout.LockFile,
-			ContainerdSocket: hostlayout.ContainerdSocket,
-			Runc:             hostlayout.Runc,
-			ServicesFile:     hostlayout.ServicesFile,
-			ServicesDir:      hostlayout.ServicesDir,
-			ServiceLogDir:    hostlayout.ServiceLogDir,
-			Identity:         hostlayout.Identity,
-			PeerPort:         hostlayout.PeerPort,
+			Version:               buildinfo.Version,
+			Socket:                hostlayout.AgentSocket,
+			NodeFile:              hostlayout.NodeFile,
+			GenerationFile:        hostlayout.GenerationFile,
+			LockFile:              hostlayout.LockFile,
+			ContainerdSocket:      hostlayout.ContainerdSocket,
+			Runc:                  hostlayout.Runc,
+			ServicesFile:          hostlayout.ServicesFile,
+			ServicesDir:           hostlayout.ServicesDir,
+			ServiceLogDir:         hostlayout.ServiceLogDir,
+			Identity:              hostlayout.Identity,
+			RemovedIdentitiesFile: hostlayout.RemovedIdentitiesFile,
+			PeerPort:              hostlayout.PeerPort,
 		})
 	case len(args) == 2 && args[0] == "relay":
 		return rootsocket.Relay(args[1], os.Stdin, os.Stdout)

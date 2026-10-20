@@ -72,6 +72,19 @@ func loadLock(file string) *operationLock {
 	return l
 }
 
+// fenced runs f only if lease holds the lock, with the lock's mutex held
+// until f returns, so that the lease can't be broken or run out between
+// the check and what f writes. It orders the calls it fences too. It
+// refuses a lease that doesn't hold the lock with FAILED_PRECONDITION.
+func (l *operationLock) fenced(lease string, f func() error) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if h := l.current(); h == nil || lease == "" || h.Lease != lease {
+		return status.Error(codes.FailedPrecondition, "the operation's lease doesn't hold the node's operation lock")
+	}
+	return f()
+}
+
 // current is the lease that holds the lock now, nil if none. l.mu must
 // be held.
 func (l *operationLock) current() *heldLease {

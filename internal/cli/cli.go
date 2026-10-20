@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/urfave/cli/v3"
@@ -195,12 +196,18 @@ var forceFlag = &cli.BoolFlag{
 	Usage: "apply this cluster directory even if a node has applied a later generation of it, or can't tell which generation it applied",
 }
 
-// preflight runs the preflight on the nodes of d, for an operation that
-// writes d, and takes the operation lock for the operator on this
-// machine. The operation runs in the returned cluster's context, which
-// ends if it loses the lock.
-func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir) (*orchestrate.Cluster, error) {
+// preflight runs the preflight on the nodes of d, apart from the node
+// called skip if one is, for an operation that writes d, takes the
+// operation lock for the operator on this machine, and pushes d's removed
+// identities to every node. The operation runs in the returned cluster's
+// context, which ends if it loses the lock.
+func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir, skip string) (*orchestrate.Cluster, error) {
 	nodes, err := d.Nodes()
+	if err != nil {
+		return nil, err
+	}
+	nodes = slices.DeleteFunc(nodes, func(n cluster.Node) bool { return n.Name == skip })
+	removed, err := d.RemovedIdentities()
 	if err != nil {
 		return nil, err
 	}
@@ -210,6 +217,7 @@ func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir) (
 	}
 	toDial := nodesToDial(env, nodes)
 	toDial.LeaseTTL = ttl
+	toDial.Removed = cluster.Fingerprints(removed)
 	c, err := orchestrate.Preflight(ctx, toDial, d.Cluster.Generation, cmd.Bool("force"), orchestrate.Holder{Who: env.LocalUser, Machine: env.Machine})
 	if errors.As(err, new(*orchestrate.LockHeldError)) {
 		return nil, fmt.Errorf("%w\nAnother operation holds the operation lock. Ask its holder, or wait for it to end. If their mooctl has died, the lock expires on its own, or break it now with mooctl cluster unlock.", err)
@@ -233,6 +241,9 @@ func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir) (
 			fmt.Fprintf(env.Stderr, "  %v\n", f)
 		}
 	}
+	// The node skipped is in the cluster directory, but not among those
+	// reached.
+	c.Unlisted = slices.DeleteFunc(c.Unlisted, func(n string) bool { return n == skip })
 	if len(c.Unlisted) > 0 {
 		fmt.Fprintf(env.Stderr, "Generation %d lists %s, which this cluster directory doesn't, so mooctl can't reach them, and they keep the generation they have applied.\n",
 			c.Latest, strings.Join(c.Unlisted, ", "))

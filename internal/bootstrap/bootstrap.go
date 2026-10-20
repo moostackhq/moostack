@@ -213,19 +213,22 @@ const healthTimeout = time.Minute
 // rel's versions too. The node's key is made on the host, and never
 // leaves it. The host must have passed Check. Install refuses a release
 // without the cluster services before it changes the host. If Install
-// fails after that, it rolls back.
-func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig, ca *identity.CA) error {
+// fails after that, it rolls back. The node holds the identities removed
+// lists as removed from before its agent starts. Install returns the
+// fingerprint of the node's identity.
+func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig, ca *identity.CA, removed []string) (string, error) {
 	if err := rel.CheckClusterServices(); err != nil {
-		return err
+		return "", err
 	}
 	wait, err := healthWait()
 	if err != nil {
-		return err
+		return "", err
 	}
-	if err := install(ctx, c, h, rel, node, ca, wait); err != nil {
-		return Rollback(ctx, c, err)
+	fingerprint, err := install(ctx, c, h, rel, node, ca, removed, wait)
+	if err != nil {
+		return "", Rollback(ctx, c, err)
 	}
-	return nil
+	return fingerprint, nil
 }
 
 // Rollback uninstalls what an install put on the host, after the
@@ -233,38 +236,45 @@ func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 // says so, and says what to stop and remove by hand.
 func Rollback(ctx context.Context, c *sshclient.Client, err error) error {
 	if rbErr := Uninstall(ctx, c); rbErr != nil {
-		return fmt.Errorf("%w; removing what was installed failed too, so stop %s and remove %s by hand: %v",
-			err, strings.Join(units, ", "), strings.Join(installed(), ", "), rbErr)
+		return fmt.Errorf("%w; removing what was installed failed too, so %s: %v", err, CleanByHand, rbErr)
 	}
 	return err
 }
 
-func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig, ca *identity.CA, wait time.Duration) error {
+// CleanByHand tells an operator how to clean a host of Moostack by hand,
+// when Uninstall can't: what to stop and what to remove.
+var CleanByHand = fmt.Sprintf("stop %s and remove %s by hand", strings.Join(units, ", "), strings.Join(installed(), ", "))
+
+func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig, ca *identity.CA, removed []string, wait time.Duration) (string, error) {
 	if _, err := output(ctx, c, "mkdir -p "+hostlayout.BinDir+" "+hostlayout.ConfigDir); err != nil {
-		return err
+		return "", err
 	}
 	for _, comp := range rel.Components {
 		for _, f := range comp.Files {
 			data, err := rel.ReadFile(h.Architecture, f)
 			if err != nil {
-				return err
+				return "", err
 			}
 			if err := c.Upload(ctx, hostlayout.BinDir+"/"+f, bytes.NewReader(data), 0o755, "root:root"); err != nil {
-				return err
+				return "", err
 			}
 		}
 	}
 	request, err := output(ctx, c, hostlayout.Agent+" request-identity")
 	if err != nil {
-		return fmt.Errorf("making the node's key: %w", err)
+		return "", fmt.Errorf("making the node's key: %w", err)
 	}
 	cert, err := ca.Issue([]byte(request), node.Node)
 	if err != nil {
-		return fmt.Errorf("issuing the node's identity: %w", err)
+		return "", fmt.Errorf("issuing the node's identity: %w", err)
+	}
+	fingerprint, err := identity.Fingerprint(cert)
+	if err != nil {
+		return "", err
 	}
 	nodeFile, err := node.Marshal()
 	if err != nil {
-		return err
+		return "", err
 	}
 	files := append([]hostFile{
 		{hostlayout.NodeFile, string(nodeFile)},
@@ -274,24 +284,31 @@ func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 	}, unitFiles...)
 	for _, f := range files {
 		if err := c.Upload(ctx, f.path, strings.NewReader(f.content), 0o644, "root:root"); err != nil {
-			return err
+			return "", err
 		}
 	}
+	// The state directory exists once request-identity has made the key.
+	if err := c.Upload(ctx, hostlayout.RemovedIdentitiesFile, bytes.NewReader(hostlayout.MarshalRemovedIdentities(removed)), 0o600, "root:root"); err != nil {
+		return "", err
+	}
 	if _, err := output(ctx, c, "systemctl daemon-reload && systemctl enable --now "+strings.Join(units, " ")); err != nil {
-		return err
+		return "", err
 	}
 	api, err := nodeclient.Dial(c)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer api.Close()
 	if err := waitHealthy(ctx, api, wait, func(s nodeclient.Status) error { return componentsHealthy(s, rel) }); err != nil {
-		return err
+		return "", err
 	}
 	if err := startServices(ctx, api, h, rel); err != nil {
-		return err
+		return "", err
 	}
-	return waitHealthy(ctx, api, wait, func(s nodeclient.Status) error { return servicesHealthy(s, rel) })
+	if err := waitHealthy(ctx, api, wait, func(s nodeclient.Status) error { return servicesHealthy(s, rel) }); err != nil {
+		return "", err
+	}
+	return fingerprint, nil
 }
 
 // startServices has the agent import the image of each of rel's cluster

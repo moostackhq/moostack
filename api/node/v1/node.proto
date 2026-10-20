@@ -51,6 +51,13 @@ service Agent {
   // refuses a service whose API a service of another name serves, with
   // FAILED_PRECONDITION.
   rpc RunService(RunServiceRequest) returns (RunServiceResponse);
+  // RemoveIdentities adds node identities, by their fingerprints, to
+  // those the node holds as removed from the cluster, and refuses peers
+  // that prove one from then on, cutting off their open connections. The
+  // node keeps the identities it held already, so the list only grows.
+  // It refuses the request with FAILED_PRECONDITION unless the request's
+  // lease holds the operation lock.
+  rpc RemoveIdentities(RemoveIdentitiesRequest) returns (RemoveIdentitiesResponse);
 }
 
 // Updater is the node API that the updater serves, on its own socket, so
@@ -174,6 +181,16 @@ message RunServiceRequest {
 }
 
 message RunServiceResponse {}
+
+message RemoveIdentitiesRequest {
+  // Identities are the fingerprints of the removed identities: each the
+  // SHA-256 of the certificate, hex, after "sha256:".
+  repeated string identities = 1;
+  // Lease is the operation's lease, which must hold the operation lock.
+  string lease = 2;
+}
+
+message RemoveIdentitiesResponse {}
 
 message UpdaterStatusRequest {}
 

@@ -2,6 +2,7 @@ package cli_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"slices"
 	"sync"
@@ -33,6 +34,51 @@ type fakeNode struct {
 	taken []nodeclient.Lock
 	// acquired counts the calls to AcquireLock.
 	acquired int
+	// removed are the identities the node holds as removed.
+	removed []string
+	// refuseNewRemovals makes the node fail to take identities it doesn't
+	// hold as removed yet, as when it can't keep them.
+	refuseNewRemovals bool
+	// dials counts the times mooctl reached the node.
+	dials int
+}
+
+// identityOf is the fingerprint of the identity of the node called name
+// in the test's cluster directories.
+func identityOf(name string) string {
+	return fmt.Sprintf("sha256:%064x", sha256.Sum256([]byte(name)))
+}
+
+// removedIdentities are the identities the node holds as removed.
+func (n *fakeNode) removedIdentities() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.removed)
+}
+
+// dialed is how many times mooctl reached the node.
+func (n *fakeNode) dialed() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.dials
+}
+
+func (n *fakeNode) RemoveIdentities(_ context.Context, identities []string, lease string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.lock == nil || n.lock.Lease != lease {
+		return fmt.Errorf("the operation's lease doesn't hold the node's operation lock")
+	}
+	for _, id := range identities {
+		if slices.Contains(n.removed, id) {
+			continue
+		}
+		if n.refuseNewRemovals {
+			return fmt.Errorf("keeping the removed identities: the disk is full")
+		}
+		n.removed = append(n.removed, id)
+	}
+	return nil
 }
 
 // bobsLock is a lock that bob's operation holds, from his desktop.
@@ -137,6 +183,9 @@ func (o *operator) dialNode() func(context.Context, cluster.Node) (orchestrate.N
 		if !ok {
 			return nil, fmt.Errorf("the test has no node %s", n.Name)
 		}
+		f.mu.Lock()
+		f.dials++
+		f.mu.Unlock()
 		if f.dialing != nil {
 			f.dialing(ctx)
 		}

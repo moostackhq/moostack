@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net/netip"
 	"os"
@@ -244,6 +246,7 @@ func TestAddNodeWritesANodeFile(t *testing.T) {
 		HostKey:        key,
 		PrivateAddress: netip.MustParseAddr("10.0.0.5"),
 		Architecture:   "amd64",
+		Identity:       fingerprint("web-1"),
 	}
 	if err := d.AddNode(n, 2); err != nil {
 		t.Fatal(err)
@@ -253,7 +256,8 @@ func TestAddNodeWritesANodeFile(t *testing.T) {
 		"user: op\n" +
 		"host_key: " + strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key))) + "\n" +
 		"private_address: 10.0.0.5\n" +
-		"architecture: amd64\n"
+		"architecture: amd64\n" +
+		"identity: " + fingerprint("web-1") + "\n"
 	if got != want {
 		t.Errorf("web-1.yml is\n%s\nwant\n%s", got, want)
 	}
@@ -284,7 +288,7 @@ func TestNodesReadsWhatAddNodeWrote(t *testing.T) {
 	want := node(t, "db")
 	got := nodes[0]
 	if got.Address != want.Address || got.User != want.User || got.PrivateAddress != want.PrivateAddress ||
-		got.Architecture != want.Architecture || !keysEqual(got.HostKey, want.HostKey) {
+		got.Architecture != want.Architecture || got.Identity != want.Identity || !keysEqual(got.HostKey, want.HostKey) {
 		t.Errorf("Nodes read %+v, want %+v", got, want)
 	}
 }
@@ -360,6 +364,8 @@ func TestAddNodeRefusesIncompleteNodes(t *testing.T) {
 		"no host key":        func(n *cluster.Node) { n.HostKey = nil },
 		"no private address": func(n *cluster.Node) { n.PrivateAddress = netip.Addr{} },
 		"no architecture":    func(n *cluster.Node) { n.Architecture = "" },
+		"no identity":        func(n *cluster.Node) { n.Identity = "" },
+		"bad identity":       func(n *cluster.Node) { n.Identity = "sha256:abc" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			d := newCluster(t)
@@ -377,12 +383,13 @@ func TestAddNodeRefusesIncompleteNodes(t *testing.T) {
 
 func TestNodesRefusesBadNodeFiles(t *testing.T) {
 	good := "address: web1\nuser: op\nhost_key: " + strings.TrimSpace(string(ssh.MarshalAuthorizedKey(hostKey(t)))) +
-		"\nprivate_address: 10.0.0.5\narchitecture: amd64\n"
+		"\nprivate_address: 10.0.0.5\narchitecture: amd64\nidentity: " + fingerprint("web-1") + "\n"
 	for name, file := range map[string]struct{ name, content string }{
 		"unknown field":   {"web-1.yml", good + "extra: x\n"},
 		"bad host key":    {"web-1.yml", strings.Replace(good, "ssh-ed25519", "ssh-nonsense", 1)},
 		"bad address":     {"web-1.yml", strings.Replace(good, "10.0.0.5", "10.0.0", 1)},
 		"no architecture": {"web-1.yml", strings.Replace(good, "architecture: amd64\n", "", 1)},
+		"bad identity":    {"web-1.yml", strings.Replace(good, "sha256:", "md5:", 1)},
 		"invalid name":    {"Web_1.yml", good},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -420,7 +427,14 @@ func node(t *testing.T, name string) cluster.Node {
 		HostKey:        key,
 		PrivateAddress: netip.MustParseAddr("10.0.0.7"),
 		Architecture:   "arm64",
+		Identity:       fingerprint(name),
 	}
+}
+
+// fingerprint is a node identity's fingerprint, the same every time for
+// seed.
+func fingerprint(seed string) string {
+	return fmt.Sprintf("sha256:%064x", sha256.Sum256([]byte(seed)))
 }
 
 func hostKey(t *testing.T) ssh.PublicKey {

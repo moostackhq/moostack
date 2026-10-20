@@ -32,6 +32,15 @@ type node struct {
 	// answerDelay is how long the node's answer to AcquireLock takes to
 	// reach the operation, after the node granted the lock.
 	answerDelay time.Duration
+	// removeErr, if set, is why removing identities fails.
+	removeErr error
+	// removeDelay is how long the node's answer to RemoveIdentities takes
+	// to reach the operation, after the node took them.
+	removeDelay time.Duration
+	// stolenOnRemove, if set, is the lease of another operation that takes
+	// the node's lock while the node answers RemoveIdentities, as when an
+	// operator breaks the lock and another operation takes it.
+	stolenOnRemove string
 	// laterGeneration, if set, is the generation the node reports from
 	// its second status call on, as if another operation recorded it in
 	// between.
@@ -51,7 +60,48 @@ type node struct {
 	recorded []int64
 	// recordedNodes are the nodes given with the last recording.
 	recordedNodes []string
-	closed        bool
+	// removed are the identities the node holds as removed, and pushes
+	// counts the pushes of them.
+	removed []string
+	pushes  int
+	closed  bool
+}
+
+func (n *node) RemoveIdentities(ctx context.Context, identities []string, lease string) error {
+	if n.hang(ctx) {
+		return ctx.Err()
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.removeErr != nil {
+		return n.removeErr
+	}
+	if l := n.held(); l == nil || l.Lease != lease {
+		return errors.New("the operation's lease doesn't hold the node's operation lock")
+	}
+	n.pushes++
+	for _, id := range identities {
+		if !slices.Contains(n.removed, id) {
+			n.removed = append(n.removed, id)
+		}
+	}
+	if n.stolenOnRemove != "" {
+		n.lock = &nodeclient.Lock{Lease: n.stolenOnRemove, Holder: "bob", Machine: "desktop"}
+		n.expires = time.Now().Add(time.Hour)
+	}
+	if n.removeDelay > 0 {
+		n.mu.Unlock()
+		time.Sleep(n.removeDelay)
+		n.mu.Lock()
+	}
+	return nil
+}
+
+// removedIdentities are the identities the node holds as removed.
+func (n *node) removedIdentities() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.removed)
 }
 
 func (n *node) Status(ctx context.Context) nodeclient.Status {

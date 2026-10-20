@@ -30,6 +30,7 @@ const (
 	Agent_BreakLock_FullMethodName        = "/moostack.node.v1.Agent/BreakLock"
 	Agent_ImportImage_FullMethodName      = "/moostack.node.v1.Agent/ImportImage"
 	Agent_RunService_FullMethodName       = "/moostack.node.v1.Agent/RunService"
+	Agent_RemoveIdentities_FullMethodName = "/moostack.node.v1.Agent/RemoveIdentities"
 )
 
 // AgentClient is the client API for Agent service.
@@ -78,6 +79,13 @@ type AgentClient interface {
 	// refuses a service whose API a service of another name serves, with
 	// FAILED_PRECONDITION.
 	RunService(ctx context.Context, in *RunServiceRequest, opts ...grpc.CallOption) (*RunServiceResponse, error)
+	// RemoveIdentities adds node identities, by their fingerprints, to
+	// those the node holds as removed from the cluster, and refuses peers
+	// that prove one from then on, cutting off their open connections. The
+	// node keeps the identities it held already, so the list only grows.
+	// It refuses the request with FAILED_PRECONDITION unless the request's
+	// lease holds the operation lock.
+	RemoveIdentities(ctx context.Context, in *RemoveIdentitiesRequest, opts ...grpc.CallOption) (*RemoveIdentitiesResponse, error)
 }
 
 type agentClient struct {
@@ -171,6 +179,16 @@ func (c *agentClient) RunService(ctx context.Context, in *RunServiceRequest, opt
 	return out, nil
 }
 
+func (c *agentClient) RemoveIdentities(ctx context.Context, in *RemoveIdentitiesRequest, opts ...grpc.CallOption) (*RemoveIdentitiesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveIdentitiesResponse)
+	err := c.cc.Invoke(ctx, Agent_RemoveIdentities_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServer is the server API for Agent service.
 // All implementations must embed UnimplementedAgentServer
 // for forward compatibility.
@@ -217,6 +235,13 @@ type AgentServer interface {
 	// refuses a service whose API a service of another name serves, with
 	// FAILED_PRECONDITION.
 	RunService(context.Context, *RunServiceRequest) (*RunServiceResponse, error)
+	// RemoveIdentities adds node identities, by their fingerprints, to
+	// those the node holds as removed from the cluster, and refuses peers
+	// that prove one from then on, cutting off their open connections. The
+	// node keeps the identities it held already, so the list only grows.
+	// It refuses the request with FAILED_PRECONDITION unless the request's
+	// lease holds the operation lock.
+	RemoveIdentities(context.Context, *RemoveIdentitiesRequest) (*RemoveIdentitiesResponse, error)
 	mustEmbedUnimplementedAgentServer()
 }
 
@@ -250,6 +275,9 @@ func (UnimplementedAgentServer) ImportImage(grpc.ClientStreamingServer[ImportIma
 }
 func (UnimplementedAgentServer) RunService(context.Context, *RunServiceRequest) (*RunServiceResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RunService not implemented")
+}
+func (UnimplementedAgentServer) RemoveIdentities(context.Context, *RemoveIdentitiesRequest) (*RemoveIdentitiesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveIdentities not implemented")
 }
 func (UnimplementedAgentServer) mustEmbedUnimplementedAgentServer() {}
 func (UnimplementedAgentServer) testEmbeddedByValue()               {}
@@ -405,6 +433,24 @@ func _Agent_RunService_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_RemoveIdentities_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveIdentitiesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).RemoveIdentities(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_RemoveIdentities_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).RemoveIdentities(ctx, req.(*RemoveIdentitiesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Agent_ServiceDesc is the grpc.ServiceDesc for Agent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -439,6 +485,10 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RunService",
 			Handler:    _Agent_RunService_Handler,
+		},
+		{
+			MethodName: "RemoveIdentities",
+			Handler:    _Agent_RemoveIdentities_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

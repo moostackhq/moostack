@@ -23,7 +23,6 @@ import (
 	containerd "github.com/containerd/containerd/v2/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
@@ -63,6 +62,9 @@ type Config struct {
 	ServicesDir, ServiceLogDir string
 	// Identity is the node's identity, which it proves to its peers.
 	Identity identity.Files
+	// RemovedIdentitiesFile keeps the identities removed from the
+	// cluster, which the node refuses as peers. Its directory must exist.
+	RemovedIdentitiesFile string
 	// PeerPort is the port to listen for peers on, at the node's private
 	// address.
 	PeerPort uint16
@@ -78,10 +80,11 @@ const containerdTimeout = 2 * time.Second
 
 // Serve serves the node API on cfg.Socket, and listens for peers at the
 // node's private address, until ctx ends. Peers connect with mTLS, and
-// only those with an identity from the cluster CA are accepted. It won't
-// serve without a valid identity of its own. Calls on cfg.Socket that
-// aren't the node API's go to the cluster services, as an operator's,
-// and the services that aren't running are started.
+// only those with an identity from the cluster CA that the node doesn't
+// hold as removed are accepted. It won't serve without a valid identity
+// of its own, or with removed identities it can't read. Calls on
+// cfg.Socket that aren't the node API's go to the cluster services, as an
+// operator's, and the services that aren't running are started.
 func Serve(ctx context.Context, cfg Config) error {
 	data, err := os.ReadFile(cfg.NodeFile)
 	if err != nil {
@@ -92,6 +95,10 @@ func Serve(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("%s: %w", cfg.NodeFile, err)
 	}
 	id, err := identity.Load(cfg.Identity)
+	if err != nil {
+		return err
+	}
+	removed, err := loadRemoved(cfg.RemovedIdentitiesFile)
 	if err != nil {
 		return err
 	}
@@ -117,8 +124,8 @@ func Serve(ctx context.Context, cfg Config) error {
 		return err
 	}
 	server := grpc.NewServer(gw.ServerOptions(servicev1.CallerKind_CALLER_KIND_OPERATOR)...)
-	nodev1.RegisterAgentServer(server, &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: client, runc: cfg.Runc, services: services, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile)})
-	peers := grpc.NewServer(grpc.Creds(credentials.NewTLS(id.ServerTLS())))
+	nodev1.RegisterAgentServer(server, &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: client, runc: cfg.Runc, services: services, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile), removed: removed})
+	peers := grpc.NewServer(grpc.Creds(newPeerCredentials(id, removed)))
 	healthpb.RegisterHealthServer(peers, health.NewServer())
 	go services.StartAll(ctx)
 	return serveAll(ctx, map[*grpc.Server]net.Listener{server: l, peers: peerListener})
@@ -170,6 +177,7 @@ type agentServer struct {
 	services       *services
 	generationFile string
 	lock           *operationLock
+	removed        *removedIdentities
 }
 
 func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nodev1.StatusResponse, error) {
@@ -192,25 +200,23 @@ func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nod
 }
 
 func (s *agentServer) RecordGeneration(_ context.Context, req *nodev1.RecordGenerationRequest) (*nodev1.RecordGenerationResponse, error) {
-	// The lock's mutex stays held until the generation is written, so
-	// that the lease can't be broken or run out between the check and the
-	// write. It orders recordings too.
-	s.lock.mu.Lock()
-	defer s.lock.mu.Unlock()
-	if h := s.lock.current(); h == nil || req.Lease == "" || h.Lease != req.Lease {
-		return nil, status.Error(codes.FailedPrecondition, "the operation's lease doesn't hold the node's operation lock")
-	}
-	// A node that can't tell the generation it applied accepts any, so
-	// that a recording repairs it.
-	if recorded, err := s.applied(); err == nil && req.Generation < recorded.Generation {
-		return nil, status.Errorf(codes.FailedPrecondition, "the node has applied generation %d, later than %d", recorded.Generation, req.Generation)
-	}
-	data, err := json.Marshal(appliedGeneration{Generation: req.Generation, Nodes: req.Nodes})
+	err := s.lock.fenced(req.Lease, func() error {
+		// A node that can't tell the generation it applied accepts any, so
+		// that a recording repairs it.
+		if recorded, err := s.applied(); err == nil && req.Generation < recorded.Generation {
+			return status.Errorf(codes.FailedPrecondition, "the node has applied generation %d, later than %d", recorded.Generation, req.Generation)
+		}
+		data, err := json.Marshal(appliedGeneration{Generation: req.Generation, Nodes: req.Nodes})
+		if err == nil {
+			err = writeFile(s.generationFile, append(data, '\n'))
+		}
+		if err != nil {
+			return status.Errorf(codes.Internal, "recording the generation: %v", err)
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "recording the generation: %v", err)
-	}
-	if err := writeFile(s.generationFile, append(data, '\n')); err != nil {
-		return nil, status.Errorf(codes.Internal, "recording the generation: %v", err)
+		return nil, err
 	}
 	return &nodev1.RecordGenerationResponse{}, nil
 }

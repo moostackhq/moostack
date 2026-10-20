@@ -1,7 +1,7 @@
 // Package orchestrate is what an operation does across the whole
-// cluster through the node API: the preflight, which reaches every node
-// and takes the operation lock before anything changes, and recording
-// the generation every node has applied.
+// cluster through the node API: the preflight, which reaches every node,
+// takes the operation lock and pushes the removed identities before
+// anything changes, and recording the generation every node has applied.
 package orchestrate
 
 import (
@@ -38,6 +38,10 @@ type Node interface {
 	// BreakLock releases the node's operation lock, whichever lease holds
 	// it, and returns the lock it broke, nil if none.
 	BreakLock(ctx context.Context) (*nodeclient.Lock, error)
+	// RemoveIdentities adds identities, by their fingerprints, to those
+	// the node holds as removed and refuses as peers, for the operation
+	// whose lease holds the node's operation lock.
+	RemoveIdentities(ctx context.Context, identities []string, lease string) error
 	// Close closes the connection.
 	Close() error
 }
@@ -62,6 +66,10 @@ type Nodes struct {
 	// LeaseTTL is how long a node holds the operation lock after the
 	// operation last renewed it. Zero means DefaultLeaseTTL.
 	LeaseTTL time.Duration
+	// Removed are the fingerprints of the identities the cluster
+	// directory lists as removed, which the preflight pushes to every
+	// node.
+	Removed []string
 }
 
 // Reached is a node as Survey found it.
@@ -223,8 +231,10 @@ func (e *UnknownGenerationError) Error() string {
 // Once every node passes, it takes the operation lock for holder on
 // every node, or fails naming each node whose lock another operation
 // holds, after handing back the lock on the others. Holding the lock, it
-// checks the generations again, and fails if a lease may already have
-// run out.
+// checks the generations again, fails if a lease may already have run
+// out, and then, renewing the lease, has every node hold the identities
+// nodes.Removed lists as removed, and fails if the operation can't be
+// sure it still holds the lock once they have.
 func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, holder Holder) (*Cluster, error) {
 	c := &Cluster{
 		recordTimeout: cmp.Or(nodes.RecordTimeout, DefaultTimeout),
@@ -272,6 +282,18 @@ func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, h
 		defer close(c.kept)
 		c.keepLease(c.stop)
 	}()
+	// Every operation pushes the removed identities, so that a node that
+	// missed a removal gets them before anything changes. The lease is
+	// renewed meanwhile, and checked again once the push is done.
+	problems := c.push(c.ctx, c.conns, nodes.Removed)
+	if err := c.CheckLock(); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if len(problems) > 0 {
+		c.Close()
+		return nil, &PreflightError{Problems: problems}
+	}
 	return c, nil
 }
 
@@ -297,7 +319,7 @@ func (c *Cluster) check(reached []Reached, generation int64, force bool) []error
 			}
 		}
 		if err != nil {
-			problems = append(problems, fmt.Errorf("%s: %w", r.Name, err))
+			problems = append(problems, &NodeError{Node: r.Name, Err: err})
 		}
 	}
 	return problems
@@ -347,11 +369,11 @@ func check(r Reached) error {
 	switch {
 	case r.Err != nil:
 		// The error says what failed: reaching the node, or its host key.
-		return r.Err
+		return &UnreachableError{Err: r.Err}
 	case r.Status.AgentErr != nil:
-		return fmt.Errorf("the agent doesn't answer: %w", r.Status.AgentErr)
+		return &UnreachableError{Err: fmt.Errorf("the agent doesn't answer: %w", r.Status.AgentErr)}
 	case r.Status.UpdaterErr != nil:
-		return fmt.Errorf("the updater doesn't answer: %w", r.Status.UpdaterErr)
+		return &UnreachableError{Err: fmt.Errorf("the updater doesn't answer: %w", r.Status.UpdaterErr)}
 	case r.Status.Mode == nodev1.Mode_MODE_CONTROL_PLANE:
 		return errors.New("it is in control plane mode")
 	case r.Status.Mode != nodev1.Mode_MODE_DIRECT:
@@ -378,9 +400,28 @@ func unlisted(reached []Reached, names []string, latest int64) []string {
 	return found
 }
 
+// UnreachableError says a node, or its agent or updater, couldn't be
+// reached, and why.
+type UnreachableError struct{ Err error }
+
+func (e *UnreachableError) Error() string { return e.Err.Error() }
+
+func (e *UnreachableError) Unwrap() error { return e.Err }
+
+// NodeError is why the node called Node failed.
+type NodeError struct {
+	Node string
+	Err  error
+}
+
+func (e *NodeError) Error() string { return e.Node + ": " + e.Err.Error() }
+
+func (e *NodeError) Unwrap() error { return e.Err }
+
 // PreflightError says which nodes failed the preflight, and why.
 type PreflightError struct {
-	// Problems are one error per node, which names it.
+	// Problems are one error per node, which names it, a *NodeError
+	// where the node failed a check or refused the lock.
 	Problems []error
 }
 
@@ -393,6 +434,18 @@ func (e *PreflightError) Error() string {
 }
 
 func (e *PreflightError) Unwrap() []error { return e.Problems }
+
+// Unreachable says whether the node called name, or its agent or
+// updater, couldn't be reached.
+func (e *PreflightError) Unreachable(name string) bool {
+	for _, p := range e.Problems {
+		var ne *NodeError
+		if errors.As(p, &ne) && ne.Node == name && errors.As(p, new(*UnreachableError)) {
+			return true
+		}
+	}
+	return false
+}
 
 // Forceable says whether force would have let the preflight pass: every
 // problem is a generation that is later than the directory's, or that
@@ -414,7 +467,8 @@ func (c *Cluster) Next(generation int64) int64 { return max(generation, c.Latest
 
 // Add adds the connection to a new node called name, which Close closes,
 // and takes the operation lock on it. A node that doesn't grant it can't
-// record a generation, and Record says why.
+// record a generation, and Record says why. The new node gets the
+// removed identities from its install, not from Add.
 func (c *Cluster) Add(name string, conn Node) {
 	n := &namedConn{name: name, conn: conn}
 	sent, err := c.take(c.ctx, conn, c.reachTimeout)
@@ -426,6 +480,58 @@ func (c *Cluster) Add(name string, conn Node) {
 		n.lease.granted(sent, c.ttl)
 	}
 	c.conns = append(c.conns, n)
+}
+
+// Remove leaves the node called name out of the rest of the operation:
+// it releases the lock on it and closes the connection, so that the node
+// can go away without the operation losing its lease.
+func (c *Cluster) Remove(name string) {
+	c.mu.Lock()
+	i := slices.IndexFunc(c.conns, func(n *namedConn) bool { return n.name == name })
+	if i < 0 {
+		c.mu.Unlock()
+		return
+	}
+	n := c.conns[i]
+	c.conns = slices.Delete(c.conns, i, i+1)
+	c.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), min(c.reachTimeout, releaseTimeout))
+	defer cancel()
+	n.conn.ReleaseLock(ctx, c.lease.Lease)
+	n.conn.Close()
+}
+
+// RemoveIdentities has every node the cluster has a connection to hold
+// identities, by their fingerprints, as removed, all at once, each within
+// the record timeout. It fails naming every node that didn't.
+func (c *Cluster) RemoveIdentities(ctx context.Context, identities []string) error {
+	c.mu.Lock()
+	conns := slices.Clone(c.conns)
+	c.mu.Unlock()
+	return errors.Join(c.push(ctx, conns, identities)...)
+}
+
+// push has each of conns hold identities as removed, all at once, each
+// within the record timeout. It returns one error per node that didn't,
+// which names it.
+func (c *Cluster) push(ctx context.Context, conns []*namedConn, identities []string) []error {
+	errs := make([]error, len(conns))
+	var wg sync.WaitGroup
+	for i, n := range conns {
+		wg.Go(func() {
+			err := n.lease.err
+			if err == nil {
+				ctx, cancel := context.WithTimeout(ctx, c.recordTimeout)
+				defer cancel()
+				err = n.conn.RemoveIdentities(ctx, identities, c.lease.Lease)
+			}
+			if err != nil {
+				errs[i] = fmt.Errorf("%s didn't take the removed identities: %w", n.name, err)
+			}
+		})
+	}
+	wg.Wait()
+	return slices.DeleteFunc(errs, func(err error) bool { return err == nil })
 }
 
 // Record has every node record generation, of a cluster directory of

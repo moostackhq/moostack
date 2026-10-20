@@ -39,8 +39,9 @@ func statusCluster(t *testing.T, o *operator, names ...string) string {
 			t.Fatal(err)
 		}
 		err = d.AddNode(cluster.Node{
-			Name: name, Address: name, User: "root", HostKey: key,
+			Name: name, Address: name + ".invalid", User: "root", HostKey: key,
 			PrivateAddress: netip.AddrFrom4([4]byte{10, 0, 0, byte(i + 1)}), Architecture: "amd64",
+			Identity: identityOf(name),
 		}, 1)
 		if err != nil {
 			t.Fatal(err)

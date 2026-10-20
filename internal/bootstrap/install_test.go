@@ -39,7 +39,7 @@ func TestInstallRefusesAReleaseWithoutTheClusterServicesBeforeReachingTheHost(t 
 	}
 	// Without a connection to a host, Install fails on whatever it does
 	// to the host first.
-	err = bootstrap.Install(t.Context(), nil, bootstrap.Host{Architecture: "amd64"}, rel, hostlayout.NodeConfig{}, nil)
+	_, err = bootstrap.Install(t.Context(), nil, bootstrap.Host{Architecture: "amd64"}, rel, hostlayout.NodeConfig{}, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "has no telemetry") {
 		t.Errorf("installing a release without telemetry: %v", err)
 	}

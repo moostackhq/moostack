@@ -3,6 +3,7 @@
 package hostlayout
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -55,6 +56,10 @@ const (
 	// LockFile keeps the node's operation lock across restarts of the
 	// agent.
 	LockFile = StateDir + "/lock"
+	// RemovedIdentitiesFile keeps the fingerprints of the node identities
+	// removed from the cluster, which the agent refuses as peers, as
+	// MarshalRemovedIdentities writes them.
+	RemovedIdentitiesFile = StateDir + "/removed-identities"
 	// PeerPort is the port the agent listens for peers on, at the node's
 	// private address.
 	PeerPort = 7443
@@ -136,6 +141,23 @@ disabled_plugins = [
 [plugins."io.containerd.shim.v1.manager"]
   socket_dir = "` + RunDir + `/containerd/s"
 `
+
+// MarshalRemovedIdentities is the fingerprints of removed identities as
+// RemovedIdentitiesFile holds them: a JSON list.
+func MarshalRemovedIdentities(fingerprints []string) []byte {
+	data, err := json.Marshal(fingerprints)
+	if err != nil {
+		panic(err)
+	}
+	return append(data, '\n')
+}
+
+// ParseRemovedIdentities reads what MarshalRemovedIdentities wrote.
+func ParseRemovedIdentities(data []byte) ([]string, error) {
+	var fingerprints []string
+	err := json.Unmarshal(data, &fingerprints)
+	return fingerprints, err
+}
 
 // ModeDirect is the mode of a node operated by mooctl over SSH.
 const ModeDirect = "direct"

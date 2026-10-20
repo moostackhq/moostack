@@ -156,6 +156,14 @@ func (n *Node) RecordGeneration(ctx context.Context, generation int64, nodes []s
 	return err
 }
 
+// RemoveIdentities has the agent add identities, by their fingerprints,
+// to those the node holds as removed and refuses as peers, for the
+// operation whose lease holds the node's operation lock.
+func (n *Node) RemoveIdentities(ctx context.Context, identities []string, lease string) error {
+	_, err := n.Agent.RemoveIdentities(ctx, &nodev1.RemoveIdentitiesRequest{Identities: identities, Lease: lease})
+	return err
+}
+
 // Lock is the operation lock, as one operation's lease holds it.
 type Lock struct {
 	// Lease identifies the operation's hold on the lock.
