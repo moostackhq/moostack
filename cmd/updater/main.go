@@ -8,19 +8,17 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
-	"strings"
 	"syscall"
 
 	"github.com/moostackhq/moostack/internal/buildinfo"
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/rootsocket"
+	"github.com/moostackhq/moostack/internal/systemd"
 	"github.com/moostackhq/moostack/internal/updater"
 )
 
@@ -44,25 +42,12 @@ func run(args []string) error {
 			AgentSlots:    hostlayout.AgentSlots,
 			AgentSwapFile: hostlayout.AgentSwapFile,
 			AgentSocket:   hostlayout.AgentSocket,
-			RestartAgent:  restartAgent,
+			RestartAgent:  func(ctx context.Context) error { return systemd.Restart(ctx, hostlayout.AgentUnit) },
 		})
 	case len(args) == 2 && args[0] == "relay":
 		return rootsocket.Relay(args[1], os.Stdin, os.Stdout)
 	}
 	return errors.New(usage)
-}
-
-// restartAgent restarts the agent's unit. It resets the unit's failed
-// state first, since an agent that kept exiting has the unit refuse to
-// start again for a while, as when rolling back from a broken one.
-func restartAgent(ctx context.Context) error {
-	for _, args := range [][]string{{"reset-failed", hostlayout.AgentUnit}, {"restart", hostlayout.AgentUnit}} {
-		out, err := exec.CommandContext(ctx, "systemctl", args...).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("systemctl %s: %w: %s", strings.Join(args, " "), err, bytes.TrimSpace(out))
-		}
-	}
-	return nil
 }
 
 const usage = `usage:

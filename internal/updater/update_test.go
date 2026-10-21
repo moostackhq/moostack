@@ -52,6 +52,22 @@ func TestUpdateAgentSwapsToTheNewAgentAndBack(t *testing.T) {
 	wantNoSwapRecord(t, n)
 }
 
+// A node that a release before the agent's A/B slots installed has the
+// agent as a plain file, which the first update moves into its first A/B
+// slot.
+func TestUpdateAgentMovesAPlainAgentIntoItsFirstABSlot(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.Exec(t, "root", "mv", hostlayout.AgentSlots[0], hostlayout.Agent)
+	if err := update(t, n, nodetest.NextAgent(t), nodetest.NextVersion, 30*time.Second); err != nil {
+		t.Fatalf("updating a plain agent: %v", err)
+	}
+	wantAgent(t, n, nodetest.NextVersion, hostlayout.AgentSlots[1])
+	if got, want := sum(t, n, hostlayout.AgentSlots[0]), sha(nodetest.Agent(t)); got != want {
+		t.Errorf("%s's SHA-256 is %s, want the plain agent's, %s", hostlayout.AgentSlots[0], got, want)
+	}
+}
+
 func TestABrokenAgentIsRolledBack(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)

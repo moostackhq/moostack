@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -286,8 +288,25 @@ func (n *Node) UpdateAgent(ctx context.Context, version string, binary []byte, h
 	return UpdateAgent(ctx, n.Updater, version, binary, healthTimeout)
 }
 
-// updateChunk is how much of an agent's binary each request carries.
+// updateChunk is how much of a binary each request of an update
+// carries.
 const updateChunk = 1 << 20
+
+// sendChunks sends data with send, updateChunk at a time, and at least
+// once. It stops at the first send that fails, since the call ended,
+// which the call's answer says why.
+func sendChunks(data []byte, send func(chunk []byte) error) {
+	for {
+		n := min(len(data), updateChunk)
+		if send(data[:n]) != nil {
+			return
+		}
+		data = data[n:]
+		if len(data) == 0 {
+			return
+		}
+	}
+}
 
 // UpdateAgent has updater replace the agent with binary, the agent at
 // version, which must become healthy within healthTimeout. It fails
@@ -297,29 +316,82 @@ func UpdateAgent(ctx context.Context, updater nodev1.UpdaterClient, version stri
 	if err != nil {
 		return err
 	}
-	sum := sha256.Sum256(binary)
-	req := &nodev1.UpdateAgentRequest{Update: &nodev1.AgentUpdate{
-		Version:       version,
-		Sha256:        hex.EncodeToString(sum[:]),
-		HealthTimeout: durationpb.New(healthTimeout),
-	}}
-	for {
-		n := min(len(binary), updateChunk)
-		req.Chunk = binary[:n]
-		if err := stream.Send(req); err != nil {
-			// The updater ended the call; CloseAndRecv says why.
-			break
-		}
-		binary = binary[n:]
-		if len(binary) == 0 {
-			break
-		}
-		req = &nodev1.UpdateAgentRequest{}
-	}
+	update := &nodev1.AgentUpdate{Version: version, Sha256: sha256Hex(binary), HealthTimeout: durationpb.New(healthTimeout)}
+	sendChunks(binary, func(chunk []byte) error {
+		req := &nodev1.UpdateAgentRequest{Update: update, Chunk: chunk}
+		update = nil
+		return stream.Send(req)
+	})
 	_, err = stream.CloseAndRecv()
 	// An updater from a release before UpdateAgent doesn't serve it.
 	if status.Code(err) == codes.Unimplemented {
 		return fmt.Errorf("the node's updater is from a release that can't update the agent: %w", err)
 	}
 	return err
+}
+
+// UpdateUpdater has the agent replace the updater with binary, the
+// updater at version, which must become healthy within healthTimeout.
+func (n *Node) UpdateUpdater(ctx context.Context, version string, binary []byte, healthTimeout time.Duration) error {
+	return UpdateUpdater(ctx, n.Agent, version, binary, healthTimeout)
+}
+
+// UpdateUpdater has agent replace the updater with binary, the updater
+// at version, which must become healthy within healthTimeout.
+func UpdateUpdater(ctx context.Context, agent nodev1.AgentClient, version string, binary []byte, healthTimeout time.Duration) error {
+	stream, err := agent.UpdateUpdater(ctx)
+	if err != nil {
+		return err
+	}
+	update := &nodev1.UpdaterUpdate{Version: version, Sha256: sha256Hex(binary), HealthTimeout: durationpb.New(healthTimeout)}
+	sendChunks(binary, func(chunk []byte) error {
+		req := &nodev1.UpdateUpdaterRequest{Update: update, Chunk: chunk}
+		update = nil
+		return stream.Send(req)
+	})
+	_, err = stream.CloseAndRecv()
+	return err
+}
+
+// UpdateContainerd has the agent replace containerd's binaries with
+// files, by name, containerd at version, which must answer within
+// healthTimeout.
+func (n *Node) UpdateContainerd(ctx context.Context, version string, files map[string][]byte, healthTimeout time.Duration) error {
+	return UpdateContainerd(ctx, n.Agent, version, files, healthTimeout)
+}
+
+// UpdateContainerd has agent replace containerd's binaries with files,
+// by name, containerd at version, which must answer within
+// healthTimeout.
+func UpdateContainerd(ctx context.Context, agent nodev1.AgentClient, version string, files map[string][]byte, healthTimeout time.Duration) error {
+	stream, err := agent.UpdateContainerd(ctx)
+	if err != nil {
+		return err
+	}
+	update := &nodev1.ContainerdUpdate{Version: version, HealthTimeout: durationpb.New(healthTimeout)}
+	names := slices.Sorted(maps.Keys(files))
+	for _, name := range names {
+		update.Files = append(update.Files, &nodev1.ContainerdFile{Name: name, Sha256: sha256Hex(files[name])})
+	}
+	sent := true
+	for _, name := range names {
+		sendChunks(files[name], func(chunk []byte) error {
+			req := &nodev1.UpdateContainerdRequest{Update: update, File: name, Chunk: chunk}
+			update = nil
+			err := stream.Send(req)
+			sent = err == nil
+			return err
+		})
+		if !sent {
+			break
+		}
+	}
+	_, err = stream.CloseAndRecv()
+	return err
+}
+
+// sha256Hex is data's SHA-256, hex.
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }

@@ -14,6 +14,8 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+
+	"github.com/moostackhq/moostack/internal/hostlayout"
 )
 
 // ContainerdVersion is the containerd that releases pin.
@@ -28,7 +30,7 @@ var containerdSHA256 = map[string]string{
 
 // ContainerdFiles are the binaries a node needs from containerd's
 // tarball.
-var ContainerdFiles = []string{"containerd", "containerd-shim-runc-v2"}
+var ContainerdFiles = hostlayout.ContainerdFiles
 
 // FetchContainerd writes ContainerdFiles for arch into dir. It downloads
 // containerd's static tarball once into cacheDir, and checks it against

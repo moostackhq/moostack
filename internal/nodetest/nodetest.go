@@ -38,7 +38,8 @@ import (
 // with.
 const Version = "9.8.7-test"
 
-// NextVersion is the version of NextAgent, an agent to update to.
+// NextVersion is the version of NextAgent and NextUpdater, an agent and
+// an updater to update to.
 const NextVersion = "9.8.8-test"
 
 // Node is a container running containerd, the updater and the agent.
@@ -204,6 +205,8 @@ func Start(t *testing.T) *Node {
 		"find "+builtDir+" -maxdepth 1 -type f -exec cp {} "+hostlayout.BinDir+" \\;\n"+
 		"mv "+hostlayout.Agent+" "+hostlayout.AgentSlots[0]+"\n"+
 		"ln -s "+filepath.Base(hostlayout.AgentSlots[0])+" "+hostlayout.Agent+"\n"+
+		"mv "+hostlayout.Updater+" "+hostlayout.UpdaterSlots[0]+"\n"+
+		"ln -s "+filepath.Base(hostlayout.UpdaterSlots[0])+" "+hostlayout.Updater+"\n"+
 		"cat >/usr/local/bin/systemctl <<'EOF'\n"+systemctl()+"EOF\n"+
 		"chmod 755 /usr/local/bin/systemctl\n")
 	request, err := exec.Command("docker", "exec", n.Name, hostlayout.Agent, "request-identity").Output()
@@ -562,12 +565,38 @@ func readBuilt(t *testing.T, name string) []byte {
 	return data
 }
 
-// nextAgent is NextAgent's file in binaries', in a directory of its own,
-// so that Start doesn't install it.
-const nextAgent = "next/agent"
+// Containerd are the release's containerd binaries, which the node
+// runs, by name.
+func Containerd(t *testing.T) map[string][]byte {
+	t.Helper()
+	files := map[string][]byte{}
+	for _, f := range release.ContainerdFiles {
+		files[f] = readBuilt(t, f)
+	}
+	return files
+}
 
-// NextAgentPath is where the container has NextAgent.
-const NextAgentPath = builtDir + "/" + nextAgent
+// Updater is the updater's binary, built at Version.
+func Updater(t *testing.T) []byte { return readBuilt(t, "updater") }
+
+// NextUpdater is the updater's binary built at NextVersion, to update
+// to.
+func NextUpdater(t *testing.T) []byte { return readBuilt(t, nextUpdater) }
+
+// nextAgent and nextUpdater are NextAgent's and NextUpdater's files in
+// binaries', in a directory of their own, so that Start doesn't install
+// them.
+const (
+	nextAgent   = "next/agent"
+	nextUpdater = "next/updater"
+)
+
+// NextAgentPath and NextUpdaterPath are where the container has
+// NextAgent and NextUpdater.
+const (
+	NextAgentPath   = builtDir + "/" + nextAgent
+	NextUpdaterPath = builtDir + "/" + nextUpdater
+)
 
 // startScript is the shell line that starts the program name with
 // command in the background, with its pid in /run/<name>.pid and its
@@ -608,10 +637,11 @@ const (
 )
 
 // binaries returns a directory holding the agent and the updater, built
-// from this checkout with Version, the agent built with NextVersion in
-// nextAgent, and the release's containerd binaries and runc for this
-// machine's architecture, with the cluster services' images in
-// imagesDir, also built with Version, and Fixture's and Broken's.
+// from this checkout with Version, the agent and the updater built with
+// NextVersion in nextAgent and nextUpdater, and the release's containerd
+// binaries and runc for this machine's architecture, with the cluster
+// services' images in imagesDir, also built with Version, and Fixture's
+// and Broken's.
 // Cleanup removes it.
 func binaries(t *testing.T) string {
 	t.Helper()
@@ -642,6 +672,7 @@ func binaries(t *testing.T) string {
 			{"agent", Version, "agent"},
 			{"updater", Version, "updater"},
 			{"agent", NextVersion, nextAgent},
+			{"updater", NextVersion, nextUpdater},
 		} {
 			cmd := exec.Command("go", "build", "-ldflags", "-X github.com/moostackhq/moostack/internal/buildinfo.Version="+b.version,
 				"-o", filepath.Join(binDir, b.out), "github.com/moostackhq/moostack/cmd/"+b.program)

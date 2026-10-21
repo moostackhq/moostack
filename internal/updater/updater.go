@@ -9,11 +9,11 @@ package updater
 import (
 	"context"
 	"errors"
-	"sync"
 
 	"google.golang.org/grpc"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
+	"github.com/moostackhq/moostack/internal/abslot"
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/rootsocket"
 )
@@ -53,8 +53,20 @@ func Serve(ctx context.Context, cfg Config) error {
 	if _, err := identity.Load(cfg.Identity); err != nil {
 		return err
 	}
-	s := &updaterServer{cfg: cfg}
-	if err := s.recoverSwap(ctx); err != nil {
+	healthy, err := agentHealthy(cfg.AgentSocket)
+	if err != nil {
+		return err
+	}
+	s := &updaterServer{cfg: cfg, agent: &abslot.Component{
+		Name:     "agent",
+		Swapper:  "the updater",
+		Link:     cfg.Agent,
+		Slots:    cfg.AgentSlots,
+		SwapFile: cfg.AgentSwapFile,
+		Restart:  cfg.RestartAgent,
+		Healthy:  healthy,
+	}}
+	if err := s.agent.Recover(ctx); err != nil {
 		return err
 	}
 	l, err := rootsocket.Listen(cfg.Socket)
@@ -73,9 +85,8 @@ func Serve(ctx context.Context, cfg Config) error {
 
 type updaterServer struct {
 	nodev1.UnimplementedUpdaterServer
-	cfg Config
-	// updating is held while an update of the agent runs.
-	updating sync.Mutex
+	cfg   Config
+	agent *abslot.Component
 }
 
 func (s *updaterServer) Status(context.Context, *nodev1.UpdaterStatusRequest) (*nodev1.UpdaterStatusResponse, error) {

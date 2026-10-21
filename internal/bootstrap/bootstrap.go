@@ -250,17 +250,21 @@ func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 				return "", err
 			}
 			to := hostlayout.BinDir + "/" + f
-			if to == hostlayout.Agent {
-				to = hostlayout.AgentSlots[0]
+			if slots, ok := hostlayout.Slots(to); ok {
+				to = slots[0]
 			}
 			if err := c.Upload(ctx, to, bytes.NewReader(data), 0o755, "root:root"); err != nil {
 				return "", err
 			}
 		}
 	}
-	// The agent runs from its first A/B slot, until the updater swaps it.
-	if _, err := output(ctx, c, "ln -sfn "+path.Base(hostlayout.AgentSlots[0])+" "+hostlayout.Agent); err != nil {
-		return "", err
+	// The agent and the updater run from their first A/B slots, until
+	// one swaps the other.
+	for _, link := range []string{hostlayout.Agent, hostlayout.Updater} {
+		slots, _ := hostlayout.Slots(link)
+		if _, err := output(ctx, c, "ln -sfn "+path.Base(slots[0])+" "+link); err != nil {
+			return "", err
+		}
 	}
 	request, err := output(ctx, c, hostlayout.Agent+" request-identity")
 	if err != nil {

@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/cluster"
 	"github.com/moostackhq/moostack/internal/release"
 )
@@ -20,7 +21,8 @@ import (
 // updateCluster makes the operator's cluster directory, on release
 // 1.0.0, with node1 and node3 on amd64 and node2 on arm64, all healthy at
 // generation 1, and a release source with 1.0.0 and 1.1.0, each of whose
-// agents says its architecture and version. It pins 1.1.0, as an
+// agents, updaters and containerd binaries says its architecture and
+// version, and whose containerd is at 2.0.0 and 2.1.0. It pins 1.1.0, as an
 // operator does before cluster update, and returns the release source.
 func updateCluster(t *testing.T, o *operator) string {
 	t.Helper()
@@ -51,16 +53,17 @@ func updateCluster(t *testing.T, o *operator) string {
 		o.nodes[n.name] = healthyNode(1)
 	}
 	source := t.TempDir()
-	for _, version := range []string{"1.0.0", "1.1.0"} {
+	for version, containerd := range map[string]string{"1.0.0": "2.0.0", "1.1.0": "2.1.0"} {
 		dir := filepath.Join(source, version)
 		for _, arch := range release.Architectures {
-			for _, f := range []string{"agent", "updater"} {
+			for _, f := range append([]string{"agent", "updater"}, release.ContainerdFiles...) {
 				writeFile(t, filepath.Join(dir, "linux-"+arch, f), []byte(f+" for "+arch+" at "+version))
 			}
 		}
 		err = release.Write(dir, release.Manifest{Version: version, Components: []release.Component{
 			{Name: "agent", Version: version, Files: []string{"agent"}},
 			{Name: "updater", Version: version, Files: []string{"updater"}},
+			{Name: "containerd", Version: containerd, Files: release.ContainerdFiles},
 		}})
 		if err != nil {
 			t.Fatal(err)
@@ -87,14 +90,19 @@ func pin(t *testing.T, o *operator, version string) {
 	writeFile(t, path, []byte(pinned))
 }
 
-func TestClusterUpdateSendsEachNodeThePinnedAgentForItsArchitecture(t *testing.T) {
+func TestClusterUpdateSendsEachNodeThePinnedComponentsForItsArchitecture(t *testing.T) {
 	o := newOperator(t, "op")
 	source := updateCluster(t, o)
 	before := snapshot(t, o.dir)
 	r := o.mustRun("--release-source", source, "cluster", "update")
-	for name, want := range map[string]string{"node1": "amd64", "node2": "arm64", "node3": "amd64"} {
-		if got := o.nodes[name].agentUpdates(); !slices.Equal(got, []string{"1.1.0 agent for " + want + " at 1.1.0"}) {
-			t.Errorf("%s's agent was updated to %q, want once to 1.1.0's agent for %s", name, got, want)
+	for name, arch := range map[string]string{"node1": "amd64", "node2": "arm64", "node3": "amd64"} {
+		want := []string{
+			"agent 1.1.0 agent for " + arch + " at 1.1.0",
+			"updater 1.1.0 updater for " + arch + " at 1.1.0",
+			"containerd 2.1.0 containerd: containerd for " + arch + " at 1.1.0 containerd-shim-runc-v2: containerd-shim-runc-v2 for " + arch + " at 1.1.0",
+		}
+		if got := o.nodes[name].nodeUpdates(); !slices.Equal(got, want) {
+			t.Errorf("%s was updated to\n%s\nwant\n%s", name, strings.Join(got, "\n"), strings.Join(want, "\n"))
 		}
 		if l := o.nodes[name].heldLock(); l != nil {
 			t.Errorf("after cluster update, %s holds the lock %+v", name, l)
@@ -106,13 +114,36 @@ func TestClusterUpdateSendsEachNodeThePinnedAgentForItsArchitecture(t *testing.T
 			t.Errorf("%s granted the lock %d times, want once, in the preflight", name, n)
 		}
 	}
-	want := "Updating the agent on node1 to 1.1.0\nUpdating the agent on node2 to 1.1.0\nUpdating the agent on node3 to 1.1.0\nEvery node runs the agent of release 1.1.0.\n"
+	var want string
+	for _, name := range []string{"node1", "node2", "node3"} {
+		want += "Updating the agent on " + name + " to 1.1.0\n" +
+			"Updating the updater on " + name + " to 1.1.0\n" +
+			"Updating containerd on " + name + " to 2.1.0\n"
+	}
+	want += "Every node runs the agent, the updater and containerd of release 1.1.0.\n"
 	if r.stdout != want {
 		t.Errorf("cluster update printed\n%s\nwant\n%s", r.stdout, want)
 	}
 	if after := snapshot(t, o.dir); !maps.Equal(before, after) {
 		t.Error("cluster update changed the cluster directory")
 	}
+}
+
+func TestClusterUpdateSkipsTheAgentAndTheUpdaterANodeRunsAlready(t *testing.T) {
+	o := newOperator(t, "op")
+	source := updateCluster(t, o)
+	healthy := nodev1.Health_HEALTH_HEALTHY
+	o.nodes["node1"].status.Components = []*nodev1.Component{
+		{Name: "agent", Version: "1.1.0", Health: healthy},
+		{Name: "containerd", Version: "2.1.0", Health: nodev1.Health_HEALTH_UNHEALTHY},
+		{Name: "updater", Version: "1.1.0", Health: healthy},
+	}
+	r := o.mustRun("--release-source", source, "cluster", "update")
+	if got := o.nodes["node1"].nodeUpdates(); len(got) != 1 || !strings.HasPrefix(got[0], "containerd 2.1.0") {
+		t.Errorf("node1 was updated to %q, want containerd only", got)
+	}
+	wantContains(t, "cluster update's output", r.stdout,
+		"node1 runs the agent at 1.1.0 already\nnode1 runs the updater at 1.1.0 already\nUpdating containerd on node1 to 2.1.0\nUpdating the agent on node2 to 1.1.0\n")
 }
 
 func TestClusterUpdateStopsAtTheFirstNodeThatFailsNamingIt(t *testing.T) {
@@ -153,25 +184,86 @@ func TestClusterUpdateUpdatesNothingWhenThePreflightFails(t *testing.T) {
 	}
 }
 
-func TestClusterUpdateRefusesAReleaseWithoutAnAgent(t *testing.T) {
-	o := newOperator(t, "op")
-	source := updateCluster(t, o)
-	dir := filepath.Join(source, "1.2.0")
-	for _, arch := range release.Architectures {
-		writeFile(t, filepath.Join(dir, "linux-"+arch, "updater"), []byte("updater"))
+func TestClusterUpdateRefusesAReleaseWithoutANodeComponent(t *testing.T) {
+	for _, missing := range []string{"agent", "updater", "containerd"} {
+		t.Run(missing, func(t *testing.T) {
+			o := newOperator(t, "op")
+			source := updateCluster(t, o)
+			dir := filepath.Join(source, "1.2.0")
+			var components []release.Component
+			for _, c := range []release.Component{
+				{Name: "agent", Version: "1.2.0", Files: []string{"agent"}},
+				{Name: "updater", Version: "1.2.0", Files: []string{"updater"}},
+				{Name: "containerd", Version: "2.2.0", Files: release.ContainerdFiles},
+			} {
+				if c.Name == missing {
+					continue
+				}
+				components = append(components, c)
+				for _, arch := range release.Architectures {
+					for _, f := range c.Files {
+						writeFile(t, filepath.Join(dir, "linux-"+arch, f), []byte(f))
+					}
+				}
+			}
+			if err := release.Write(dir, release.Manifest{Version: "1.2.0", Components: components}); err != nil {
+				t.Fatal(err)
+			}
+			pin(t, o, "1.2.0")
+			r := o.run("--release-source", source, "cluster", "update")
+			if r.err == nil || !strings.Contains(r.err.Error(), "release 1.2.0 pins no "+missing) {
+				t.Errorf("cluster update of a release without %s: %v", missing, r.err)
+			}
+			for name, n := range o.nodes {
+				if n.dialed() > 0 {
+					t.Errorf("cluster update reached %s for a release without %s", name, missing)
+				}
+			}
+		})
 	}
-	if err := release.Write(dir, release.Manifest{Version: "1.2.0", Components: []release.Component{{Name: "updater", Version: "1.2.0", Files: []string{"updater"}}}}); err != nil {
-		t.Fatal(err)
-	}
-	pin(t, o, "1.2.0")
-	r := o.run("--release-source", source, "cluster", "update")
-	if r.err == nil || !strings.Contains(r.err.Error(), "release 1.2.0 pins no agent") {
-		t.Errorf("cluster update of a release without an agent: %v", r.err)
-	}
-	for name, n := range o.nodes {
-		if n.dialed() > 0 {
-			t.Errorf("cluster update reached %s for a release without an agent", name)
-		}
+}
+
+func TestClusterUpdateRefusesANodeComponentWithOtherFiles(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		files map[string][]string
+		want  string
+	}{
+		{"an updater named otherwise", map[string][]string{"updater": {"updater-x"}}, "pins the updater as updater-x"},
+		{"an agent with a second file", map[string][]string{"agent": {"agent", "extra"}}, "pins the agent as agent, extra"},
+		{"containerd without its shim", map[string][]string{"containerd": {"containerd"}}, "pins containerd as containerd"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			o := newOperator(t, "op")
+			source := updateCluster(t, o)
+			dir := filepath.Join(source, "1.2.0")
+			files := map[string][]string{"agent": {"agent"}, "updater": {"updater"}, "containerd": release.ContainerdFiles}
+			for name, f := range c.files {
+				files[name] = f
+			}
+			var components []release.Component
+			for _, name := range []string{"agent", "updater", "containerd"} {
+				components = append(components, release.Component{Name: name, Version: "1.2.0", Files: files[name]})
+				for _, arch := range release.Architectures {
+					for _, f := range files[name] {
+						writeFile(t, filepath.Join(dir, "linux-"+arch, f), []byte(f))
+					}
+				}
+			}
+			if err := release.Write(dir, release.Manifest{Version: "1.2.0", Components: components}); err != nil {
+				t.Fatal(err)
+			}
+			pin(t, o, "1.2.0")
+			r := o.run("--release-source", source, "cluster", "update")
+			if r.err == nil || !strings.Contains(r.err.Error(), c.want) {
+				t.Errorf("cluster update of a release with %s: %v, want it refused saying %q", c.name, r.err, c.want)
+			}
+			for name, n := range o.nodes {
+				if n.dialed() > 0 {
+					t.Errorf("cluster update reached %s for a release with %s", name, c.name)
+				}
+			}
+		})
 	}
 }
 

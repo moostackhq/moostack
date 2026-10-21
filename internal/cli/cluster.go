@@ -427,10 +427,12 @@ func describeLocks(locks []lockView, nodes, answered int) string {
 	return strings.Join(held, "; ")
 }
 
-// clusterUpdate is mooctl cluster update. Once the preflight has passed,
-// it updates the agent of each node in turn to the pinned release's,
-// for the node's architecture, and stops at the first node that fails.
-// It doesn't change the cluster directory.
+// clusterUpdate is mooctl cluster update. After the preflight, it
+// updates each node in turn to the pinned release's node components, for
+// the node's architecture: the agent, then the updater, then containerd,
+// skipping the agent and the updater where the node runs them already.
+// It stops at the first step that fails. It doesn't change the cluster
+// directory.
 func clusterUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 	d, err := cluster.Open(cmd.String("dir"))
 	if err != nil {
@@ -440,9 +442,22 @@ func clusterUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	agent, ok := rel.Component("agent")
-	if !ok || !slices.Contains(agent.Files, "agent") {
-		return fmt.Errorf("release %s pins no agent", rel.Version)
+	pinned := map[string]release.Component{}
+	for _, name := range orchestrate.NodeComponents {
+		pc, ok := rel.Component(name)
+		if !ok {
+			return fmt.Errorf("release %s pins no %s", rel.Version, name)
+		}
+		// The agent and the updater are a binary each, named for them,
+		// and containerd is its binaries, each of them.
+		want := []string{name}
+		if name == "containerd" {
+			want = release.ContainerdFiles
+		}
+		if !slices.Equal(slices.Sorted(slices.Values(pc.Files)), slices.Sorted(slices.Values(want))) {
+			return fmt.Errorf("release %s pins %s as %s, not %s", rel.Version, orchestrate.ComponentNoun(name), strings.Join(pc.Files, ", "), strings.Join(want, ", "))
+		}
+		pinned[name] = pc
 	}
 	nodes, err := d.Nodes()
 	if err != nil {
@@ -457,25 +472,38 @@ func clusterUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 		return err
 	}
 	defer c.Close()
-	binaries := map[string][]byte{}
-	agentOf := func(name string) ([]byte, error) {
-		a := arch[name]
-		if binaries[a] == nil {
-			data, err := rel.ReadFile(a, "agent")
-			if err != nil {
-				return nil, err
-			}
-			binaries[a] = data
+	releases := map[string]orchestrate.NodeRelease{}
+	releaseOf := func(node string) (orchestrate.NodeRelease, error) {
+		a := arch[node]
+		if r, ok := releases[a]; ok {
+			return r, nil
 		}
-		return binaries[a], nil
+		r := orchestrate.NodeRelease{}
+		for component, pc := range pinned {
+			files := map[string][]byte{}
+			for _, f := range pc.Files {
+				data, err := rel.ReadFile(a, f)
+				if err != nil {
+					return nil, err
+				}
+				files[f] = data
+			}
+			r[component] = orchestrate.Component{Version: pc.Version, Files: files}
+		}
+		releases[a] = r
+		return r, nil
 	}
-	err = c.UpdateAgents(c.Context(), agent.Version, agentOf, func(name string) {
-		fmt.Fprintf(env.Stdout, "Updating the agent on %s to %s\n", name, agent.Version)
+	err = c.UpdateNodes(c.Context(), releaseOf, func(s orchestrate.Step) {
+		if s.Already {
+			fmt.Fprintf(env.Stdout, "%s runs %s at %s already\n", s.Node, s.Component, s.Version)
+			return
+		}
+		fmt.Fprintf(env.Stdout, "Updating %s on %s to %s\n", s.Component, s.Node, s.Version)
 	})
 	if err != nil {
 		return fmt.Errorf("cluster update stopped: %w", err)
 	}
-	fmt.Fprintf(env.Stdout, "Every node runs the agent of release %s.\n", rel.Version)
+	fmt.Fprintf(env.Stdout, "Every node runs the agent, the updater and containerd of release %s.\n", rel.Version)
 	return nil
 }
 

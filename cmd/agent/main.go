@@ -20,6 +20,7 @@ import (
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/rootsocket"
+	"github.com/moostackhq/moostack/internal/systemd"
 )
 
 func main() {
@@ -48,6 +49,14 @@ func run(args []string) error {
 			Identity:              hostlayout.Identity,
 			RemovedIdentitiesFile: hostlayout.RemovedIdentitiesFile,
 			PeerPort:              hostlayout.PeerPort,
+			Updater:               hostlayout.Updater,
+			UpdaterSlots:          hostlayout.UpdaterSlots,
+			UpdaterSwapFile:       hostlayout.UpdaterSwapFile,
+			UpdaterSocket:         hostlayout.UpdaterSocket,
+			RestartUpdater:        func(ctx context.Context) error { return systemd.Restart(ctx, hostlayout.UpdaterUnit) },
+			ContainerdBinDir:      hostlayout.BinDir,
+			ContainerdFiles:       hostlayout.ContainerdFiles,
+			RestartContainerd:     func(ctx context.Context) error { return systemd.Restart(ctx, hostlayout.ContainerdUnit) },
 		})
 	case len(args) == 2 && args[0] == "relay":
 		return rootsocket.Relay(args[1], os.Stdin, os.Stdout)

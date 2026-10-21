@@ -31,6 +31,8 @@ const (
 	Agent_ImportImage_FullMethodName      = "/moostack.node.v1.Agent/ImportImage"
 	Agent_RunService_FullMethodName       = "/moostack.node.v1.Agent/RunService"
 	Agent_RemoveIdentities_FullMethodName = "/moostack.node.v1.Agent/RemoveIdentities"
+	Agent_UpdateUpdater_FullMethodName    = "/moostack.node.v1.Agent/UpdateUpdater"
+	Agent_UpdateContainerd_FullMethodName = "/moostack.node.v1.Agent/UpdateContainerd"
 )
 
 // AgentClient is the client API for Agent service.
@@ -86,6 +88,31 @@ type AgentClient interface {
 	// It refuses the request with FAILED_PRECONDITION unless the request's
 	// lease holds the operation lock.
 	RemoveIdentities(ctx context.Context, in *RemoveIdentitiesRequest, opts ...grpc.CallOption) (*RemoveIdentitiesResponse, error)
+	// UpdateUpdater replaces the updater with the binary that the requests
+	// carry, through the updater's A/B slots, as the updater's UpdateAgent
+	// replaces the agent, and with the same answers: the new updater must
+	// serve its status at the update's version, healthy. An agent that
+	// crashes before the new updater is healthy, or whose switch back
+	// failed, switches back when it starts again, and refuses another
+	// update of the updater until it has. Both move a binary that a
+	// release before the A/B slots installed into the first of them.
+	UpdateUpdater(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpdateUpdaterRequest, UpdateUpdaterResponse], error)
+	// UpdateContainerd replaces containerd's binaries with those that the
+	// requests carry: the first says which containerd they are, and every
+	// request carries the next bytes of one of them, each file's in order.
+	// Once it has them all, the agent puts them in place of the old ones,
+	// which it keeps, restarts containerd, and answers once containerd
+	// serves at the update's version with its shim at the same version. If
+	// it doesn't within the update's health timeout, the agent puts the old
+	// binaries back, restarts containerd and fails the call with ABORTED,
+	// or with INTERNAL if containerd doesn't restart or answer within the
+	// health timeout either. Running containers keep running, through
+	// their shims. It refuses, with INVALID_ARGUMENT, binaries that don't
+	// match their checksums, a file that isn't one of containerd's, and an
+	// update without each of them, and, with FAILED_PRECONDITION, an update
+	// while another runs, changing nothing. Once the agent has the
+	// binaries, the update goes on even if the call ends.
+	UpdateContainerd(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpdateContainerdRequest, UpdateContainerdResponse], error)
 }
 
 type agentClient struct {
@@ -189,6 +216,32 @@ func (c *agentClient) RemoveIdentities(ctx context.Context, in *RemoveIdentities
 	return out, nil
 }
 
+func (c *agentClient) UpdateUpdater(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpdateUpdaterRequest, UpdateUpdaterResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Agent_ServiceDesc.Streams[1], Agent_UpdateUpdater_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[UpdateUpdaterRequest, UpdateUpdaterResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Agent_UpdateUpdaterClient = grpc.ClientStreamingClient[UpdateUpdaterRequest, UpdateUpdaterResponse]
+
+func (c *agentClient) UpdateContainerd(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpdateContainerdRequest, UpdateContainerdResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Agent_ServiceDesc.Streams[2], Agent_UpdateContainerd_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[UpdateContainerdRequest, UpdateContainerdResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Agent_UpdateContainerdClient = grpc.ClientStreamingClient[UpdateContainerdRequest, UpdateContainerdResponse]
+
 // AgentServer is the server API for Agent service.
 // All implementations must embed UnimplementedAgentServer
 // for forward compatibility.
@@ -242,6 +295,31 @@ type AgentServer interface {
 	// It refuses the request with FAILED_PRECONDITION unless the request's
 	// lease holds the operation lock.
 	RemoveIdentities(context.Context, *RemoveIdentitiesRequest) (*RemoveIdentitiesResponse, error)
+	// UpdateUpdater replaces the updater with the binary that the requests
+	// carry, through the updater's A/B slots, as the updater's UpdateAgent
+	// replaces the agent, and with the same answers: the new updater must
+	// serve its status at the update's version, healthy. An agent that
+	// crashes before the new updater is healthy, or whose switch back
+	// failed, switches back when it starts again, and refuses another
+	// update of the updater until it has. Both move a binary that a
+	// release before the A/B slots installed into the first of them.
+	UpdateUpdater(grpc.ClientStreamingServer[UpdateUpdaterRequest, UpdateUpdaterResponse]) error
+	// UpdateContainerd replaces containerd's binaries with those that the
+	// requests carry: the first says which containerd they are, and every
+	// request carries the next bytes of one of them, each file's in order.
+	// Once it has them all, the agent puts them in place of the old ones,
+	// which it keeps, restarts containerd, and answers once containerd
+	// serves at the update's version with its shim at the same version. If
+	// it doesn't within the update's health timeout, the agent puts the old
+	// binaries back, restarts containerd and fails the call with ABORTED,
+	// or with INTERNAL if containerd doesn't restart or answer within the
+	// health timeout either. Running containers keep running, through
+	// their shims. It refuses, with INVALID_ARGUMENT, binaries that don't
+	// match their checksums, a file that isn't one of containerd's, and an
+	// update without each of them, and, with FAILED_PRECONDITION, an update
+	// while another runs, changing nothing. Once the agent has the
+	// binaries, the update goes on even if the call ends.
+	UpdateContainerd(grpc.ClientStreamingServer[UpdateContainerdRequest, UpdateContainerdResponse]) error
 	mustEmbedUnimplementedAgentServer()
 }
 
@@ -278,6 +356,12 @@ func (UnimplementedAgentServer) RunService(context.Context, *RunServiceRequest) 
 }
 func (UnimplementedAgentServer) RemoveIdentities(context.Context, *RemoveIdentitiesRequest) (*RemoveIdentitiesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveIdentities not implemented")
+}
+func (UnimplementedAgentServer) UpdateUpdater(grpc.ClientStreamingServer[UpdateUpdaterRequest, UpdateUpdaterResponse]) error {
+	return status.Error(codes.Unimplemented, "method UpdateUpdater not implemented")
+}
+func (UnimplementedAgentServer) UpdateContainerd(grpc.ClientStreamingServer[UpdateContainerdRequest, UpdateContainerdResponse]) error {
+	return status.Error(codes.Unimplemented, "method UpdateContainerd not implemented")
 }
 func (UnimplementedAgentServer) mustEmbedUnimplementedAgentServer() {}
 func (UnimplementedAgentServer) testEmbeddedByValue()               {}
@@ -451,6 +535,20 @@ func _Agent_RemoveIdentities_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_UpdateUpdater_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(AgentServer).UpdateUpdater(&grpc.GenericServerStream[UpdateUpdaterRequest, UpdateUpdaterResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Agent_UpdateUpdaterServer = grpc.ClientStreamingServer[UpdateUpdaterRequest, UpdateUpdaterResponse]
+
+func _Agent_UpdateContainerd_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(AgentServer).UpdateContainerd(&grpc.GenericServerStream[UpdateContainerdRequest, UpdateContainerdResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Agent_UpdateContainerdServer = grpc.ClientStreamingServer[UpdateContainerdRequest, UpdateContainerdResponse]
+
 // Agent_ServiceDesc is the grpc.ServiceDesc for Agent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -495,6 +593,16 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ImportImage",
 			Handler:       _Agent_ImportImage_Handler,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "UpdateUpdater",
+			Handler:       _Agent_UpdateUpdater_Handler,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "UpdateContainerd",
+			Handler:       _Agent_UpdateContainerd_Handler,
 			ClientStreams: true,
 		},
 	},

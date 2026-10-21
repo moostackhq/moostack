@@ -47,6 +47,14 @@ type Node interface {
 	// the agent at version, which must become healthy within
 	// healthTimeout, or the updater rolls it back.
 	UpdateAgent(ctx context.Context, version string, binary []byte, healthTimeout time.Duration) error
+	// UpdateUpdater has the node's agent replace its updater with binary,
+	// the updater at version, which must become healthy within
+	// healthTimeout, or the agent rolls it back.
+	UpdateUpdater(ctx context.Context, version string, binary []byte, healthTimeout time.Duration) error
+	// UpdateContainerd has the node's agent replace containerd's binaries
+	// with files, by name, containerd at version, which must answer
+	// within healthTimeout, or the agent puts the old ones back.
+	UpdateContainerd(ctx context.Context, version string, files map[string][]byte, healthTimeout time.Duration) error
 	// Close closes the connection.
 	Close() error
 }

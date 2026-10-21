@@ -1,8 +1,10 @@
 package orchestrate_test
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -46,22 +48,28 @@ type node struct {
 	// between.
 	laterGeneration int64
 
-	// updateErr, if set, is why updating the agent fails, and
-	// updateDelay how long an update takes.
+	// updateErr, if set, is why updating the component failing fails,
+	// the agent if failing is empty, and updateDelay how long an update
+	// of any component takes.
 	updateErr   error
+	failing     string
 	updateDelay time.Duration
-	// onUpdate, if set, is called as an update of the agent starts.
-	onUpdate func()
+	// onUpdate, if set, is called as an update of the agent starts, and
+	// onUpdateOf as an update of the component it names starts.
+	onUpdate   func()
+	onUpdateOf map[string]func()
 	// restartFor is how long the node's agent doesn't answer once an
 	// update ends, as it restarts.
 	restartFor time.Duration
 	// rollsBack says the update uses its whole health timeout and as
 	// long again rolling back, and then fails.
 	rollsBack bool
+	// components are the node components the node reports.
+	components []*nodev1.Component
 
 	mu sync.Mutex
-	// updates are the updates of the agent, in order.
-	updates []agentUpdate
+	// updates are the updates of the node's components, in order.
+	updates []componentUpdate
 	// downUntil is when the agent answers again after a restart.
 	downUntil time.Time
 	// lock is the lease that holds the node's operation lock, nil if
@@ -133,7 +141,7 @@ func (n *node) Status(ctx context.Context) nodeclient.Status {
 		generation = n.laterGeneration
 	}
 	n.mu.Unlock()
-	return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock()}
+	return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock(), Components: n.components}
 }
 
 func (n *node) RecordGeneration(ctx context.Context, g int64, nodes []string, lease string) error {
@@ -263,20 +271,46 @@ func (n *node) BreakLock(ctx context.Context) (*nodeclient.Lock, error) {
 	return l, nil
 }
 
-// agentUpdate is an update of a fake node's agent.
-type agentUpdate struct {
-	version, binary string
-	healthTimeout   time.Duration
-	started, ended  time.Time
+// componentUpdate is an update of a fake node's component: agent,
+// updater or containerd.
+type componentUpdate struct {
+	component, version, binary string
+	healthTimeout              time.Duration
+	started, ended             time.Time
 }
 
 func (n *node) UpdateAgent(ctx context.Context, version string, binary []byte, healthTimeout time.Duration) error {
-	started := time.Now()
 	if n.onUpdate != nil {
 		n.onUpdate()
 	}
+	return n.update(ctx, "agent", version, string(binary), healthTimeout)
+}
+
+func (n *node) UpdateUpdater(ctx context.Context, version string, binary []byte, healthTimeout time.Duration) error {
+	return n.update(ctx, "updater", version, string(binary), healthTimeout)
+}
+
+func (n *node) UpdateContainerd(ctx context.Context, version string, files map[string][]byte, healthTimeout time.Duration) error {
+	var binaries []string
+	for _, name := range slices.Sorted(maps.Keys(files)) {
+		binaries = append(binaries, name+": "+string(files[name]))
+	}
+	return n.update(ctx, "containerd", version, strings.Join(binaries, ", "), healthTimeout)
+}
+
+// update records an update of component, after updateDelay, and fails
+// it with updateErr if it is the one failing. An update of the agent
+// restarts it, for restartFor.
+func (n *node) update(ctx context.Context, component, version, binary string, healthTimeout time.Duration) error {
+	started := time.Now()
+	if f := n.onUpdateOf[component]; f != nil {
+		f()
+	}
 	delay, err := n.updateDelay, n.updateErr
-	if n.rollsBack {
+	if failing := cmp.Or(n.failing, "agent"); failing != component {
+		err = nil
+	}
+	if n.rollsBack && component == "agent" {
 		delay, err = 2*healthTimeout, errors.New("rolled back to the agent it replaced")
 	}
 	select {
@@ -286,17 +320,29 @@ func (n *node) UpdateAgent(ctx context.Context, version string, binary []byte, h
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.updates = append(n.updates, agentUpdate{version, string(binary), healthTimeout, started, time.Now()})
-	n.downUntil = time.Now().Add(n.restartFor)
+	n.updates = append(n.updates, componentUpdate{component, version, binary, healthTimeout, started, time.Now()})
+	if component == "agent" {
+		n.downUntil = time.Now().Add(n.restartFor)
+	}
 	return err
 }
 
-// agentUpdates are the updates of the node's agent so far.
-func (n *node) agentUpdates() []agentUpdate {
+// componentUpdates are the updates of the node's components so far, of
+// component only unless that is empty.
+func (n *node) componentUpdates(component string) []componentUpdate {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return slices.Clone(n.updates)
+	var updates []componentUpdate
+	for _, u := range n.updates {
+		if component == "" || u.component == component {
+			updates = append(updates, u)
+		}
+	}
+	return updates
 }
+
+// agentUpdates are the updates of the node's agent so far.
+func (n *node) agentUpdates() []componentUpdate { return n.componentUpdates("agent") }
 
 func (n *node) Close() error {
 	n.mu.Lock()

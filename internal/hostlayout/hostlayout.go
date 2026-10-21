@@ -34,7 +34,8 @@ const (
 	Agent = BinDir + "/agent"
 	// AgentSocket is where the agent serves the node API, to root only.
 	AgentSocket = RunDir + "/agent.sock"
-	// Updater is the updater's binary.
+	// Updater is the updater's binary: a symbolic link, relative, to the
+	// active one of UpdaterSlots.
 	Updater = BinDir + "/updater"
 	// Runc is runc's binary, which containerd's shim runs each container
 	// with.
@@ -89,6 +90,14 @@ const (
 	ServiceUser = 65534
 )
 
+// ContainerdShim is the shim that containerd runs each container
+// through, in BinDir.
+const ContainerdShim = "containerd-shim-runc-v2"
+
+// ContainerdFiles are containerd's binaries in BinDir, by name:
+// containerd and its shim.
+var ContainerdFiles = []string{"containerd", ContainerdShim}
+
 // AgentSlots are the agent's A/B slots: the binary the agent runs from,
 // which Agent links to, and the one the updater writes the next agent
 // into.
@@ -98,6 +107,27 @@ var AgentSlots = [2]string{Agent + ".a", Agent + ".b"}
 // switched to but not yet seen healthy: the A/B slot it switched from,
 // which it switches back to if it starts again with the file there.
 const AgentSwapFile = StateDir + "/agent-swap"
+
+// UpdaterSlots are the updater's A/B slots, as AgentSlots are the
+// agent's, which the agent swaps.
+var UpdaterSlots = [2]string{Updater + ".a", Updater + ".b"}
+
+// UpdaterSwapFile records a swap of the updater that the agent has
+// switched to but not yet seen healthy, as AgentSwapFile does the
+// agent's.
+const UpdaterSwapFile = StateDir + "/updater-swap"
+
+// Slots are the A/B slots of the binary at path, if it runs from them:
+// the agent's or the updater's.
+func Slots(path string) ([2]string, bool) {
+	switch path {
+	case Agent:
+		return AgentSlots, true
+	case Updater:
+		return UpdaterSlots, true
+	}
+	return [2]string{}, false
+}
 
 // The systemd units that run the node components.
 const (

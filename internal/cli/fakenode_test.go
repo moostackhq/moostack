@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,8 +45,8 @@ type fakeNode struct {
 	dials int
 	// updateErr, if set, is why updating the agent fails.
 	updateErr error
-	// updates are the agents the node was updated to, as version and
-	// binary, in order.
+	// updates are the components the node was updated to, as the
+	// component, its version and its binaries, in order.
 	updates []string
 }
 
@@ -178,15 +180,44 @@ func (n *fakeNode) BreakLock(context.Context) (*nodeclient.Lock, error) {
 func (n *fakeNode) UpdateAgent(_ context.Context, version string, binary []byte, _ time.Duration) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.updates = append(n.updates, version+" "+string(binary))
+	n.updates = append(n.updates, "agent "+version+" "+string(binary))
 	return n.updateErr
+}
+
+func (n *fakeNode) UpdateUpdater(_ context.Context, version string, binary []byte, _ time.Duration) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.updates = append(n.updates, "updater "+version+" "+string(binary))
+	return nil
+}
+
+func (n *fakeNode) UpdateContainerd(_ context.Context, version string, files map[string][]byte, _ time.Duration) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	update := "containerd " + version
+	for _, name := range slices.Sorted(maps.Keys(files)) {
+		update += " " + name + ": " + string(files[name])
+	}
+	n.updates = append(n.updates, update)
+	return nil
+}
+
+// nodeUpdates are the components the node was updated to so far.
+func (n *fakeNode) nodeUpdates() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.updates)
 }
 
 // agentUpdates are the agents the node was updated to so far.
 func (n *fakeNode) agentUpdates() []string {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return slices.Clone(n.updates)
+	var agents []string
+	for _, u := range n.nodeUpdates() {
+		if a, ok := strings.CutPrefix(u, "agent "); ok {
+			agents = append(agents, a)
+		}
+	}
+	return agents
 }
 
 func (n *fakeNode) Close() error { return nil }

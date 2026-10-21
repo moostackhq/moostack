@@ -303,6 +303,14 @@ func (n unreachedNode) UpdateAgent(context.Context, string, []byte, time.Duratio
 	return n.err
 }
 
+func (n unreachedNode) UpdateUpdater(context.Context, string, []byte, time.Duration) error {
+	return n.err
+}
+
+func (n unreachedNode) UpdateContainerd(context.Context, string, map[string][]byte, time.Duration) error {
+	return n.err
+}
+
 func (n unreachedNode) Close() error { return nil }
 
 // openCA opens the cluster CA of d, reading its key from the secret

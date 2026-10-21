@@ -29,6 +29,7 @@ import (
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	servicev1 "github.com/moostackhq/moostack/api/service/v1"
+	"github.com/moostackhq/moostack/internal/abslot"
 	"github.com/moostackhq/moostack/internal/gateway"
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/identity"
@@ -68,6 +69,26 @@ type Config struct {
 	// PeerPort is the port to listen for peers on, at the node's private
 	// address.
 	PeerPort uint16
+	// Updater is the updater's binary, a symbolic link to the active one
+	// of UpdaterSlots, relative, in the same directory.
+	Updater string
+	// UpdaterSlots are the updater's A/B slots.
+	UpdaterSlots [2]string
+	// UpdaterSwapFile records a swap of the updater that hasn't been seen
+	// healthy. Its directory must exist.
+	UpdaterSwapFile string
+	// UpdaterSocket is where the updater serves its node API.
+	UpdaterSocket string
+	// RestartUpdater restarts the updater, from the binary Updater links
+	// to.
+	RestartUpdater func(ctx context.Context) error
+	// ContainerdBinDir holds containerd's binaries, ContainerdFiles by
+	// name, which an update replaces.
+	ContainerdBinDir string
+	ContainerdFiles  []string
+	// RestartContainerd restarts containerd, leaving the containers'
+	// shims running.
+	RestartContainerd func(ctx context.Context) error
 }
 
 // StopTimeout bounds how long the agent waits, once told to stop, for
@@ -79,12 +100,16 @@ const StopTimeout = 5 * time.Second
 const containerdTimeout = 2 * time.Second
 
 // Serve serves the node API on cfg.Socket, and listens for peers at the
-// node's private address, until ctx ends. Peers connect with mTLS, and
-// only those with an identity from the cluster CA that the node doesn't
-// hold as removed are accepted. It won't serve without a valid identity
-// of its own, or with removed identities it can't read. Calls on
-// cfg.Socket that aren't the node API's go to the cluster services, as an
-// operator's, and the services that aren't running are started.
+// node's private address, until ctx ends. Its graceful stop waits for
+// an update of the updater that runs, past StopTimeout, since the update
+// goes on once its call ends. If a swap of the updater is recorded, as
+// when the agent crashed in one, it switches the updater back meanwhile.
+// Peers connect with mTLS, and only those with an identity from the
+// cluster CA that the node doesn't hold as removed are accepted. It
+// won't serve without a valid identity of its own, or with removed
+// identities it can't read. Calls on cfg.Socket that aren't the node
+// API's go to the cluster services, as an operator's, and the services
+// that aren't running are started.
 func Serve(ctx context.Context, cfg Config) error {
 	data, err := os.ReadFile(cfg.NodeFile)
 	if err != nil {
@@ -123,11 +148,27 @@ func Serve(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	healthy, err := updaterHealthy(cfg.UpdaterSocket)
+	if err != nil {
+		return err
+	}
+	updater := &abslot.Component{
+		Name:     "updater",
+		Swapper:  "the agent",
+		Link:     cfg.Updater,
+		Slots:    cfg.UpdaterSlots,
+		SwapFile: cfg.UpdaterSwapFile,
+		Restart:  cfg.RestartUpdater,
+		Healthy:  healthy,
+	}
 	server := grpc.NewServer(gw.ServerOptions(servicev1.CallerKind_CALLER_KIND_OPERATOR)...)
-	nodev1.RegisterAgentServer(server, &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: client, runc: cfg.Runc, services: services, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile), removed: removed})
+	agent := &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: client, shim: filepath.Join(cfg.ContainerdBinDir, hostlayout.ContainerdShim), runc: cfg.Runc, services: services, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile), removed: removed, updater: updater}
+	agent.containerdBinaries = &containerdBinaries{dir: cfg.ContainerdBinDir, files: cfg.ContainerdFiles, restart: cfg.RestartContainerd, wait: agent.waitContainerd}
+	nodev1.RegisterAgentServer(server, agent)
 	peers := grpc.NewServer(grpc.Creds(newPeerCredentials(id, removed)))
 	healthpb.RegisterHealthServer(peers, health.NewServer())
 	go services.StartAll(ctx)
+	go recoverUpdater(ctx, updater)
 	return serveAll(ctx, map[*grpc.Server]net.Listener{server: l, peers: peerListener})
 }
 
@@ -170,14 +211,18 @@ var modes = map[string]nodev1.Mode{hostlayout.ModeDirect: nodev1.Mode_MODE_DIREC
 
 type agentServer struct {
 	nodev1.UnimplementedAgentServer
-	version        string
-	mode           nodev1.Mode
-	containerd     *containerd.Client
-	runc           string
-	services       *services
-	generationFile string
-	lock           *operationLock
-	removed        *removedIdentities
+	version    string
+	mode       nodev1.Mode
+	containerd *containerd.Client
+	// shim is containerd's shim, which must be at containerd's version.
+	shim               string
+	runc               string
+	services           *services
+	generationFile     string
+	lock               *operationLock
+	removed            *removedIdentities
+	updater            *abslot.Component
+	containerdBinaries *containerdBinaries
 }
 
 func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nodev1.StatusResponse, error) {
@@ -286,20 +331,44 @@ func syncDir(path string) error {
 }
 
 // containerdStatus is containerd's version, if it answers, without the
-// leading v, as a release pins it.
+// leading v, as a release pins it. It is healthy if its shim is at the
+// same version: binaries that are part old and part new, as when the
+// host restarted while an update put them in place, aren't.
 func (s *agentServer) containerdStatus(ctx context.Context) *nodev1.Component {
 	ctx, cancel := context.WithTimeout(ctx, containerdTimeout)
 	defer cancel()
-	c := &nodev1.Component{Name: "containerd"}
+	c := &nodev1.Component{Name: "containerd", Health: nodev1.Health_HEALTH_UNHEALTHY}
 	v, err := s.containerd.Version(ctx)
 	if err != nil {
-		c.Health = nodev1.Health_HEALTH_UNHEALTHY
 		c.Problem = err.Error()
 		return c
 	}
 	c.Version = strings.TrimPrefix(v.Version, "v")
-	c.Health = nodev1.Health_HEALTH_HEALTHY
+	shim, err := s.shimVersion(ctx)
+	switch {
+	case err != nil:
+		c.Problem = err.Error()
+	case shim != c.Version:
+		c.Problem = fmt.Sprintf("its shim, %s, is at %s", hostlayout.ContainerdShim, shim)
+	default:
+		c.Health = nodev1.Health_HEALTH_HEALTHY
+	}
 	return c
+}
+
+// shimVersion is the version of containerd's shim, as it says when run,
+// without the leading v.
+func (s *agentServer) shimVersion(ctx context.Context) (string, error) {
+	out, err := exec.CommandContext(ctx, s.shim, "-v").Output()
+	if err != nil {
+		return "", fmt.Errorf("running %s -v: %v", s.shim, err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "Version:"); ok {
+			return strings.TrimPrefix(strings.TrimSpace(v), "v"), nil
+		}
+	}
+	return "", fmt.Errorf("%s -v doesn't say its version", s.shim)
 }
 
 // runcTimeout bounds asking runc for its version.

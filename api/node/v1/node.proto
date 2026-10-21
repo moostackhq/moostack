@@ -58,6 +58,31 @@ service Agent {
   // It refuses the request with FAILED_PRECONDITION unless the request's
   // lease holds the operation lock.
   rpc RemoveIdentities(RemoveIdentitiesRequest) returns (RemoveIdentitiesResponse);
+  // UpdateUpdater replaces the updater with the binary that the requests
+  // carry, through the updater's A/B slots, as the updater's UpdateAgent
+  // replaces the agent, and with the same answers: the new updater must
+  // serve its status at the update's version, healthy. An agent that
+  // crashes before the new updater is healthy, or whose switch back
+  // failed, switches back when it starts again, and refuses another
+  // update of the updater until it has. Both move a binary that a
+  // release before the A/B slots installed into the first of them.
+  rpc UpdateUpdater(stream UpdateUpdaterRequest) returns (UpdateUpdaterResponse);
+  // UpdateContainerd replaces containerd's binaries with those that the
+  // requests carry: the first says which containerd they are, and every
+  // request carries the next bytes of one of them, each file's in order.
+  // Once it has them all, the agent puts them in place of the old ones,
+  // which it keeps, restarts containerd, and answers once containerd
+  // serves at the update's version with its shim at the same version. If
+  // it doesn't within the update's health timeout, the agent puts the old
+  // binaries back, restarts containerd and fails the call with ABORTED,
+  // or with INTERNAL if containerd doesn't restart or answer within the
+  // health timeout either. Running containers keep running, through
+  // their shims. It refuses, with INVALID_ARGUMENT, binaries that don't
+  // match their checksums, a file that isn't one of containerd's, and an
+  // update without each of them, and, with FAILED_PRECONDITION, an update
+  // while another runs, changing nothing. Once the agent has the
+  // binaries, the update goes on even if the call ends.
+  rpc UpdateContainerd(stream UpdateContainerdRequest) returns (UpdateContainerdResponse);
 }
 
 // Updater is the node API that the updater serves, on its own socket, so
@@ -238,6 +263,58 @@ message AgentUpdate {
 }
 
 message UpdateAgentResponse {}
+
+message UpdateUpdaterRequest {
+  // Update says which updater the binary is. The first request carries
+  // it, and the others don't.
+  UpdaterUpdate update = 1;
+  // Chunk is the binary's next bytes.
+  bytes chunk = 2;
+}
+
+// UpdaterUpdate is the updater that an update installs.
+message UpdaterUpdate {
+  // Version is the version the new updater reports.
+  string version = 1;
+  // Sha256 is the binary's SHA-256, hex.
+  string sha256 = 2;
+  // HealthTimeout is how long the new updater has to become healthy.
+  google.protobuf.Duration health_timeout = 3;
+}
+
+message UpdateUpdaterResponse {}
+
+message UpdateContainerdRequest {
+  // Update says which containerd the binaries are. The first request
+  // carries it, and the others don't.
+  ContainerdUpdate update = 1;
+  // File is the name of the file that chunk is the next bytes of, one of
+  // the update's files.
+  string file = 2;
+  bytes chunk = 3;
+}
+
+// ContainerdUpdate is the containerd that an update installs.
+message ContainerdUpdate {
+  // Version is the version the new containerd reports, without the
+  // leading v.
+  string version = 1;
+  // Files are containerd's binaries, each of them.
+  repeated ContainerdFile files = 2;
+  // HealthTimeout is how long the new containerd has to restart and
+  // answer.
+  google.protobuf.Duration health_timeout = 3;
+}
+
+// ContainerdFile is one of containerd's binaries.
+message ContainerdFile {
+  // Name is the binary's, such as containerd.
+  string name = 1;
+  // Sha256 is the binary's SHA-256, hex.
+  string sha256 = 2;
+}
+
+message UpdateContainerdResponse {}
 
 // Mode is how the node is operated.
 enum Mode {
