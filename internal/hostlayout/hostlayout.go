@@ -29,7 +29,8 @@ var Dirs = []string{Root, ConfigDir, StateDir, RunDir}
 const (
 	// BinDir holds the node components' binaries.
 	BinDir = Root + "/bin"
-	// Agent is the agent's binary.
+	// Agent is the agent's binary: a symbolic link, relative, to the
+	// active one of AgentSlots.
 	Agent = BinDir + "/agent"
 	// AgentSocket is where the agent serves the node API, to root only.
 	AgentSocket = RunDir + "/agent.sock"
@@ -86,6 +87,23 @@ const (
 	// ServiceUser is the user and group, by ID, that the cluster services
 	// run as: nobody.
 	ServiceUser = 65534
+)
+
+// AgentSlots are the agent's A/B slots: the binary the agent runs from,
+// which Agent links to, and the one the updater writes the next agent
+// into.
+var AgentSlots = [2]string{Agent + ".a", Agent + ".b"}
+
+// AgentSwapFile records a swap of the agent that the updater has
+// switched to but not yet seen healthy: the A/B slot it switched from,
+// which it switches back to if it starts again with the file there.
+const AgentSwapFile = StateDir + "/agent-swap"
+
+// The systemd units that run the node components.
+const (
+	ContainerdUnit = "moostack-containerd.service"
+	UpdaterUnit    = "moostack-updater.service"
+	AgentUnit      = "moostack-agent.service"
 )
 
 // Identity is where the node keeps its node identity, which the agent

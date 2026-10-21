@@ -502,7 +502,8 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	Updater_Status_FullMethodName = "/moostack.node.v1.Updater/Status"
+	Updater_Status_FullMethodName      = "/moostack.node.v1.Updater/Status"
+	Updater_UpdateAgent_FullMethodName = "/moostack.node.v1.Updater/UpdateAgent"
 )
 
 // UpdaterClient is the client API for Updater service.
@@ -514,6 +515,26 @@ const (
 type UpdaterClient interface {
 	// Status reports the updater's own state.
 	Status(ctx context.Context, in *UpdaterStatusRequest, opts ...grpc.CallOption) (*UpdaterStatusResponse, error)
+	// UpdateAgent replaces the agent with the binary that the requests
+	// carry: the first says which agent it is, and every request carries
+	// the binary's next bytes, in order. The updater writes it into the
+	// agent's inactive A/B slot, switches to that A/B slot and restarts the
+	// agent, and answers once the new agent serves its status at the
+	// update's version with every component it reports healthy. If it
+	// doesn't within the update's health timeout, the updater switches
+	// back, restarts the agent it replaced, and fails the call with
+	// ABORTED, or with INTERNAL if the agent it replaced doesn't restart or
+	// become healthy within the health timeout either. The call fails with
+	// INTERNAL too if the new agent becomes healthy but the updater can't
+	// remove the swap's record, since it then switches back when it next
+	// starts. It refuses a binary that doesn't match the update's checksum
+	// with INVALID_ARGUMENT, and, with FAILED_PRECONDITION, an update while
+	// another runs or while a swap that didn't finish is recorded, changing
+	// nothing. Once it has the whole binary, the update goes on even if the
+	// call ends, and an updater told to stop finishes it first. One that
+	// crashes before the new agent is healthy, or whose switch back failed,
+	// switches back when it starts again.
+	UpdateAgent(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpdateAgentRequest, UpdateAgentResponse], error)
 }
 
 type updaterClient struct {
@@ -534,6 +555,19 @@ func (c *updaterClient) Status(ctx context.Context, in *UpdaterStatusRequest, op
 	return out, nil
 }
 
+func (c *updaterClient) UpdateAgent(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpdateAgentRequest, UpdateAgentResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Updater_ServiceDesc.Streams[0], Updater_UpdateAgent_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[UpdateAgentRequest, UpdateAgentResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Updater_UpdateAgentClient = grpc.ClientStreamingClient[UpdateAgentRequest, UpdateAgentResponse]
+
 // UpdaterServer is the server API for Updater service.
 // All implementations must embed UnimplementedUpdaterServer
 // for forward compatibility.
@@ -543,6 +577,26 @@ func (c *updaterClient) Status(ctx context.Context, in *UpdaterStatusRequest, op
 type UpdaterServer interface {
 	// Status reports the updater's own state.
 	Status(context.Context, *UpdaterStatusRequest) (*UpdaterStatusResponse, error)
+	// UpdateAgent replaces the agent with the binary that the requests
+	// carry: the first says which agent it is, and every request carries
+	// the binary's next bytes, in order. The updater writes it into the
+	// agent's inactive A/B slot, switches to that A/B slot and restarts the
+	// agent, and answers once the new agent serves its status at the
+	// update's version with every component it reports healthy. If it
+	// doesn't within the update's health timeout, the updater switches
+	// back, restarts the agent it replaced, and fails the call with
+	// ABORTED, or with INTERNAL if the agent it replaced doesn't restart or
+	// become healthy within the health timeout either. The call fails with
+	// INTERNAL too if the new agent becomes healthy but the updater can't
+	// remove the swap's record, since it then switches back when it next
+	// starts. It refuses a binary that doesn't match the update's checksum
+	// with INVALID_ARGUMENT, and, with FAILED_PRECONDITION, an update while
+	// another runs or while a swap that didn't finish is recorded, changing
+	// nothing. Once it has the whole binary, the update goes on even if the
+	// call ends, and an updater told to stop finishes it first. One that
+	// crashes before the new agent is healthy, or whose switch back failed,
+	// switches back when it starts again.
+	UpdateAgent(grpc.ClientStreamingServer[UpdateAgentRequest, UpdateAgentResponse]) error
 	mustEmbedUnimplementedUpdaterServer()
 }
 
@@ -555,6 +609,9 @@ type UnimplementedUpdaterServer struct{}
 
 func (UnimplementedUpdaterServer) Status(context.Context, *UpdaterStatusRequest) (*UpdaterStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Status not implemented")
+}
+func (UnimplementedUpdaterServer) UpdateAgent(grpc.ClientStreamingServer[UpdateAgentRequest, UpdateAgentResponse]) error {
+	return status.Error(codes.Unimplemented, "method UpdateAgent not implemented")
 }
 func (UnimplementedUpdaterServer) mustEmbedUnimplementedUpdaterServer() {}
 func (UnimplementedUpdaterServer) testEmbeddedByValue()                 {}
@@ -595,6 +652,13 @@ func _Updater_Status_Handler(srv interface{}, ctx context.Context, dec func(inte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Updater_UpdateAgent_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(UpdaterServer).UpdateAgent(&grpc.GenericServerStream[UpdateAgentRequest, UpdateAgentResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Updater_UpdateAgentServer = grpc.ClientStreamingServer[UpdateAgentRequest, UpdateAgentResponse]
+
 // Updater_ServiceDesc is the grpc.ServiceDesc for Updater service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -607,6 +671,12 @@ var Updater_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Updater_Status_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "UpdateAgent",
+			Handler:       _Updater_UpdateAgent_Handler,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "api/node/v1/node.proto",
 }

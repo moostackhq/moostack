@@ -46,7 +46,24 @@ type node struct {
 	// between.
 	laterGeneration int64
 
+	// updateErr, if set, is why updating the agent fails, and
+	// updateDelay how long an update takes.
+	updateErr   error
+	updateDelay time.Duration
+	// onUpdate, if set, is called as an update of the agent starts.
+	onUpdate func()
+	// restartFor is how long the node's agent doesn't answer once an
+	// update ends, as it restarts.
+	restartFor time.Duration
+	// rollsBack says the update uses its whole health timeout and as
+	// long again rolling back, and then fails.
+	rollsBack bool
+
 	mu sync.Mutex
+	// updates are the updates of the agent, in order.
+	updates []agentUpdate
+	// downUntil is when the agent answers again after a restart.
+	downUntil time.Time
 	// lock is the lease that holds the node's operation lock, nil if
 	// none, until expires.
 	lock    *nodeclient.Lock
@@ -206,6 +223,9 @@ func (n *node) RenewLock(ctx context.Context, lease string, ttl time.Duration) (
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if time.Now().Before(n.downUntil) {
+		return nil, errors.New("the agent is restarting")
+	}
 	l := n.held()
 	if l != nil && l.Lease == lease {
 		n.expires = time.Now().Add(ttl)
@@ -241,6 +261,41 @@ func (n *node) BreakLock(ctx context.Context) (*nodeclient.Lock, error) {
 	l := n.held()
 	n.lock = nil
 	return l, nil
+}
+
+// agentUpdate is an update of a fake node's agent.
+type agentUpdate struct {
+	version, binary string
+	healthTimeout   time.Duration
+	started, ended  time.Time
+}
+
+func (n *node) UpdateAgent(ctx context.Context, version string, binary []byte, healthTimeout time.Duration) error {
+	started := time.Now()
+	if n.onUpdate != nil {
+		n.onUpdate()
+	}
+	delay, err := n.updateDelay, n.updateErr
+	if n.rollsBack {
+		delay, err = 2*healthTimeout, errors.New("rolled back to the agent it replaced")
+	}
+	select {
+	case <-time.After(delay):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.updates = append(n.updates, agentUpdate{version, string(binary), healthTimeout, started, time.Now()})
+	n.downUntil = time.Now().Add(n.restartFor)
+	return err
+}
+
+// agentUpdates are the updates of the node's agent so far.
+func (n *node) agentUpdates() []agentUpdate {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.updates)
 }
 
 func (n *node) Close() error {

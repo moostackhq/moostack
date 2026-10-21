@@ -1,7 +1,8 @@
 // Package orchestrate is what an operation does across the whole
 // cluster through the node API: the preflight, which reaches every node,
 // takes the operation lock and pushes the removed identities before
-// anything changes, and recording the generation every node has applied.
+// anything changes, the rolling update, and recording the generation
+// every node has applied.
 package orchestrate
 
 import (
@@ -42,6 +43,10 @@ type Node interface {
 	// the node holds as removed and refuses as peers, for the operation
 	// whose lease holds the node's operation lock.
 	RemoveIdentities(ctx context.Context, identities []string, lease string) error
+	// UpdateAgent has the node's updater replace its agent with binary,
+	// the agent at version, which must become healthy within
+	// healthTimeout, or the updater rolls it back.
+	UpdateAgent(ctx context.Context, version string, binary []byte, healthTimeout time.Duration) error
 	// Close closes the connection.
 	Close() error
 }

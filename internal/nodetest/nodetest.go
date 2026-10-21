@@ -38,6 +38,9 @@ import (
 // with.
 const Version = "9.8.7-test"
 
+// NextVersion is the version of NextAgent, an agent to update to.
+const NextVersion = "9.8.8-test"
+
 // Node is a container running containerd, the updater and the agent.
 type Node struct {
 	// Name is the container's.
@@ -59,12 +62,86 @@ type Node struct {
 }
 
 // programs are the node's programs, each started in the background with
-// its pid in /run/<name>.pid and its output in /var/log/<name>.log.
-// containerd has the PATH its unit gives it.
-var programs = []struct{ name, command string }{
-	{"containerd", "env PATH=" + hostlayout.ContainerdPath + " " + hostlayout.BinDir + "/containerd --config " + hostlayout.ContainerdConfigFile},
-	{"updater", hostlayout.Updater + " serve"},
-	{"agent", hostlayout.Agent + " serve"},
+// its pid in /run/<name>.pid and its output in /var/log/<name>.log, in
+// place of its systemd unit. containerd has the PATH its unit gives it.
+var programs = []program{
+	{"containerd", hostlayout.ContainerdUnit, "env PATH=" + hostlayout.ContainerdPath + " " + hostlayout.BinDir + "/containerd --config " + hostlayout.ContainerdConfigFile},
+	{"updater", hostlayout.UpdaterUnit, hostlayout.Updater + " serve"},
+	{"agent", hostlayout.AgentUnit, hostlayout.Agent + " serve"},
+}
+
+// program is one of the node's programs, by name, with its unit and the
+// command that starts it.
+type program struct{ name, unit, command string }
+
+// builtDir is where the container mounts the directory that binaries
+// returns, read-only. Start copies the programs from there into
+// hostlayout.BinDir, laid out as node add lays them out.
+const builtDir = "/mnt/nodetest-bin"
+
+// systemctl is a stand-in for systemctl, since the container doesn't run
+// systemd: "systemctl restart UNIT" stops the program of the unit, waits
+// for it to exit, and starts it again, as programs start it, and
+// "systemctl reset-failed UNIT" does nothing. BreakRestarts makes its
+// restarts fail or hang.
+func systemctl() string {
+	var cases strings.Builder
+	for _, p := range programs {
+		fmt.Fprintf(&cases, "%s) name=%s ;;\n", p.unit, p.name)
+	}
+	var starts strings.Builder
+	for _, p := range programs {
+		fmt.Fprintf(&starts, "%s) %s", p.name, startScript(p.name, p.command))
+		starts.WriteString(";;\n")
+	}
+	return "#!/bin/sh\n" +
+		"[ \"$1\" = reset-failed ] && exit 0\n" +
+		"[ -e " + restartsFail + " ] && { echo 'the restart failed' >&2; exit 1; }\n" +
+		"[ -e " + restartsHang + " ] && exec sleep infinity\n" +
+		"[ \"$1\" = restart ] || { echo \"nodetest's systemctl only restarts\" >&2; exit 1; }\n" +
+		"case $2 in\n" + cases.String() + "*) echo \"no unit $2\" >&2; exit 1 ;;\nesac\n" +
+		stopScript("$name", "TERM") +
+		"case $name in\n" + starts.String() + "esac\n"
+}
+
+// The files that make nodetest's systemctl fail or hang a restart.
+const (
+	restartsFail = "/run/nodetest-restarts-fail"
+	restartsHang = "/run/nodetest-restarts-hang"
+)
+
+// Restarts is how a node's systemctl restarts a unit.
+type Restarts int
+
+const (
+	// RestartsWork restarts the unit.
+	RestartsWork Restarts = iota
+	// RestartsFail fails at once, as when systemd refuses.
+	RestartsFail
+	// RestartsHang never returns, as when a program won't stop.
+	RestartsHang
+)
+
+// BreakRestarts makes systemctl restart units as r says, from now on.
+func (n *Node) BreakRestarts(t *testing.T, r Restarts) {
+	t.Helper()
+	script := "rm -f " + restartsFail + " " + restartsHang
+	switch r {
+	case RestartsFail:
+		script += " && touch " + restartsFail
+	case RestartsHang:
+		script += " && touch " + restartsHang
+	}
+	n.Exec(t, "root", "sh", "-c", script)
+}
+
+// stopScript is the shell lines that send the program name signal and
+// wait for it to exit. Nothing reaps a program once it exits, so it is
+// gone when it is a zombie.
+func stopScript(name, signal string) string {
+	return "pid=$(cat /run/" + name + ".pid)\n" +
+		"kill -" + signal + " $pid 2>/dev/null\n" +
+		"while [ -e /proc/$pid ] && [ \"$(cut -d' ' -f3 /proc/$pid/stat)\" != Z ]; do sleep 0.1; done\n"
 }
 
 // Start starts a node, and removes it when the test ends. It runs the
@@ -82,7 +159,7 @@ func Start(t *testing.T) *Node {
 	// The state directory is a volume of its own, since containerd's
 	// snapshots can't be overlays on the container's overlay.
 	out, err := exec.Command("docker", "run", "-d", "--rm", "--privileged",
-		"-v", bin+":"+hostlayout.BinDir+":ro",
+		"-v", bin+":"+builtDir+":ro",
 		"-v", n.config+":"+hostlayout.ConfigDir+":ro",
 		"-v", hostlayout.StateDir,
 		"debian:13-slim", "sleep", "infinity").Output()
@@ -122,6 +199,13 @@ func Start(t *testing.T) *Node {
 	if n.CA, err = identity.NewCA("test"); err != nil {
 		t.Fatal(err)
 	}
+	n.Exec(t, "root", "sh", "-c", "set -e\n"+
+		"mkdir -p "+hostlayout.BinDir+"\n"+
+		"find "+builtDir+" -maxdepth 1 -type f -exec cp {} "+hostlayout.BinDir+" \\;\n"+
+		"mv "+hostlayout.Agent+" "+hostlayout.AgentSlots[0]+"\n"+
+		"ln -s "+filepath.Base(hostlayout.AgentSlots[0])+" "+hostlayout.Agent+"\n"+
+		"cat >/usr/local/bin/systemctl <<'EOF'\n"+systemctl()+"EOF\n"+
+		"chmod 755 /usr/local/bin/systemctl\n")
 	request, err := exec.Command("docker", "exec", n.Name, hostlayout.Agent, "request-identity").Output()
 	if err != nil {
 		t.Fatalf("making the node's key: %v\n%s", err, stderr(err))
@@ -433,21 +517,57 @@ func (n *Node) Kill(t *testing.T, program string) {
 }
 
 // Restart stops one of the node's programs, waits for it to exit, and
-// starts it again.
+// starts it again, as restarting its unit would.
 func (n *Node) Restart(t *testing.T, program string) {
 	t.Helper()
+	n.Exec(t, "root", "systemctl", "restart", programNamed(t, program).unit)
+}
+
+// programNamed is the node's program called name, failing t if there is
+// none.
+func programNamed(t *testing.T, name string) program {
+	t.Helper()
 	for _, p := range programs {
-		if p.name == program {
-			// Nothing reaps the program once it exits, so it is gone
-			// when it is a zombie.
-			n.Exec(t, "root", "sh", "-c", "pid=$(cat /run/"+program+".pid); kill $pid\n"+
-				"while [ -e /proc/$pid ] && [ \"$(cut -d' ' -f3 /proc/$pid/stat)\" != Z ]; do sleep 0.1; done\n"+
-				startScript(p.name, p.command))
-			return
+		if p.name == name {
+			return p
 		}
 	}
-	t.Fatalf("the node has no program %s", program)
+	t.Fatalf("the node has no program %s", name)
+	return program{}
 }
+
+// Crash kills one of the node's programs with SIGKILL, as a crash would,
+// waits for it to exit, and starts it again, as systemd restarts its
+// unit.
+func (n *Node) Crash(t *testing.T, program string) {
+	t.Helper()
+	p := programNamed(t, program)
+	n.Exec(t, "root", "sh", "-c", stopScript(p.name, "KILL")+startScript(p.name, p.command))
+}
+
+// Agent is the agent's binary, built at Version.
+func Agent(t *testing.T) []byte { return readBuilt(t, "agent") }
+
+// NextAgent is the agent's binary built at NextVersion, to update to.
+func NextAgent(t *testing.T) []byte { return readBuilt(t, nextAgent) }
+
+// readBuilt reads the file called name in the directory that binaries
+// returns.
+func readBuilt(t *testing.T, name string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(binaries(t), name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// nextAgent is NextAgent's file in binaries', in a directory of its own,
+// so that Start doesn't install it.
+const nextAgent = "next/agent"
+
+// NextAgentPath is where the container has NextAgent.
+const NextAgentPath = builtDir + "/" + nextAgent
 
 // startScript is the shell line that starts the program name with
 // command in the background, with its pid in /run/<name>.pid and its
@@ -488,10 +608,11 @@ const (
 )
 
 // binaries returns a directory holding the agent and the updater, built
-// from this checkout with Version, and the release's containerd binaries
-// and runc for this machine's architecture, with the cluster services'
-// images in imagesDir, also built with Version, and Fixture's and
-// Broken's. Cleanup removes it.
+// from this checkout with Version, the agent built with NextVersion in
+// nextAgent, and the release's containerd binaries and runc for this
+// machine's architecture, with the cluster services' images in
+// imagesDir, also built with Version, and Fixture's and Broken's.
+// Cleanup removes it.
 func binaries(t *testing.T) string {
 	t.Helper()
 	binOnce.Do(func() {
@@ -517,12 +638,16 @@ func binaries(t *testing.T) string {
 		if binErr != nil {
 			return
 		}
-		for _, program := range []string{"agent", "updater"} {
-			cmd := exec.Command("go", "build", "-ldflags", "-X github.com/moostackhq/moostack/internal/buildinfo.Version="+Version,
-				"-o", filepath.Join(binDir, program), "github.com/moostackhq/moostack/cmd/"+program)
+		for _, b := range []struct{ program, version, out string }{
+			{"agent", Version, "agent"},
+			{"updater", Version, "updater"},
+			{"agent", NextVersion, nextAgent},
+		} {
+			cmd := exec.Command("go", "build", "-ldflags", "-X github.com/moostackhq/moostack/internal/buildinfo.Version="+b.version,
+				"-o", filepath.Join(binDir, b.out), "github.com/moostackhq/moostack/cmd/"+b.program)
 			cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 			if out, err := cmd.CombinedOutput(); err != nil {
-				binErr = fmt.Errorf("building the %s: %v\n%s", program, err, out)
+				binErr = fmt.Errorf("building the %s at %s: %v\n%s", b.program, b.version, err, out)
 				return
 			}
 		}

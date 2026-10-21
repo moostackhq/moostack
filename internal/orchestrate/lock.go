@@ -187,24 +187,31 @@ func (c *Cluster) renewAll() {
 		wg.Go(func() {
 			ctx, cancel := context.WithTimeout(c.ctx, c.ttl/3)
 			defer cancel()
-			sent := time.Now()
-			got, err := n.conn.RenewLock(ctx, c.lease.Lease, c.ttl)
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			switch {
-			case err != nil:
-				// The lease holds until it may have run out, which lost
-				// tells.
-			case got == nil:
-				n.lease.lost = "its lock was broken or ran out"
-			case got.Lease != c.lease.Lease:
-				n.lease.lost = (&LockHeldError{Lock: *got}).Error()
-			default:
-				n.lease.granted(sent, c.ttl)
-			}
+			c.renew(ctx, n)
 		})
 	}
 	wg.Wait()
+}
+
+// renew renews the lease on n, and keeps what n answered. It fails if n
+// didn't answer, and then the lease holds until it may have run out,
+// which lost tells.
+func (c *Cluster) renew(ctx context.Context, n *namedConn) error {
+	sent := time.Now()
+	got, err := n.conn.RenewLock(ctx, c.lease.Lease, c.ttl)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case err != nil:
+		return err
+	case got == nil:
+		n.lease.lost = "its lock was broken or ran out"
+	case got.Lease != c.lease.Lease:
+		n.lease.lost = (&LockHeldError{Lock: *got}).Error()
+	default:
+		n.lease.granted(sent, c.ttl)
+	}
+	return nil
 }
 
 // lost says why the operation can't be sure it holds the lock at by:

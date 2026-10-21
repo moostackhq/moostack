@@ -3,6 +3,8 @@ package nodeclient
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -11,7 +13,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
@@ -274,4 +278,48 @@ func ImportImage(ctx context.Context, agent nodev1.AgentClient, data []byte) ([]
 		return nil, err
 	}
 	return res.Images, nil
+}
+
+// UpdateAgent has the updater replace the agent with binary, the agent at
+// version, which must become healthy within healthTimeout.
+func (n *Node) UpdateAgent(ctx context.Context, version string, binary []byte, healthTimeout time.Duration) error {
+	return UpdateAgent(ctx, n.Updater, version, binary, healthTimeout)
+}
+
+// updateChunk is how much of an agent's binary each request carries.
+const updateChunk = 1 << 20
+
+// UpdateAgent has updater replace the agent with binary, the agent at
+// version, which must become healthy within healthTimeout. It fails
+// saying so if the updater is from a release that can't.
+func UpdateAgent(ctx context.Context, updater nodev1.UpdaterClient, version string, binary []byte, healthTimeout time.Duration) error {
+	stream, err := updater.UpdateAgent(ctx)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(binary)
+	req := &nodev1.UpdateAgentRequest{Update: &nodev1.AgentUpdate{
+		Version:       version,
+		Sha256:        hex.EncodeToString(sum[:]),
+		HealthTimeout: durationpb.New(healthTimeout),
+	}}
+	for {
+		n := min(len(binary), updateChunk)
+		req.Chunk = binary[:n]
+		if err := stream.Send(req); err != nil {
+			// The updater ended the call; CloseAndRecv says why.
+			break
+		}
+		binary = binary[n:]
+		if len(binary) == 0 {
+			break
+		}
+		req = &nodev1.UpdateAgentRequest{}
+	}
+	_, err = stream.CloseAndRecv()
+	// An updater from a release before UpdateAgent doesn't serve it.
+	if status.Code(err) == codes.Unimplemented {
+		return fmt.Errorf("the node's updater is from a release that can't update the agent: %w", err)
+	}
+	return err
 }

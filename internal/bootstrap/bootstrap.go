@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"path"
 	"slices"
 	"strings"
 	"text/template"
@@ -25,17 +26,10 @@ import (
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
-// The systemd units that run the node components.
-const (
-	containerdUnit = "moostack-containerd.service"
-	updaterUnit    = "moostack-updater.service"
-	agentUnit      = "moostack-agent.service"
-)
-
 // units are the systemd units. systemd starts them together, the agent
 // after containerd. Uninstall stops them one by one in the reverse order,
 // the agent first, and containerd once the cluster services are gone.
-var units = []string{containerdUnit, updaterUnit, agentUnit}
+var units = []string{hostlayout.ContainerdUnit, hostlayout.UpdaterUnit, hostlayout.AgentUnit}
 
 // hostFile is a file to write on the host.
 type hostFile struct{ path, content string }
@@ -63,7 +57,7 @@ func renderUnits() []hostFile {
 		AgentBinary:          hostlayout.Agent,
 		UpdaterBinary:        hostlayout.Updater,
 		ContainerdConfigFile: hostlayout.ContainerdConfigFile,
-		ContainerdUnit:       containerdUnit,
+		ContainerdUnit:       hostlayout.ContainerdUnit,
 		ContainerdPath:       hostlayout.ContainerdPath,
 	}
 	var files []hostFile
@@ -255,10 +249,18 @@ func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 			if err != nil {
 				return "", err
 			}
-			if err := c.Upload(ctx, hostlayout.BinDir+"/"+f, bytes.NewReader(data), 0o755, "root:root"); err != nil {
+			to := hostlayout.BinDir + "/" + f
+			if to == hostlayout.Agent {
+				to = hostlayout.AgentSlots[0]
+			}
+			if err := c.Upload(ctx, to, bytes.NewReader(data), 0o755, "root:root"); err != nil {
 				return "", err
 			}
 		}
+	}
+	// The agent runs from its first A/B slot, until the updater swaps it.
+	if _, err := output(ctx, c, "ln -sfn "+path.Base(hostlayout.AgentSlots[0])+" "+hostlayout.Agent); err != nil {
+		return "", err
 	}
 	request, err := output(ctx, c, hostlayout.Agent+" request-identity")
 	if err != nil {
@@ -423,8 +425,8 @@ stop() {
 	*) echo "$1 is still $state" >&2; exit 1 ;;
 	esac
 }
-stop `+agentUnit+`
-stop `+updaterUnit+`
+stop `+hostlayout.AgentUnit+`
+stop `+hostlayout.UpdaterUnit+`
 # The cluster services' containers, and containerd's shims, outlive
 # containerd's unit stopping, by its KillMode, so they are killed first.
 if [ -d `+cgroup+` ]; then
@@ -438,10 +440,10 @@ if [ -d `+cgroup+` ]; then
 		echo "the cluster services' containers in `+cgroup+` didn't end" >&2; exit 1
 	fi
 fi
-if loaded `+containerdUnit+`; then
-	systemctl kill --kill-whom=all --signal=SIGKILL `+containerdUnit+` 2>/dev/null || true
+if loaded `+hostlayout.ContainerdUnit+`; then
+	systemctl kill --kill-whom=all --signal=SIGKILL `+hostlayout.ContainerdUnit+` 2>/dev/null || true
 fi
-stop `+containerdUnit+`
+stop `+hostlayout.ContainerdUnit+`
 # The containers' root filesystems stay mounted once they are killed.
 awk '{print $2}' /proc/self/mounts | grep -E '^(`+strings.Join(hostlayout.Dirs, "|")+`)(/|$)' | sort -r | while read -r m; do umount -l "$m"; done
 rm -f `+strings.Join(unitPaths(), " ")+`

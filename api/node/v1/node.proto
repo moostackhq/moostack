@@ -65,6 +65,26 @@ service Agent {
 service Updater {
   // Status reports the updater's own state.
   rpc Status(UpdaterStatusRequest) returns (UpdaterStatusResponse);
+  // UpdateAgent replaces the agent with the binary that the requests
+  // carry: the first says which agent it is, and every request carries
+  // the binary's next bytes, in order. The updater writes it into the
+  // agent's inactive A/B slot, switches to that A/B slot and restarts the
+  // agent, and answers once the new agent serves its status at the
+  // update's version with every component it reports healthy. If it
+  // doesn't within the update's health timeout, the updater switches
+  // back, restarts the agent it replaced, and fails the call with
+  // ABORTED, or with INTERNAL if the agent it replaced doesn't restart or
+  // become healthy within the health timeout either. The call fails with
+  // INTERNAL too if the new agent becomes healthy but the updater can't
+  // remove the swap's record, since it then switches back when it next
+  // starts. It refuses a binary that doesn't match the update's checksum
+  // with INVALID_ARGUMENT, and, with FAILED_PRECONDITION, an update while
+  // another runs or while a swap that didn't finish is recorded, changing
+  // nothing. Once it has the whole binary, the update goes on even if the
+  // call ends, and an updater told to stop finishes it first. One that
+  // crashes before the new agent is healthy, or whose switch back failed,
+  // switches back when it starts again.
+  rpc UpdateAgent(stream UpdateAgentRequest) returns (UpdateAgentResponse);
 }
 
 message StatusRequest {}
@@ -198,6 +218,26 @@ message UpdaterStatusResponse {
   // Updater is the updater itself.
   Component updater = 1;
 }
+
+message UpdateAgentRequest {
+  // Update says which agent the binary is. The first request carries it,
+  // and the others don't.
+  AgentUpdate update = 1;
+  // Chunk is the binary's next bytes.
+  bytes chunk = 2;
+}
+
+// AgentUpdate is the agent that an update installs.
+message AgentUpdate {
+  // Version is the version the new agent reports.
+  string version = 1;
+  // Sha256 is the binary's SHA-256, hex.
+  string sha256 = 2;
+  // HealthTimeout is how long the new agent has to become healthy.
+  google.protobuf.Duration health_timeout = 3;
+}
+
+message UpdateAgentResponse {}
 
 // Mode is how the node is operated.
 enum Mode {

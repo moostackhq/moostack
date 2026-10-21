@@ -64,6 +64,17 @@ func clusterCommand(env Env) *cli.Command {
 				},
 			},
 			{
+				Name:  "update",
+				Usage: "move every node to the release pinned in the cluster directory, one node at a time",
+				Flags: []cli.Flag{forceFlag},
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					if err := wantArgs(cmd, 0); err != nil {
+						return err
+					}
+					return clusterUpdate(ctx, env, cmd)
+				},
+			},
+			{
 				Name:  "unlock",
 				Usage: "break the operation lock, whoever holds it, when their mooctl has died",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
@@ -414,6 +425,58 @@ func describeLocks(locks []lockView, nodes, answered int) string {
 		held = append(held, s)
 	}
 	return strings.Join(held, "; ")
+}
+
+// clusterUpdate is mooctl cluster update. Once the preflight has passed,
+// it updates the agent of each node in turn to the pinned release's,
+// for the node's architecture, and stops at the first node that fails.
+// It doesn't change the cluster directory.
+func clusterUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
+	d, err := cluster.Open(cmd.String("dir"))
+	if err != nil {
+		return err
+	}
+	rel, err := openRelease(cmd, d)
+	if err != nil {
+		return err
+	}
+	agent, ok := rel.Component("agent")
+	if !ok || !slices.Contains(agent.Files, "agent") {
+		return fmt.Errorf("release %s pins no agent", rel.Version)
+	}
+	nodes, err := d.Nodes()
+	if err != nil {
+		return err
+	}
+	arch := map[string]string{}
+	for _, n := range nodes {
+		arch[n.Name] = n.Architecture
+	}
+	c, err := preflight(ctx, env, cmd, d, "")
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	binaries := map[string][]byte{}
+	agentOf := func(name string) ([]byte, error) {
+		a := arch[name]
+		if binaries[a] == nil {
+			data, err := rel.ReadFile(a, "agent")
+			if err != nil {
+				return nil, err
+			}
+			binaries[a] = data
+		}
+		return binaries[a], nil
+	}
+	err = c.UpdateAgents(c.Context(), agent.Version, agentOf, func(name string) {
+		fmt.Fprintf(env.Stdout, "Updating the agent on %s to %s\n", name, agent.Version)
+	})
+	if err != nil {
+		return fmt.Errorf("cluster update stopped: %w", err)
+	}
+	fmt.Fprintf(env.Stdout, "Every node runs the agent of release %s.\n", rel.Version)
+	return nil
 }
 
 // clusterUnlock is mooctl cluster unlock. It breaks the operation lock on

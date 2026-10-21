@@ -41,6 +41,11 @@ type fakeNode struct {
 	refuseNewRemovals bool
 	// dials counts the times mooctl reached the node.
 	dials int
+	// updateErr, if set, is why updating the agent fails.
+	updateErr error
+	// updates are the agents the node was updated to, as version and
+	// binary, in order.
+	updates []string
 }
 
 // identityOf is the fingerprint of the identity of the node called name
@@ -168,6 +173,20 @@ func (n *fakeNode) BreakLock(context.Context) (*nodeclient.Lock, error) {
 	l := n.lock
 	n.lock = nil
 	return l, nil
+}
+
+func (n *fakeNode) UpdateAgent(_ context.Context, version string, binary []byte, _ time.Duration) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.updates = append(n.updates, version+" "+string(binary))
+	return n.updateErr
+}
+
+// agentUpdates are the agents the node was updated to so far.
+func (n *fakeNode) agentUpdates() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.updates)
 }
 
 func (n *fakeNode) Close() error { return nil }

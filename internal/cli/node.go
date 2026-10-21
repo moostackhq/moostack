@@ -299,6 +299,10 @@ func (n unreachedNode) BreakLock(context.Context) (*nodeclient.Lock, error) { re
 
 func (n unreachedNode) RemoveIdentities(context.Context, []string, string) error { return n.err }
 
+func (n unreachedNode) UpdateAgent(context.Context, string, []byte, time.Duration) error {
+	return n.err
+}
+
 func (n unreachedNode) Close() error { return nil }
 
 // openCA opens the cluster CA of d, reading its key from the secret

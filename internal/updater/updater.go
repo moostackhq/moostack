@@ -1,13 +1,15 @@
 //go:build linux
 
-// Package updater is the node component that will replace the agent
-// with a new version. For now it serves its own status, on its own
-// socket, so that it answers whatever state the agent is in.
+// Package updater is the node component that replaces the agent with a
+// new version, through an A/B swap that it rolls back if the new agent
+// isn't healthy. It serves its own node API, on its own socket, so that
+// it answers whatever state the agent is in.
 package updater
 
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"google.golang.org/grpc"
 
@@ -26,12 +28,33 @@ type Config struct {
 	// Identity is the node's identity, which the updater shares with the
 	// agent.
 	Identity identity.Files
+	// Agent is the agent's binary, a symbolic link to the active one of
+	// AgentSlots, relative, in the same directory.
+	Agent string
+	// AgentSlots are the agent's A/B slots: the one the agent runs from,
+	// and the one an update writes the new agent into.
+	AgentSlots [2]string
+	// AgentSwapFile records a swap of the agent that hasn't been seen
+	// healthy. Its directory must exist.
+	AgentSwapFile string
+	// AgentSocket is where the agent serves the node API.
+	AgentSocket string
+	// RestartAgent restarts the agent, from the binary Agent links to.
+	RestartAgent func(ctx context.Context) error
 }
 
-// Serve serves the updater's node API on cfg.Socket until ctx ends. It
-// won't serve without a valid node identity.
+// Serve serves the updater's node API on cfg.Socket until ctx ends, and
+// then finishes an update of the agent that runs. It won't serve without
+// a valid node identity. If a swap of the agent is recorded, as when the
+// updater crashed in one, it first switches the agent back, within the
+// health timeout the swap's update had, and fails if it can't, so that
+// systemd starts it again to try once more.
 func Serve(ctx context.Context, cfg Config) error {
 	if _, err := identity.Load(cfg.Identity); err != nil {
+		return err
+	}
+	s := &updaterServer{cfg: cfg}
+	if err := s.recoverSwap(ctx); err != nil {
 		return err
 	}
 	l, err := rootsocket.Listen(cfg.Socket)
@@ -39,7 +62,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		return err
 	}
 	server := grpc.NewServer()
-	nodev1.RegisterUpdaterServer(server, &updaterServer{version: cfg.Version})
+	nodev1.RegisterUpdaterServer(server, s)
 	stop := context.AfterFunc(ctx, server.GracefulStop)
 	defer stop()
 	if err := server.Serve(l); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
@@ -50,11 +73,13 @@ func Serve(ctx context.Context, cfg Config) error {
 
 type updaterServer struct {
 	nodev1.UnimplementedUpdaterServer
-	version string
+	cfg Config
+	// updating is held while an update of the agent runs.
+	updating sync.Mutex
 }
 
 func (s *updaterServer) Status(context.Context, *nodev1.UpdaterStatusRequest) (*nodev1.UpdaterStatusResponse, error) {
 	return &nodev1.UpdaterStatusResponse{
-		Updater: &nodev1.Component{Name: "updater", Version: s.version, Health: nodev1.Health_HEALTH_HEALTHY},
+		Updater: &nodev1.Component{Name: "updater", Version: s.cfg.Version, Health: nodev1.Health_HEALTH_HEALTHY},
 	}, nil
 }
