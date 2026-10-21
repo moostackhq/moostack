@@ -3,6 +3,7 @@ package release
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 )
@@ -30,7 +31,7 @@ func FetchRunc(ctx context.Context, arch, cacheDir, dir string) error {
 	cached := filepath.Join(cacheDir, fmt.Sprintf("runc-%s.%s", RuncVersion, arch))
 	if err := checkSum(cached, sum); err != nil {
 		url := fmt.Sprintf("https://github.com/opencontainers/runc/releases/download/v%s/runc.%s", RuncVersion, arch)
-		if err := download(ctx, url, cached); err != nil {
+		if err := download(ctx, http.DefaultClient, url, cached); err != nil {
 			return err
 		}
 		if err := checkSum(cached, sum); err != nil {

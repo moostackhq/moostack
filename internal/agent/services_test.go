@@ -165,6 +165,61 @@ func TestTheAgentStartsTheServicesThatArentRunningWhenItStarts(t *testing.T) {
 	}
 }
 
+// The agent starts a service from the container it has, so that one
+// whose image is gone, as after someone cleaned the node's images up by
+// hand, runs on.
+func TestTheAgentStartsAServiceWhoseImageIsGoneFromItsContainer(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.StartServices(t)
+	n.Kill(t, "agent")
+	killService(t, n, "dns")
+	n.DeleteImage(t, nodetest.Service("dns").Image)
+	n.Restart(t, "agent")
+	api := nodetest.Service("dns").Api
+	nodetest.Eventually(t, 30*time.Second, func() error {
+		if _, err := call(t.Context(), n.AgentConn(t), api, "Echo", nil); err != nil {
+			s, _ := n.Status(t)
+			return fmt.Errorf("dns doesn't answer: %v; status: %v", err, s.GetServices())
+		}
+		return nil
+	})
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Service("dns")}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("running dns again: %v, want it refused, its image gone", err)
+	}
+}
+
+// At start, the agent keeps a service whose container is as stored, even
+// one that doesn't answer: only running it again replaces it.
+func TestTheAgentKeepsAServiceAsStoredWhenItStartsAnsweringOrNot(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.StartServices(t)
+	pid := servicePID(t, n, "dns")
+	n.Exec(t, "root", "sh", "-c", "kill -STOP "+pid)
+	defer n.Exec(t, "root", "sh", "-c", "kill -CONT "+pid)
+	n.Kill(t, "agent")
+	n.Restart(t, "agent")
+	nodetest.Eventually(t, 30*time.Second, func() error {
+		s, err := n.Status(t)
+		if err != nil {
+			return err
+		}
+		for _, c := range s.Services {
+			if c.Name == "dns" && c.Health == nodev1.Health_HEALTH_UNHEALTHY {
+				return nil
+			}
+		}
+		return fmt.Errorf("dns isn't unhealthy yet: %v", s.Services)
+	})
+	// The agent has started every service once by the time it answers,
+	// and tries again for one that fails every 2 s.
+	time.Sleep(3 * time.Second)
+	if _, err := n.Output("root", "test", "-e", "/proc/"+pid); err != nil {
+		t.Errorf("the agent replaced dns, which doesn't answer, when it started: pid %s is gone", pid)
+	}
+}
+
 func TestAStartRetryDoesntUndoARunInBetween(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
@@ -311,6 +366,38 @@ func TestRunningAServiceOfAnAPIThatAnotherStillServesIsRefused(t *testing.T) {
 	_, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: clash})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("running a service of the API the old dns still serves: %v, want a failed precondition", err)
+	}
+}
+
+// A rerun of cluster update runs a service at its target that is
+// unhealthy: the agent replaces it, rather than keeping a container whose
+// task runs but doesn't answer.
+func TestRunningAnUnhealthyServiceAgainReplacesIt(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.StartServices(t)
+	pid := servicePID(t, n, "dns")
+	n.Exec(t, "root", "sh", "-c", "kill -STOP "+pid)
+	nodetest.Eventually(t, 30*time.Second, func() error {
+		s, err := n.Status(t)
+		if err != nil {
+			return err
+		}
+		for _, c := range s.Services {
+			if c.Name == "dns" && c.Health == nodev1.Health_HEALTH_UNHEALTHY {
+				return nil
+			}
+		}
+		return fmt.Errorf("dns isn't unhealthy yet: %v", s.Services)
+	})
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Service("dns")}); err != nil {
+		t.Fatalf("running the unhealthy dns again: %v", err)
+	}
+	if res, err := call(t.Context(), n.AgentConn(t), nodetest.Service("dns").Api, "Echo", nil); err != nil || res.Calls != 1 {
+		t.Errorf("Echo on dns after it ran again: %v, %v, want a new dns's first call", res, err)
+	}
+	if _, err := n.Output("root", "test", "-e", "/proc/"+pid); err == nil {
+		t.Errorf("the unhealthy dns runs on as pid %s", pid)
 	}
 }
 
@@ -675,4 +762,71 @@ func killService(t *testing.T, n *nodetest.Node, name string) {
 		}
 		return nil
 	})
+}
+
+// A call may end while the agent replaces a service, as when mooctl is
+// stopped: the agent goes on until the new service runs, rather than
+// leaving the node without it.
+func TestAServiceRunGoesOnWhenItsCallEnds(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.StartServices(t)
+	n.ImportFixtures(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: nodetest.Fixture()}); status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("running dns from the fixture within 50ms: %v, want the call to end first", err)
+	}
+	nodetest.Eventually(t, time.Minute, func() error {
+		s, err := n.Status(t)
+		if err != nil {
+			return err
+		}
+		for _, c := range s.Services {
+			if c.Name == "dns" && c.Version == "fixture" && c.Health == nodev1.Health_HEALTH_HEALTHY {
+				return nil
+			}
+		}
+		return fmt.Errorf("dns isn't running from the fixture, healthy: %v", s.Services)
+	})
+}
+
+// A node keeps no image of a service that a run from another image
+// replaced, so that its disk doesn't grow with each release.
+func TestRunningAServiceFromAnotherImageDeletesTheImageItReplaced(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.StartServices(t)
+	n.ImportFixtures(t)
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Fixture()}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Service("dns")})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "the node has no image "+nodetest.Service("dns").Image) {
+		t.Errorf("running dns from the image the fixture replaced: %v, want it refused, the image gone", err)
+	}
+	// The other services' images stay.
+	n.RunService(t, "proxy")
+}
+
+// A release built again under the same version names its images as the
+// build before did: running a service from the new build replaces the
+// one that runs from the old.
+func TestRunningAServiceFromARebuildOfItsImageReplacesIt(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.StartServices(t)
+	n.ImportFixtures(t)
+	fixture := nodetest.Fixture()
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+		t.Fatal(err)
+	}
+	before := servicePID(t, n, "fixtureservice")
+	n.ImportFixtureRebuiltAs(t, fixture)
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Output("root", "test", "-e", "/proc/"+before); err == nil {
+		t.Errorf("dns runs on as pid %s from the build it ran from, rather than from the rebuild", before)
+	}
 }

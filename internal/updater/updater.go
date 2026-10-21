@@ -9,11 +9,13 @@ package updater
 import (
 	"context"
 	"errors"
+	"os"
 
 	"google.golang.org/grpc"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/abslot"
+	"github.com/moostackhq/moostack/internal/buildid"
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/rootsocket"
 )
@@ -75,6 +77,9 @@ func Serve(ctx context.Context, cfg Config) error {
 	}
 	server := grpc.NewServer()
 	nodev1.RegisterUpdaterServer(server, s)
+	// The build is hashed from the start, in the background, so that
+	// status says it by the time an operation asks.
+	s.build()
 	stop := context.AfterFunc(ctx, server.GracefulStop)
 	defer stop()
 	if err := server.Serve(l); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
@@ -87,10 +92,23 @@ type updaterServer struct {
 	nodev1.UnimplementedUpdaterServer
 	cfg   Config
 	agent *abslot.Component
+	// builds tells the build of the updater's own file.
+	builds buildid.Cache
+}
+
+// build is the build of the file the updater runs from, by the name a
+// release gives it, empty until it is hashed, which status doesn't wait
+// for, or if it can't tell.
+func (s *updaterServer) build() string {
+	path, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return s.builds.Peek(map[string]string{"updater": path})
 }
 
 func (s *updaterServer) Status(context.Context, *nodev1.UpdaterStatusRequest) (*nodev1.UpdaterStatusResponse, error) {
 	return &nodev1.UpdaterStatusResponse{
-		Updater: &nodev1.Component{Name: "updater", Version: s.cfg.Version, Health: nodev1.Health_HEALTH_HEALTHY},
+		Updater: &nodev1.Component{Name: "updater", Version: s.cfg.Version, Build: s.build(), Health: nodev1.Health_HEALTH_HEALTHY},
 	}, nil
 }

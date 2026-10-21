@@ -382,7 +382,10 @@ type Lock struct {
 	Since *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=since,proto3" json:"since,omitempty"`
 	// Until is when the lease runs out on the node unless renewed, on the
 	// node's clock. A request leaves it unset.
-	Until         *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=until,proto3" json:"until,omitempty"`
+	Until *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=until,proto3" json:"until,omitempty"`
+	// Operation is the command the operation runs, such as "cluster
+	// update", empty from a release that didn't say.
+	Operation     string `protobuf:"bytes,6,opt,name=operation,proto3" json:"operation,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -450,6 +453,13 @@ func (x *Lock) GetUntil() *timestamppb.Timestamp {
 		return x.Until
 	}
 	return nil
+}
+
+func (x *Lock) GetOperation() string {
+	if x != nil {
+		return x.Operation
+	}
+	return ""
 }
 
 type AcquireLockRequest struct {
@@ -1764,7 +1774,13 @@ type Component struct {
 	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
 	Health  Health `protobuf:"varint,3,opt,name=health,proto3,enum=moostack.node.v1.Health" json:"health,omitempty"`
 	// Problem says why the component is unhealthy.
-	Problem       string `protobuf:"bytes,4,opt,name=problem,proto3" json:"problem,omitempty"`
+	Problem string `protobuf:"bytes,4,opt,name=problem,proto3" json:"problem,omitempty"`
+	// Build is which build of version runs, empty when the node can't
+	// tell: for a node component, sha256: and the hex SHA-256 of the lines
+	// "<file> <its hex SHA-256>\n" of its files, by the names a release
+	// gives them, in order of name; for a cluster service, its image's
+	// digest.
+	Build         string `protobuf:"bytes,5,opt,name=build,proto3" json:"build,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1827,6 +1843,13 @@ func (x *Component) GetProblem() string {
 	return ""
 }
 
+func (x *Component) GetBuild() string {
+	if x != nil {
+		return x.Build
+	}
+	return ""
+}
+
 var File_api_node_v1_node_proto protoreflect.FileDescriptor
 
 const file_api_node_v1_node_proto_rawDesc = "" +
@@ -1851,13 +1874,14 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"generation\x12\x14\n" +
 	"\x05nodes\x18\x02 \x03(\tR\x05nodes\x12\x14\n" +
 	"\x05lease\x18\x03 \x01(\tR\x05lease\"\x1a\n" +
-	"\x18RecordGenerationResponse\"\xb2\x01\n" +
+	"\x18RecordGenerationResponse\"\xd0\x01\n" +
 	"\x04Lock\x12\x14\n" +
 	"\x05lease\x18\x01 \x01(\tR\x05lease\x12\x16\n" +
 	"\x06holder\x18\x02 \x01(\tR\x06holder\x12\x18\n" +
 	"\amachine\x18\x03 \x01(\tR\amachine\x120\n" +
 	"\x05since\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x05since\x120\n" +
-	"\x05until\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\x05until\"m\n" +
+	"\x05until\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\x05until\x12\x1c\n" +
+	"\toperation\x18\x06 \x01(\tR\toperation\"m\n" +
 	"\x12AcquireLockRequest\x12*\n" +
 	"\x04lock\x18\x01 \x01(\v2\x16.moostack.node.v1.LockR\x04lock\x12+\n" +
 	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"A\n" +
@@ -1922,12 +1946,13 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"\x0eContainerdFile\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06sha256\x18\x02 \x01(\tR\x06sha256\"\x1a\n" +
-	"\x18UpdateContainerdResponse\"\x85\x01\n" +
+	"\x18UpdateContainerdResponse\"\x9b\x01\n" +
 	"\tComponent\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x120\n" +
 	"\x06health\x18\x03 \x01(\x0e2\x18.moostack.node.v1.HealthR\x06health\x12\x18\n" +
-	"\aproblem\x18\x04 \x01(\tR\aproblem*E\n" +
+	"\aproblem\x18\x04 \x01(\tR\aproblem\x12\x14\n" +
+	"\x05build\x18\x05 \x01(\tR\x05build*E\n" +
 	"\x04Mode\x12\x14\n" +
 	"\x10MODE_UNSPECIFIED\x10\x00\x12\x0f\n" +
 	"\vMODE_DIRECT\x10\x01\x12\x16\n" +

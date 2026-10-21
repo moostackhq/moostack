@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"slices"
+	"time"
 
 	"github.com/moostackhq/moostack/internal/hostlayout"
 )
@@ -44,7 +46,7 @@ func FetchContainerd(ctx context.Context, arch, cacheDir, dir string) error {
 	tarball := filepath.Join(cacheDir, name)
 	if err := checkSum(tarball, sum); err != nil {
 		url := fmt.Sprintf("https://github.com/containerd/containerd/releases/download/v%s/%s", ContainerdVersion, name)
-		if err := download(ctx, url, tarball); err != nil {
+		if err := download(ctx, http.DefaultClient, url, tarball); err != nil {
 			return err
 		}
 		if err := checkSum(tarball, sum); err != nil {
@@ -71,19 +73,47 @@ func checkSum(path, sum string) error {
 	return nil
 }
 
-// download writes what url serves to path.
-func download(ctx context.Context, url, path string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// stallTimeout is how long a download may go without data before it
+// gives up, and maxFileSize how large a downloaded file may be, more than
+// any file of a release.
+var (
+	stallTimeout       = 30 * time.Second
+	maxFileSize  int64 = 4 << 30
+)
+
+// download writes what rawURL serves to path, getting it with client. It
+// gives up once stallTimeout passes without data, or the file grows
+// larger than maxFileSize.
+func download(ctx context.Context, client *http.Client, rawURL, path string) error {
+	stalled := fmt.Errorf("no data for %s", stallTimeout)
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	timer := time.AfterFunc(stallTimeout, func() { cancel(stalled) })
+	defer timer.Stop()
+	// why is the error a download failed with: the stall, if it was.
+	why := func(err error) error {
+		if context.Cause(ctx) == stalled {
+			return stalled
+		}
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		// The error names the URL it failed at, which may be a
+		// redirect's, whole.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			urlErr.URL = redacted(urlErr.URL)
+		}
+		return fmt.Errorf("GET %s: %w", redacted(rawURL), why(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: %s", url, resp.Status)
+		return fmt.Errorf("GET %s: %s", redacted(rawURL), resp.Status)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -93,14 +123,35 @@ func download(ctx context.Context, url, path string) error {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	_, err = io.Copy(tmp, resp.Body)
+	body := &progress{r: io.LimitReader(resp.Body, maxFileSize+1), timer: timer}
+	_, err = io.Copy(tmp, body)
+	if err == nil && body.n > maxFileSize {
+		err = fmt.Errorf("larger than %d bytes", maxFileSize)
+	}
 	if closeErr := tmp.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
-		return fmt.Errorf("GET %s: %w", url, err)
+		return fmt.Errorf("GET %s: %w", redacted(rawURL), why(err))
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+// progress reads r, counting the bytes in n, and restarts timer, the
+// stall timer, whenever data arrives.
+type progress struct {
+	r     io.Reader
+	n     int64
+	timer *time.Timer
+}
+
+func (p *progress) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.n += int64(n)
+		p.timer.Reset(stallTimeout)
+	}
+	return n, err
 }
 
 // extract writes the regular files of the tarball whose base names are

@@ -24,10 +24,11 @@ import (
 // before a lease time has passed since it sent its last renewal that was
 // answered, which is never later than the node got it.
 
-// Holder is who an operation runs for, and on which machine, as the
-// operation lock records them.
+// Holder is who an operation runs for, on which machine, and which
+// command it runs, such as "cluster update", as the operation lock
+// records them.
 type Holder struct {
-	Who, Machine string
+	Who, Machine, Operation string
 }
 
 // DefaultLeaseTTL is how long a node holds the lock for an operation
@@ -53,9 +54,14 @@ func (e *LockHeldError) Error() string {
 	return fmt.Sprintf("it is locked by %s, and expires at %s unless renewed", DescribeLock(e.Lock), LocalTime(e.Lock.Until))
 }
 
-// DescribeLock says who holds l, where, and since when, in local time.
+// DescribeLock says who holds l, where, since when, in local time, and
+// for which command, if the node said.
 func DescribeLock(l nodeclient.Lock) string {
-	return fmt.Sprintf("%s on %s since %s", l.Holder, l.Machine, LocalTime(l.Since))
+	s := fmt.Sprintf("%s on %s since %s", l.Holder, l.Machine, LocalTime(l.Since))
+	if l.Operation != "" {
+		s += ", for " + l.Operation
+	}
+	return s
 }
 
 // LocalTime is t as the lock's messages show it, in local time.

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/nodeclient"
 )
 
@@ -72,8 +73,8 @@ func (r *updateRecorder) RenewLock(context.Context, string, time.Duration) (*nod
 }
 
 // Woken from sleep before keepLease noticed the leases ran out,
-// UpdateNodes must not send an update once the lease may have run out.
-func TestUpdateNodesSendsNoUpdateOnceTheLeaseRanOutWhileTheMachineSlept(t *testing.T) {
+// Update must not send an update once the lease may have run out.
+func TestUpdateSendsNoUpdateOnceTheLeaseRanOutWhileTheMachineSlept(t *testing.T) {
 	var l leased
 	l.granted(time.Now().Add(-2*time.Second), time.Minute)
 	l.expiresWall = l.expiresWall.Add(-time.Minute)
@@ -81,11 +82,11 @@ func TestUpdateNodesSendsNoUpdateOnceTheLeaseRanOutWhileTheMachineSlept(t *testi
 	c := &Cluster{conns: []*namedConn{{name: "node1", conn: node, lease: l}}, ttl: time.Minute}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
 	releaseOf := func(string) (NodeRelease, error) {
-		return NodeRelease{"agent": {Version: "2.0.0", Files: map[string][]byte{"agent": []byte("agent")}}}, nil
+		return NodeRelease{Components: map[string]Component{"agent": {Version: "2.0.0", Files: map[string][]byte{"agent": []byte("agent")}}}}, nil
 	}
-	err := c.UpdateNodes(context.Background(), releaseOf, func(Step) {})
+	err := c.Update(context.Background(), releaseOf, func(Step) {})
 	if !errors.Is(err, ErrLockLost) {
-		t.Errorf("UpdateNodes says %v, want ErrLockLost", err)
+		t.Errorf("Update says %v, want ErrLockLost", err)
 	}
 	if node.updates != 0 {
 		t.Errorf("node1 was sent %d updates, want none", node.updates)
@@ -124,9 +125,9 @@ func (r *stepRecorder) RenewLock(context.Context, string, time.Duration) (*nodec
 	return &nodeclient.Lock{Lease: r.lease}, nil
 }
 
-// Asleep while the updater updates, UpdateNodes must not go on to
+// Asleep while the updater updates, Update must not go on to
 // containerd once the lease may have run out.
-func TestUpdateNodesTakesNoNextStepOnceTheLeaseRanOutWhileTheMachineSlept(t *testing.T) {
+func TestUpdateTakesNoNextStepOnceTheLeaseRanOutWhileTheMachineSlept(t *testing.T) {
 	var l leased
 	l.granted(time.Now(), time.Minute)
 	node := &stepRecorder{lease: "ours"}
@@ -139,16 +140,218 @@ func TestUpdateNodesTakesNoNextStepOnceTheLeaseRanOutWhileTheMachineSlept(t *tes
 		c.mu.Unlock()
 	}
 	releaseOf := func(string) (NodeRelease, error) {
-		return NodeRelease{
+		return NodeRelease{Components: map[string]Component{
 			"agent":   {Version: "2.0.0", Files: map[string][]byte{"agent": []byte("agent")}},
 			"updater": {Version: "2.0.0", Files: map[string][]byte{"updater": []byte("updater")}},
-		}, nil
+		}}, nil
 	}
-	err := c.UpdateNodes(context.Background(), releaseOf, func(Step) {})
+	err := c.Update(context.Background(), releaseOf, func(Step) {})
 	if !errors.Is(err, ErrLockLost) {
-		t.Errorf("UpdateNodes says %v, want ErrLockLost", err)
+		t.Errorf("Update says %v, want ErrLockLost", err)
 	}
 	if want := []string{"agent", "updater"}; !slices.Equal(node.steps, want) {
 		t.Errorf("node1 was sent the updates %v, want %v", node.steps, want)
+	}
+}
+
+// lateAgent is a node whose agent update takes until just before the
+// step's time is up, and whose new agent answers renewals only a while
+// after it.
+type lateAgent struct {
+	Node
+	took, restarting time.Duration
+	updated          time.Time
+}
+
+func (r *lateAgent) Status(context.Context) nodeclient.Status { return nodeclient.Status{} }
+
+func (r *lateAgent) UpdateAgent(context.Context, string, []byte, time.Duration) error {
+	time.Sleep(r.took)
+	r.updated = time.Now()
+	return nil
+}
+
+func (r *lateAgent) UpdateUpdater(context.Context, string, []byte, time.Duration) error { return nil }
+
+func (r *lateAgent) UpdateContainerd(context.Context, string, map[string][]byte, time.Duration) error {
+	return nil
+}
+
+func (r *lateAgent) RenewLock(context.Context, string, time.Duration) (*nodeclient.Lock, error) {
+	if time.Since(r.updated) < r.restarting {
+		return nil, errors.New("the agent is restarting")
+	}
+	return &nodeclient.Lock{Lease: "ours"}, nil
+}
+
+// An agent update that ends late in its step leaves the renewal on the
+// restarted agent its own time, not what is left of the step's, so that
+// an update that succeeded isn't taken for one whose agent doesn't
+// answer.
+func TestTheRenewalAfterALateAgentUpdateHasItsOwnTime(t *testing.T) {
+	defer func(d time.Duration) { updateTimeout = d }(updateTimeout)
+	updateTimeout = 500 * time.Millisecond
+	var l leased
+	l.granted(time.Now(), time.Minute)
+	node := &lateAgent{took: 450 * time.Millisecond, restarting: 300 * time.Millisecond}
+	c := &Cluster{conns: []*namedConn{{name: "node1", conn: node, lease: l}}, ttl: time.Minute, lease: nodeclient.Lock{Lease: "ours"}}
+	c.ctx, c.cancel = context.WithCancelCause(context.Background())
+	releaseOf := func(string) (NodeRelease, error) {
+		return NodeRelease{Components: map[string]Component{
+			"agent":      {Version: "2.0.0", Files: map[string][]byte{"agent": []byte("agent")}},
+			"updater":    {Version: "2.0.0", Files: map[string][]byte{"updater": []byte("updater")}},
+			"containerd": {Version: "2.4.1"},
+		}}, nil
+	}
+	if err := c.Update(context.Background(), releaseOf, func(Step) {}); err != nil {
+		t.Errorf("Update says %v, want the late agent update to succeed", err)
+	}
+}
+
+// serviceRecorder is a node that keeps the lease, runs what it is asked
+// to at the version asked, and records the services it runs. onImport
+// and onRun, if set, run as an image is imported and a service is run.
+type serviceRecorder struct {
+	stepRecorder
+	services        []*nodev1.Component
+	onImport, onRun func()
+}
+
+func (r *serviceRecorder) Status(context.Context) nodeclient.Status {
+	return nodeclient.Status{Services: r.services}
+}
+
+func (r *serviceRecorder) ImportImage(_ context.Context, archive []byte) ([]string, error) {
+	if r.onImport != nil {
+		r.onImport()
+	}
+	return []string{string(archive)}, nil
+}
+
+func (r *serviceRecorder) RunService(_ context.Context, svc *nodev1.Service) error {
+	r.steps = append(r.steps, svc.Name)
+	r.services = append(r.services, &nodev1.Component{Name: svc.Name, Version: svc.Version, Health: nodev1.Health_HEALTH_HEALTHY})
+	if r.onRun != nil {
+		r.onRun()
+	}
+	return nil
+}
+
+// Asleep while a service runs, Update must not go on to the next service
+// once the lease may have run out.
+func TestUpdateRunsNoNextServiceOnceTheLeaseRanOutWhileTheMachineSlept(t *testing.T) {
+	var l leased
+	l.granted(time.Now(), time.Minute)
+	node := &serviceRecorder{stepRecorder: stepRecorder{lease: "ours"}}
+	n := &namedConn{name: "node1", conn: node, lease: l}
+	c := &Cluster{conns: []*namedConn{n}, ttl: time.Minute, lease: nodeclient.Lock{Lease: "ours"}, serviceTimeout: time.Second, reachTimeout: time.Second}
+	c.ctx, c.cancel = context.WithCancelCause(context.Background())
+	node.onRun = func() {
+		c.mu.Lock()
+		n.lease.expiresWall = time.Now().Add(-time.Second)
+		c.mu.Unlock()
+	}
+	releaseOf := func(string) (NodeRelease, error) {
+		return NodeRelease{Services: []Service{
+			{Name: "dns", Version: "2.0.0", Image: "dns", Archive: []byte("dns")},
+			{Name: "proxy", Version: "2.0.0", Image: "proxy", Archive: []byte("proxy")},
+		}}, nil
+	}
+	err := c.updateServices(context.Background(), n, releaseOf, func(Step) {})
+	if !errors.Is(err, ErrLockLost) {
+		t.Errorf("updateServices says %v, want ErrLockLost", err)
+	}
+	if want := []string{"dns"}; !slices.Equal(node.steps, want) {
+		t.Errorf("node1 ran the services %v, want %v", node.steps, want)
+	}
+}
+
+// Asleep while a service's image imports, Update must not run the
+// service once the lease may have run out, since another operation may
+// hold the lock by then.
+func TestUpdateRunsNoServiceOnceTheLeaseRanOutWhileItsImageImported(t *testing.T) {
+	var l leased
+	l.granted(time.Now(), time.Minute)
+	node := &serviceRecorder{stepRecorder: stepRecorder{lease: "ours"}}
+	n := &namedConn{name: "node1", conn: node, lease: l}
+	c := &Cluster{conns: []*namedConn{n}, ttl: time.Minute, lease: nodeclient.Lock{Lease: "ours"}, serviceTimeout: time.Second, reachTimeout: time.Second}
+	c.ctx, c.cancel = context.WithCancelCause(context.Background())
+	node.onImport = func() {
+		c.mu.Lock()
+		n.lease.expiresWall = time.Now().Add(-time.Second)
+		c.mu.Unlock()
+	}
+	releaseOf := func(string) (NodeRelease, error) {
+		return NodeRelease{Services: []Service{{Name: "dns", Version: "2.0.0", Image: "dns", Archive: []byte("dns")}}}, nil
+	}
+	err := c.updateServices(context.Background(), n, releaseOf, func(Step) {})
+	if !errors.Is(err, ErrLockLost) {
+		t.Errorf("updateServices says %v, want ErrLockLost", err)
+	}
+	if len(node.steps) > 0 {
+		t.Errorf("node1 ran the services %v, want none", node.steps)
+	}
+}
+
+// stoppedAgent is a node whose agent update ends at once, and whose
+// restarted agent never answers a renewal, until mooctl stops waiting.
+type stoppedAgent struct {
+	Node
+	updated chan struct{}
+}
+
+func (r *stoppedAgent) Status(context.Context) nodeclient.Status { return nodeclient.Status{} }
+
+func (r *stoppedAgent) UpdateAgent(context.Context, string, []byte, time.Duration) error {
+	close(r.updated)
+	return nil
+}
+
+func (r *stoppedAgent) RenewLock(ctx context.Context, _ string, _ time.Duration) (*nodeclient.Lock, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, errors.New("connection refused")
+}
+
+// agentOnly is a release of the agent alone, which Update sends first.
+func agentOnly(string) (NodeRelease, error) {
+	return NodeRelease{Components: map[string]Component{"agent": {Version: "2.0.0", Files: map[string][]byte{"agent": []byte("agent")}}}}, nil
+}
+
+// The renewal on the restarted agent ends with the operation: an operator
+// who stops mooctl then is told mooctl stopped waiting, not that the new
+// agent doesn't answer, and a lost lock is said as the lost lock it is.
+func TestTheRenewalAfterAnAgentUpdateEndsWithTheOperation(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		cause error
+		want  func(error) bool
+	}{
+		{"stopped", context.Canceled, func(err error) bool {
+			return strings.Contains(err.Error(), "mooctl stopped waiting") && !strings.Contains(err.Error(), "doesn't answer")
+		}},
+		{"lock lost", errors.Join(ErrLockLost, errors.New("node2: its lock was broken")), func(err error) bool { return errors.Is(err, ErrLockLost) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var l leased
+			l.granted(time.Now(), time.Hour)
+			node := &stoppedAgent{updated: make(chan struct{})}
+			cl := &Cluster{conns: []*namedConn{{name: "node1", conn: node, lease: l}}, ttl: time.Minute, lease: nodeclient.Lock{Lease: "ours"}}
+			cl.ctx, cl.cancel = context.WithCancelCause(context.Background())
+			go func() {
+				<-node.updated
+				time.Sleep(100 * time.Millisecond)
+				cl.cancel(c.cause)
+			}()
+			start := time.Now()
+			err := cl.Update(cl.ctx, agentOnly, func(Step) {})
+			if took := time.Since(start); took > 2*time.Second {
+				t.Errorf("the renewal went on %s after the operation ended", took)
+			}
+			if err == nil || !c.want(err) {
+				t.Errorf("Update says %v", err)
+			}
+		})
 	}
 }

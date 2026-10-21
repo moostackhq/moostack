@@ -3,6 +3,7 @@
 package filelock
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,4 +44,29 @@ func Lock(path string) (unlock func(), err error) {
 		f.Close()
 		mu.(*sync.Mutex).Unlock()
 	}, nil
+}
+
+// LockContext is Lock, but gives up waiting once ctx ends. A wait it
+// gave up on releases the lock as soon as it gets it.
+func LockContext(ctx context.Context, path string) (unlock func(), err error) {
+	type locked struct {
+		unlock func()
+		err    error
+	}
+	got := make(chan locked, 1)
+	go func() {
+		unlock, err := Lock(path)
+		got <- locked{unlock, err}
+	}()
+	select {
+	case l := <-got:
+		return l.unlock, l.err
+	case <-ctx.Done():
+		go func() {
+			if l := <-got; l.err == nil {
+				l.unlock()
+			}
+		}()
+		return nil, fmt.Errorf("locking %s: %w", path, ctx.Err())
+	}
 }

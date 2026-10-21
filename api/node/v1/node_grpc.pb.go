@@ -76,10 +76,14 @@ type AgentClient interface {
 	// have imported, and routes calls of its API to it from then on, across
 	// restarts of the agent and the node. Running a service that already
 	// runs as asked changes nothing; running a service of a name the node
-	// runs already, at another version, from another image or of another
-	// API, replaces it, and the API it served before is routed no more. It
+	// runs already, at another version, from another image or another
+	// build of its image, or of another API, replaces it, and the API it
+	// served before is routed no more. It
 	// refuses a service whose API a service of another name serves, with
-	// FAILED_PRECONDITION.
+	// FAILED_PRECONDITION. Once the agent has the call, it goes on running
+	// the service even if the call ends. Once the service runs, the agent
+	// deletes the image of the one it replaced, unless another service
+	// runs from it.
 	RunService(ctx context.Context, in *RunServiceRequest, opts ...grpc.CallOption) (*RunServiceResponse, error)
 	// RemoveIdentities adds node identities, by their fingerprints, to
 	// those the node holds as removed from the cluster, and refuses peers
@@ -283,10 +287,14 @@ type AgentServer interface {
 	// have imported, and routes calls of its API to it from then on, across
 	// restarts of the agent and the node. Running a service that already
 	// runs as asked changes nothing; running a service of a name the node
-	// runs already, at another version, from another image or of another
-	// API, replaces it, and the API it served before is routed no more. It
+	// runs already, at another version, from another image or another
+	// build of its image, or of another API, replaces it, and the API it
+	// served before is routed no more. It
 	// refuses a service whose API a service of another name serves, with
-	// FAILED_PRECONDITION.
+	// FAILED_PRECONDITION. Once the agent has the call, it goes on running
+	// the service even if the call ends. Once the service runs, the agent
+	// deletes the image of the one it replaced, unless another service
+	// runs from it.
 	RunService(context.Context, *RunServiceRequest) (*RunServiceResponse, error)
 	// RemoveIdentities adds node identities, by their fingerprints, to
 	// those the node holds as removed from the cluster, and refuses peers

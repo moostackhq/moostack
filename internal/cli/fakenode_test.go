@@ -1,8 +1,11 @@
 package cli_test
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"slices"
@@ -43,8 +46,12 @@ type fakeNode struct {
 	refuseNewRemovals bool
 	// dials counts the times mooctl reached the node.
 	dials int
-	// updateErr, if set, is why updating the agent fails.
-	updateErr error
+	// updating, if set, is called as an update of the agent starts, with
+	// the call's context.
+	updating func(ctx context.Context)
+	// updateErr, if set, is why updating the agent fails, and
+	// serviceErr why running a service does.
+	updateErr, serviceErr error
 	// updates are the components the node was updated to, as the
 	// component, its version and its binaries, in order.
 	updates []string
@@ -111,9 +118,50 @@ func (n *fakeNode) granted() []nodeclient.Lock {
 	return slices.Clone(n.taken)
 }
 
-// healthyNode is a node in direct mode that has applied generation.
+// healthyNode is a node in direct mode that has applied generation,
+// whose agent runs release 1.0.0, statusCluster's.
 func healthyNode(generation int64) *fakeNode {
-	return &fakeNode{status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation}}
+	return &fakeNode{status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Components: []*nodev1.Component{
+		{Name: "agent", Version: "1.0.0", Health: nodev1.Health_HEALTH_HEALTHY},
+	}}}
+}
+
+// generationUnknown is healthyNode, but it can't tell its generation,
+// for problem.
+func generationUnknown(problem string) *fakeNode {
+	n := healthyNode(0)
+	n.status.GenerationUnknown = problem
+	return n
+}
+
+// runs has the node report that it runs each of components at version,
+// healthy.
+func (n *fakeNode) runs(version string, components ...string) *fakeNode {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, name := range components {
+		n.ran(name, version)
+	}
+	return n
+}
+
+// ran has the node report that it runs component at version, healthy.
+// The node's mu is held.
+func (n *fakeNode) ran(component, version string) {
+	n.status.Components = slices.DeleteFunc(n.status.Components, func(c *nodev1.Component) bool { return c.Name == component })
+	n.status.Components = append(n.status.Components, &nodev1.Component{Name: component, Version: version, Health: nodev1.Health_HEALTH_HEALTHY})
+}
+
+// runsServices has the node report that it runs each of services at
+// version, healthy.
+func (n *fakeNode) runsServices(version string, services ...string) *fakeNode {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, name := range services {
+		n.status.Services = slices.DeleteFunc(n.status.Services, func(c *nodev1.Component) bool { return c.Name == name })
+		n.status.Services = append(n.status.Services, &nodev1.Component{Name: name, Version: version, Health: nodev1.Health_HEALTH_HEALTHY})
+	}
+	return n
 }
 
 // generations are the generations recorded on the node so far.
@@ -124,7 +172,11 @@ func (n *fakeNode) generations() []int64 {
 }
 
 func (n *fakeNode) Status(context.Context) nodeclient.Status {
+	n.mu.Lock()
 	s := n.status
+	s.Components = slices.Clone(s.Components)
+	s.Services = slices.Clone(s.Services)
+	n.mu.Unlock()
 	s.Lock = n.heldLock()
 	return s
 }
@@ -177,10 +229,19 @@ func (n *fakeNode) BreakLock(context.Context) (*nodeclient.Lock, error) {
 	return l, nil
 }
 
-func (n *fakeNode) UpdateAgent(_ context.Context, version string, binary []byte, _ time.Duration) error {
+func (n *fakeNode) UpdateAgent(ctx context.Context, version string, binary []byte, _ time.Duration) error {
+	if n.updating != nil {
+		n.updating(ctx)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.updates = append(n.updates, "agent "+version+" "+string(binary))
+	if n.updateErr == nil {
+		n.ran("agent", version)
+	}
 	return n.updateErr
 }
 
@@ -188,6 +249,7 @@ func (n *fakeNode) UpdateUpdater(_ context.Context, version string, binary []byt
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.updates = append(n.updates, "updater "+version+" "+string(binary))
+	n.ran("updater", version)
 	return nil
 }
 
@@ -199,6 +261,45 @@ func (n *fakeNode) UpdateContainerd(_ context.Context, version string, files map
 		update += " " + name + ": " + string(files[name])
 	}
 	n.updates = append(n.updates, update)
+	n.ran("containerd", version)
+	return nil
+}
+
+// ImportImage imports the image in the OCI image layout archive, as the
+// name its index gives it.
+func (n *fakeNode) ImportImage(_ context.Context, archive []byte) ([]string, error) {
+	r := tar.NewReader(bytes.NewReader(archive))
+	for {
+		h, err := r.Next()
+		if err != nil {
+			return nil, fmt.Errorf("not an image: %v", err)
+		}
+		if h.Name != "index.json" {
+			continue
+		}
+		var index struct {
+			Manifests []struct{ Annotations map[string]string }
+		}
+		if err := json.NewDecoder(r).Decode(&index); err != nil || len(index.Manifests) != 1 {
+			return nil, fmt.Errorf("not an image: %v", err)
+		}
+		return []string{index.Manifests[0].Annotations["io.containerd.image.name"]}, nil
+	}
+}
+
+// RunService records an update to the service, as "service", its name,
+// version and image, and has the node report it running at its version,
+// healthy, unless serviceErr is set. Successful updates of components
+// show in the node's status too.
+func (n *fakeNode) RunService(_ context.Context, svc *nodev1.Service) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.updates = append(n.updates, "service "+svc.Name+" "+svc.Version+" "+svc.Image)
+	if n.serviceErr != nil {
+		return n.serviceErr
+	}
+	n.status.Services = slices.DeleteFunc(n.status.Services, func(c *nodev1.Component) bool { return c.Name == svc.Name })
+	n.status.Services = append(n.status.Services, &nodev1.Component{Name: svc.Name, Version: svc.Version, Health: nodev1.Health_HEALTH_HEALTHY})
 	return nil
 }
 
@@ -238,6 +339,9 @@ func (o *operator) dialNode() func(context.Context, cluster.Node) (orchestrate.N
 		f.mu.Unlock()
 		if f.dialing != nil {
 			f.dialing(ctx)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
 		if f.err != nil {
 			return nil, f.err

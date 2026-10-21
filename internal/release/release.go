@@ -25,6 +25,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/moostackhq/moostack/internal/buildid"
+	"github.com/moostackhq/moostack/internal/ociimage"
 	"github.com/moostackhq/moostack/internal/strictyaml"
 )
 
@@ -39,7 +41,10 @@ var Architectures = []string{"amd64", "arm64"}
 // Manifest pins the version of each node component and cluster
 // service.
 type Manifest struct {
-	Version    string      `yaml:"version"`
+	Version string `yaml:"version"`
+	// Previous is the version of the release before this one, which
+	// updates to it, empty for the first.
+	Previous   string      `yaml:"previous,omitempty"`
 	Components []Component `yaml:"components"`
 	Services   []Service   `yaml:"services,omitempty"`
 }
@@ -77,6 +82,22 @@ func (m Manifest) Service(name string) (Service, bool) {
 		return Service{}, false
 	}
 	return m.Services[i], true
+}
+
+// UpdatedFrom are the releases that m updates nodes on: m itself and the
+// release before it, if there is one.
+func (m Manifest) UpdatedFrom() []string {
+	if m.Previous == "" {
+		return []string{m.Version}
+	}
+	return []string{m.Version, m.Previous}
+}
+
+// UpdatesFrom reports whether m updates a node on the release running:
+// m itself or the release before it, so that no update skips a release
+// or goes back.
+func (m Manifest) UpdatesFrom(running string) bool {
+	return running != "" && (running == m.Version || running == m.Previous)
 }
 
 // Pin is the version that a release pins a component or a cluster
@@ -164,7 +185,9 @@ func Open(source, version string) (*Release, error) {
 		return nil, err
 	}
 	r := &Release{dir: dir}
-	if err := strictyaml.Unmarshal(data, &r.Manifest); err != nil {
+	// A newer release's manifest may have fields that this one doesn't
+	// know, which a mooctl reads to say what it refuses.
+	if err := strictyaml.UnmarshalNewer(data, &r.Manifest); err != nil {
 		return nil, fmt.Errorf("release %s: %s: %w", version, manifestName, err)
 	}
 	if r.Version != version {
@@ -173,15 +196,24 @@ func Open(source, version string) (*Release, error) {
 	if r.sums, err = readSums(filepath.Join(dir, sumsName)); err != nil {
 		return nil, fmt.Errorf("release %s: %w", version, err)
 	}
+	// The agent, the updater and the cluster services say which release a
+	// node runs, so each is at the release's own version; containerd and
+	// runc have versions of their own.
 	for _, c := range r.Components {
 		if c.Name == "" || c.Version == "" || len(c.Files) == 0 {
 			return nil, fmt.Errorf("release %s: a component without a name, version or files", version)
+		}
+		if (c.Name == "agent" || c.Name == "updater") && c.Version != version {
+			return nil, fmt.Errorf("release %s: its %s, at %s, isn't at the release's version", version, c.Name, c.Version)
 		}
 	}
 	names, apis := map[string]bool{}, map[string]bool{}
 	for _, s := range r.Services {
 		if s.Name == "" || s.Version == "" || s.API == "" || s.Image == "" {
 			return nil, fmt.Errorf("release %s: a service without a name, version, API or image", version)
+		}
+		if s.Version != version {
+			return nil, fmt.Errorf("release %s: its %s service, at %s, isn't at the release's version", version, s.Name, s.Version)
 		}
 		if names[s.Name] || apis[s.API] {
 			return nil, fmt.Errorf("release %s: two services called %s or serving %s", version, s.Name, s.API)
@@ -260,4 +292,29 @@ func Write(dir string, m Manifest) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, sumsName), sums.Bytes(), 0o644)
+}
+
+// Build is the build of the component of the files files for arch, as
+// node status says it, from the release's checksums.
+func (r *Release) Build(arch string, files []string) (string, error) {
+	sums := map[string]string{}
+	for _, f := range files {
+		sum, ok := r.sums[filePath(arch, f)]
+		if !ok {
+			return "", fmt.Errorf("release %s has no %s", r.Version, filePath(arch, f))
+		}
+		sums[f] = sum
+	}
+	return buildid.FromSums(sums), nil
+}
+
+// ServiceBuild is the build of the cluster service s for arch, as node
+// status says it: its image's digest, read from its image, which is
+// checked against its checksum.
+func (r *Release) ServiceBuild(arch string, s Service) (string, error) {
+	archive, err := r.ReadFile(arch, s.Image)
+	if err != nil {
+		return "", err
+	}
+	return ociimage.Digest(archive)
 }

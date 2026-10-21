@@ -42,6 +42,10 @@ const (
 	versionLabel = "moostack.version"
 	imageLabel   = "moostack.image"
 	apiLabel     = "moostack.api"
+	// digestLabel is the digest of the image the container was made
+	// from, so that a rebuild of an image under the same name, as of a
+	// release built again, is told apart.
+	digestLabel = "moostack.image-digest"
 )
 
 // serviceName is what a cluster service may be called: its name names
@@ -152,11 +156,19 @@ func (s *services) Run(ctx context.Context, svc *nodev1.Service) error {
 		return status.Errorf(codes.Unavailable, "reading the image %s: %v", svc.Image, err)
 	}
 	s.mu.Lock()
+	var replaced *nodev1.Service
+	if i := slices.IndexFunc(s.list, func(other *nodev1.Service) bool { return other.Name == svc.Name }); i >= 0 {
+		replaced = s.list[i]
+	}
 	list := slices.DeleteFunc(slices.Clone(s.list), func(other *nodev1.Service) bool { return other.Name == svc.Name })
 	s.mu.Unlock()
 	// An API is another service's while it is routed for it, stored or
 	// still running. A service whose container the agent couldn't read
-	// when it started is routed first, so that the APIs of all are known.
+	// when it started is routed first, so that the APIs of all are known,
+	// and so is the one run again, so that whether it answers is known.
+	if replaced != nil && s.unknown[replaced.Name] {
+		s.route(namespaced(ctx), replaced)
+	}
 	for _, other := range list {
 		if s.unknown[other.Name] {
 			if err := s.route(namespaced(ctx), other); err != nil {
@@ -175,7 +187,16 @@ func (s *services) Run(ctx context.Context, svc *nodev1.Service) error {
 	s.mu.Lock()
 	s.list = list
 	s.mu.Unlock()
-	return s.start(ctx, svc)
+	if err := s.start(ctx, svc, true); err != nil {
+		return err
+	}
+	// The image of the service replaced goes, unless another service
+	// runs it, so that a node keeps no image per release. Failing to
+	// delete it leaves it, which doesn't affect the service.
+	if replaced != nil && replaced.Image != svc.Image && !slices.ContainsFunc(list, func(other *nodev1.Service) bool { return other.Image == replaced.Image }) {
+		s.client.ImageService().Delete(namespaced(ctx), replaced.Image)
+	}
+	return nil
 }
 
 // store writes list to the file.
@@ -215,7 +236,7 @@ func (s *services) StartAll(ctx context.Context) {
 			s.mu.Unlock()
 			var err error
 			if svc != nil {
-				err = s.start(ctx, svc)
+				err = s.start(ctx, svc, false)
 			}
 			s.running.Unlock()
 			if err != nil {
@@ -233,10 +254,11 @@ func (s *services) StartAll(ctx context.Context) {
 
 // start makes sure svc's container runs, as svc says, and records why
 // if it can't. Either way it routes what runs, as route does. The caller
-// holds s.running.
-func (s *services) start(ctx context.Context, svc *nodev1.Service) error {
+// holds s.running. With repair, as when svc is run again, a service as
+// svc says that doesn't answer its health check is made anew.
+func (s *services) start(ctx context.Context, svc *nodev1.Service, repair bool) error {
 	ctx = namespaced(ctx)
-	err := s.ensure(ctx, svc)
+	err := s.ensure(ctx, svc, repair)
 	if routeErr := s.route(ctx, svc); err == nil {
 		err = routeErr
 	}
@@ -252,19 +274,38 @@ func (s *services) start(ctx context.Context, svc *nodev1.Service) error {
 
 // ensure starts svc's container, first making it anew from svc's image
 // if there is none, or the one there is runs another version, image or
-// API. The new image is found and unpacked before the old container
-// goes, so that a new image the node lacks, or can't unpack, leaves the
-// old service running. One that unpacks but doesn't run doesn't.
-func (s *services) ensure(ctx context.Context, svc *nodev1.Service) error {
+// API, or another build of the image. A container made before the agent
+// recorded its image's digest is taken to run the image there is, so
+// that a new agent doesn't restart every service, and so is one whose
+// image is gone, which it can run without. The new image is found
+// and unpacked before the old container goes, so that a new image the
+// node lacks, or can't unpack, leaves the old service running. One that
+// unpacks but doesn't run doesn't. With repair, a container as svc says
+// whose service doesn't answer its health check is made anew too, so that
+// running a service again repairs it.
+func (s *services) ensure(ctx context.Context, svc *nodev1.Service, repair bool) error {
 	c, labels, err := s.container(ctx, svc.Name)
 	if err != nil {
 		return err
 	}
-	if c != nil && labels[versionLabel] == svc.Version && labels[imageLabel] == svc.Image && labels[apiLabel] == svc.Api {
+	// The image is looked up once, so that the container is labelled with
+	// the digest of the image it is made from, whatever is imported meanwhile.
+	var digest string
+	img, imgErr := s.client.GetImage(ctx, svc.Image)
+	if imgErr == nil {
+		digest = img.Target().Digest.String()
+	} else if !errdefs.IsNotFound(imgErr) {
+		return imgErr
+	}
+	if c != nil && labels[versionLabel] == svc.Version && labels[imageLabel] == svc.Image && labels[apiLabel] == svc.Api &&
+		(labels[digestLabel] == "" || digest == "" || labels[digestLabel] == digest) &&
+		(!repair || s.gateway.Health(ctx, svc.Api) == nil) {
 		return s.startTask(ctx, c, svc)
 	}
-	img, err := s.unpacked(ctx, svc.Image)
-	if err != nil {
+	if imgErr != nil {
+		return imgErr
+	}
+	if err := unpack(ctx, img); err != nil {
 		return err
 	}
 	if c != nil {
@@ -284,7 +325,7 @@ func (s *services) ensure(ctx context.Context, svc *nodev1.Service) error {
 		containerd.WithImage(img),
 		containerd.WithNewSnapshot(svc.Name, img),
 		containerd.WithRuntime(plugins.RuntimeRuncV2, &options.Options{Root: hostlayout.RuncRoot}),
-		containerd.WithContainerLabels(map[string]string{versionLabel: svc.Version, imageLabel: svc.Image, apiLabel: svc.Api}),
+		containerd.WithContainerLabels(map[string]string{versionLabel: svc.Version, imageLabel: svc.Image, apiLabel: svc.Api, digestLabel: digest}),
 		containerd.WithNewSpec(
 			oci.WithImageConfig(img),
 			oci.WithUIDGID(hostlayout.ServiceUser, hostlayout.ServiceUser),
@@ -300,22 +341,16 @@ func (s *services) ensure(ctx context.Context, svc *nodev1.Service) error {
 	return s.startTask(ctx, c, svc)
 }
 
-// unpacked is the image called name, unpacked into snapshots.
-func (s *services) unpacked(ctx context.Context, name string) (containerd.Image, error) {
-	img, err := s.client.GetImage(ctx, name)
-	if err != nil {
-		return nil, err
-	}
+// unpack unpacks img into snapshots, unless it is already.
+func unpack(ctx context.Context, img containerd.Image) error {
 	if unpacked, err := img.IsUnpacked(ctx, ""); err != nil {
-		return nil, err
+		return err
 	} else if !unpacked {
 		// The layers are synced before their snapshots are committed, so
 		// that a crash never leaves a service's files half written.
-		if err := img.Unpack(ctx, "", containerd.WithUnpackApplyOpts(diff.WithSyncFs(true))); err != nil {
-			return nil, err
-		}
+		return img.Unpack(ctx, "", containerd.WithUnpackApplyOpts(diff.WithSyncFs(true)))
 	}
-	return img, nil
+	return nil
 }
 
 // startTask starts c's task, unless it runs already, with a fresh
@@ -463,7 +498,7 @@ func (s *services) Status(ctx context.Context) []*nodev1.Component {
 	for i, svc := range list {
 		wg.Go(func() {
 			_, labels, err := s.container(namespaced(ctx), svc.Name)
-			c := &nodev1.Component{Name: svc.Name, Version: labels[versionLabel], Health: nodev1.Health_HEALTH_HEALTHY}
+			c := &nodev1.Component{Name: svc.Name, Version: labels[versionLabel], Build: labels[digestLabel], Health: nodev1.Health_HEALTH_HEALTHY}
 			if err != nil {
 				c.Health, c.Problem = nodev1.Health_HEALTH_UNHEALTHY, fmt.Sprintf("reading its container: %v", err)
 			} else if p := problems[svc.Name]; p != "" {

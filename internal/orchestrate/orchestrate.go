@@ -55,6 +55,13 @@ type Node interface {
 	// with files, by name, containerd at version, which must answer
 	// within healthTimeout, or the agent puts the old ones back.
 	UpdateContainerd(ctx context.Context, version string, files map[string][]byte, healthTimeout time.Duration) error
+	// ImportImage has the node's agent import the image in archive, an OCI
+	// image layout archive, and returns the names of the images imported.
+	ImportImage(ctx context.Context, archive []byte) ([]string, error)
+	// RunService has the node's agent run the cluster service svc, from
+	// its image, which the node must have imported, replacing the one of
+	// its name that runs.
+	RunService(ctx context.Context, svc *nodev1.Service) error
 	// Close closes the connection.
 	Close() error
 }
@@ -66,6 +73,10 @@ type Dial func(ctx context.Context, name string) (Node, error)
 // it, may take when Nodes doesn't say.
 const DefaultTimeout = 30 * time.Second
 
+// DefaultServiceTimeout is how long a cluster service that an update ran
+// has to answer its health call, when Nodes doesn't say.
+const DefaultServiceTimeout = time.Minute
+
 // Nodes are the nodes an operation runs on, and how to reach them.
 type Nodes struct {
 	// Names are the names of the nodes in the cluster directory.
@@ -76,6 +87,9 @@ type Nodes struct {
 	// status, and RecordTimeout recording a generation on one node. Zero
 	// means DefaultTimeout.
 	ReachTimeout, RecordTimeout time.Duration
+	// ServiceTimeout is how long a cluster service that an update ran has
+	// to answer its health call. Zero means DefaultServiceTimeout.
+	ServiceTimeout time.Duration
 	// LeaseTTL is how long a node holds the operation lock after the
 	// operation last renewed it. Zero means DefaultLeaseTTL.
 	LeaseTTL time.Duration
@@ -83,6 +97,10 @@ type Nodes struct {
 	// directory lists as removed, which the preflight pushes to every
 	// node.
 	Removed []string
+	// Check, if set, is what else the preflight checks of each node, such
+	// as the release it runs, given the status of each node it reached
+	// too: a node it fails can't be operated, even with force.
+	Check func(s nodeclient.Status, all []nodeclient.Status) error
 }
 
 // Reached is a node as Survey found it.
@@ -174,9 +192,12 @@ type Cluster struct {
 	// keep the generation they have applied.
 	Unlisted []string
 	// Latest is the latest generation any node has applied.
-	Latest        int64
-	recordTimeout time.Duration
-	reachTimeout  time.Duration
+	Latest         int64
+	recordTimeout  time.Duration
+	reachTimeout   time.Duration
+	serviceTimeout time.Duration
+	// checkNode is Nodes.Check, nil if it isn't set.
+	checkNode func(s nodeclient.Status, all []nodeclient.Status) error
 	// lease is the operation's hold on the lock, which every node holds
 	// for ttl after the operation last renewed it.
 	lease nodeclient.Lock
@@ -235,25 +256,28 @@ func (e *UnknownGenerationError) Error() string {
 }
 
 // Preflight reaches nodes, all at once, before an operation changes
-// anything, and checks that each can be operated from a cluster directory
-// at generation: that it can be reached with its pinned host key, its
-// agent and updater answer, it is in direct mode, and it can tell the
-// generation it has applied, which isn't later than the directory's.
-// With force, the generation checks pass, and Cluster.Forced says what
-// they found. It fails naming every node that fails a check, and why.
-// Once every node passes, it takes the operation lock for holder on
-// every node, or fails naming each node whose lock another operation
-// holds, after handing back the lock on the others. Holding the lock, it
-// checks the generations again, fails if a lease may already have run
-// out, and then, renewing the lease, has every node hold the identities
+// anything, and checks that each can be operated from a cluster
+// directory at generation: that it can be reached with its pinned host
+// key, its agent and updater answer, it is in direct mode, and it can
+// tell the generation it has applied, which isn't later than the
+// directory's, and that it passes nodes.Check. With force, the
+// generation checks pass, and Cluster.Forced says what they found. It
+// fails naming every node that fails a check, and why. Once every node
+// passes, it takes the operation lock for holder on every node, or fails
+// naming each node whose lock another operation holds, after handing
+// back the lock on the others. Holding the lock, it checks the
+// generations again, fails if a lease may already have run out, and
+// then, renewing the lease, has every node hold the identities
 // nodes.Removed lists as removed, and fails if the operation can't be
 // sure it still holds the lock once they have.
 func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, holder Holder) (*Cluster, error) {
 	c := &Cluster{
-		recordTimeout: cmp.Or(nodes.RecordTimeout, DefaultTimeout),
-		reachTimeout:  cmp.Or(nodes.ReachTimeout, DefaultTimeout),
-		lease:         nodeclient.Lock{Lease: newLease(), Holder: holder.Who, Machine: holder.Machine},
-		ttl:           cmp.Or(nodes.LeaseTTL, DefaultLeaseTTL),
+		recordTimeout:  cmp.Or(nodes.RecordTimeout, DefaultTimeout),
+		reachTimeout:   cmp.Or(nodes.ReachTimeout, DefaultTimeout),
+		serviceTimeout: cmp.Or(nodes.ServiceTimeout, DefaultServiceTimeout),
+		checkNode:      nodes.Check,
+		lease:          nodeclient.Lock{Lease: newLease(), Holder: holder.Who, Machine: holder.Machine, Operation: holder.Operation},
+		ttl:            cmp.Or(nodes.LeaseTTL, DefaultLeaseTTL),
 	}
 	reached := reach(ctx, nodes)
 	for _, r := range reached {
@@ -316,12 +340,21 @@ func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, h
 // names it.
 func (c *Cluster) check(reached []Reached, generation int64, force bool) []error {
 	c.Latest, c.Forced = 0, nil
+	var all []nodeclient.Status
+	for _, r := range reached {
+		if r.Err == nil {
+			all = append(all, r.Status)
+		}
+	}
 	var problems []error
 	for _, r := range reached {
 		if applied, ok := r.KnownGeneration(); ok {
 			c.Latest = max(c.Latest, applied)
 		}
 		err := check(r)
+		if err == nil && c.checkNode != nil {
+			err = c.checkNode(r.Status, all)
+		}
 		if err == nil {
 			err = r.GenerationProblem(generation)
 			if errors.As(err, new(*EarlierGenerationError)) {

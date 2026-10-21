@@ -64,8 +64,12 @@ type node struct {
 	// rollsBack says the update uses its whole health timeout and as
 	// long again rolling back, and then fails.
 	rollsBack bool
-	// components are the node components the node reports.
-	components []*nodev1.Component
+	// components are the node components the node reports, and services
+	// the cluster services. An update of a service runs it at its version,
+	// healthy unless it is sickService.
+	components  []*nodev1.Component
+	services    []*nodev1.Component
+	sickService string
 
 	mu sync.Mutex
 	// updates are the updates of the node's components, in order.
@@ -141,7 +145,7 @@ func (n *node) Status(ctx context.Context) nodeclient.Status {
 		generation = n.laterGeneration
 	}
 	n.mu.Unlock()
-	return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock(), Components: n.components}
+	return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock(), Components: n.components, Services: n.reportedServices()}
 }
 
 func (n *node) RecordGeneration(ctx context.Context, g int64, nodes []string, lease string) error {
@@ -296,6 +300,41 @@ func (n *node) UpdateContainerd(ctx context.Context, version string, files map[s
 		binaries = append(binaries, name+": "+string(files[name]))
 	}
 	return n.update(ctx, "containerd", version, strings.Join(binaries, ", "), healthTimeout)
+}
+
+// ImportImage imports the image whose archive is "image " and its name,
+// failing it if failing names the image's service.
+func (n *node) ImportImage(ctx context.Context, archive []byte) ([]string, error) {
+	image := strings.TrimPrefix(string(archive), "image ")
+	if service, _, _ := strings.Cut(strings.TrimPrefix(image, "moostack.local/"), ":"); n.failing == "import "+service {
+		return nil, n.updateErr
+	}
+	return []string{image}, nil
+}
+
+// RunService records an update of the service, as update records one of
+// a component, as "service <name>", with its image as the binary.
+func (n *node) RunService(ctx context.Context, svc *nodev1.Service) error {
+	err := n.update(ctx, "service "+svc.Name, svc.Version, svc.Image, 0)
+	if err != nil {
+		return err
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	health := nodev1.Health_HEALTH_HEALTHY
+	if svc.Name == n.sickService {
+		health = nodev1.Health_HEALTH_UNHEALTHY
+	}
+	n.services = slices.DeleteFunc(n.services, func(c *nodev1.Component) bool { return c.Name == svc.Name })
+	n.services = append(n.services, &nodev1.Component{Name: svc.Name, Version: svc.Version, Health: health})
+	return nil
+}
+
+// reportedServices are the services the node reports.
+func (n *node) reportedServices() []*nodev1.Component {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.services)
 }
 
 // update records an update of component, after updateDelay, and fails
@@ -667,5 +706,96 @@ func TestAPreflightErrorSaysWhetherForceWouldPassIt(t *testing.T) {
 				t.Errorf("Forceable is %t, want %t, for %v", perr.Forceable(), c.forceable, err)
 			}
 		})
+	}
+}
+
+func TestPreflightRefusesNodesItsCheckFailsBeforeTakingTheLock(t *testing.T) {
+	f := fakes{"node1": {generation: 1}, "node2": {generation: 1, nodes: []string{"bad"}}}
+	nodes := inOrder(f, "node1", "node2")
+	nodes.Check = func(s nodeclient.Status, _ []nodeclient.Status) error {
+		if slices.Contains(s.Nodes, "bad") {
+			return errors.New("it is bad")
+		}
+		return nil
+	}
+	_, err := orchestrate.Preflight(t.Context(), nodes, 1, false, holder)
+	var pe *orchestrate.PreflightError
+	if !errors.As(err, &pe) || len(pe.Problems) != 1 || !strings.Contains(pe.Problems[0].Error(), "node2: it is bad") {
+		t.Fatalf("Preflight: %v, want node2 refused as bad", err)
+	}
+	for name, n := range f {
+		if n.acquired != 0 {
+			t.Errorf("%s was asked for its lock %d times, want never", name, n.acquired)
+		}
+	}
+	// --force doesn't pass it.
+	if _, err := orchestrate.Preflight(t.Context(), nodes, 1, true, holder); !errors.As(err, &pe) {
+		t.Errorf("Preflight with force: %v, want node2 refused", err)
+	}
+}
+
+// Another operation may have changed what a node runs between the check
+// and the lock, so the check runs again on what the nodes say once the
+// lock is held.
+func TestPreflightChecksTheNodesAgainWhileHoldingTheLock(t *testing.T) {
+	f := fakes{"node1": {generation: 1}, "node2": {generation: 1}}
+	nodes := inOrder(f, "node1", "node2")
+	var mu sync.Mutex
+	checks := 0
+	nodes.Check = func(nodeclient.Status, []nodeclient.Status) error {
+		mu.Lock()
+		defer mu.Unlock()
+		checks++
+		// The two nodes pass before the lock, and fail after.
+		if checks > 2 {
+			return errors.New("it runs another release now")
+		}
+		return nil
+	}
+	_, err := orchestrate.Preflight(t.Context(), nodes, 1, false, holder)
+	var pe *orchestrate.PreflightError
+	if !errors.As(err, &pe) || !strings.Contains(err.Error(), "it runs another release now") {
+		t.Fatalf("Preflight: %v, want the nodes refused on the second check", err)
+	}
+	for name, n := range f {
+		if n.acquired == 0 {
+			t.Errorf("%s was never asked for its lock, want the second check to come after it", name)
+		}
+		if l := n.heldLock(); l != nil {
+			t.Errorf("%s holds the lock %+v after the refusal", name, l)
+		}
+	}
+}
+
+// A node's check may depend on the others, as going back to a release
+// some node still runs does.
+func TestPreflightChecksEachNodeWithWhatEveryNodeSays(t *testing.T) {
+	f := fakes{"node1": {generation: 1, nodes: []string{"a"}}, "node2": {generation: 1, nodes: []string{"b"}}}
+	nodes := inOrder(f, "node1", "node2")
+	var mu sync.Mutex
+	var seen [][]string
+	nodes.Check = func(_ nodeclient.Status, all []nodeclient.Status) error {
+		mu.Lock()
+		defer mu.Unlock()
+		var said []string
+		for _, s := range all {
+			said = append(said, s.Nodes...)
+		}
+		slices.Sort(said)
+		seen = append(seen, said)
+		return nil
+	}
+	cl, err := orchestrate.Preflight(t.Context(), nodes, 1, false, holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	if len(seen) == 0 {
+		t.Fatal("the check never ran")
+	}
+	for _, said := range seen {
+		if !slices.Equal(said, []string{"a", "b"}) {
+			t.Errorf("a node's check saw the statuses %v, want every node's", said)
+		}
 	}
 }

@@ -9,10 +9,10 @@ import (
 	"slices"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/abslot"
+	"github.com/moostackhq/moostack/internal/rootsocket"
 )
 
 // UpdateAgent receives the new agent and swaps to it, through the
@@ -39,7 +39,7 @@ func (s *updaterServer) UpdateAgent(stream grpc.ClientStreamingServer[nodev1.Upd
 // healthy. It keeps one connection, which reconnects as the agent
 // restarts.
 func agentHealthy(socket string) (func(ctx context.Context, version string) error, error) {
-	conn, err := grpc.NewClient("unix://"+socket, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := rootsocket.Dial(socket)
 	if err != nil {
 		return nil, err
 	}

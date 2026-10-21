@@ -51,8 +51,8 @@ func TestClusterStatusShowsEachPinnedServiceOfEachNode(t *testing.T) {
 	source := statusCluster(t, o, "node1", "node2", "node3")
 	pinServices(t, source)
 	o.nodes = map[string]*fakeNode{
-		// DNS is behind and stopped, and a service the release doesn't
-		// pin runs too.
+		// DNS is behind, on a release that 1.0.0 doesn't update, and
+		// stopped, and a service the release doesn't pin runs too.
 		"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: upToDate(), Services: []*nodev1.Component{
 			component("dns", "0.9.0", unhealthy, "the service doesn't answer: connection refused"),
 			component("registry", "1.0.0", healthy, ""),
@@ -68,6 +68,9 @@ func TestClusterStatusShowsEachPinnedServiceOfEachNode(t *testing.T) {
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	want := `Cluster prod on release 1.0.0
 Operation lock: free on the nodes whose agent answered
+Update: refused, so cluster update won't run:
+node1: its dns service runs release 0.9.0, and release 1.0.0 updates nodes on 1.0.0 only
+Pin the release the nodes run, or the one after it, and run the mooctl of that release.
 
 NODE   REACHABLE  MODE    COMPONENT   RUNNING  PINNED  HEALTH
 node1  yes        direct  agent       1.0.0    1.0.0   healthy

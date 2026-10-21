@@ -3,6 +3,8 @@ package cli_test
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/netip"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
+	"github.com/moostackhq/moostack/internal/buildid"
 	"github.com/moostackhq/moostack/internal/cluster"
 	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/release"
@@ -94,6 +97,7 @@ func TestClusterStatusShowsEachPinnedComponentOfEachNode(t *testing.T) {
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	want := `Cluster prod on release 1.0.0
 Operation lock: free on the nodes whose agent answered
+Update: stopped partway; run mooctl cluster update again to finish it
 
 NODE   REACHABLE  MODE    COMPONENT   RUNNING  PINNED  HEALTH
 node1  yes        direct  agent       1.0.0    1.0.0   healthy
@@ -124,6 +128,7 @@ func TestClusterStatusShowsAComponentTheReleaseDoesntPin(t *testing.T) {
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	want := `Cluster prod on release 1.0.0
 Operation lock: free
+Update: none needed
 
 NODE   REACHABLE  MODE    COMPONENT   RUNNING  PINNED  HEALTH
 node1  yes        direct  agent       1.0.0    1.0.0   healthy
@@ -159,6 +164,7 @@ func TestClusterStatusPrintsJSON(t *testing.T) {
   "cluster": "prod",
   "release": "1.0.0",
   "generation": 1,
+  "update": "stopped_partway",
   "nodes": [
     {
       "name": "node1",
@@ -170,18 +176,21 @@ func TestClusterStatusPrintsJSON(t *testing.T) {
           "name": "agent",
           "running": "1.0.0",
           "pinned": "1.0.0",
+          "pinned_build": "{agent}",
           "health": "healthy"
         },
         {
           "name": "updater",
           "running": "1.0.0",
           "pinned": "1.0.0",
+          "pinned_build": "{updater}",
           "health": "unhealthy",
           "problem": "it is stuck"
         },
         {
           "name": "containerd",
           "pinned": "2.0.0",
+          "pinned_build": "{containerd}",
           "health": "unknown"
         }
       ]
@@ -198,6 +207,7 @@ func TestClusterStatusPrintsJSON(t *testing.T) {
         {
           "name": "agent",
           "pinned": "1.0.0",
+          "pinned_build": "{agent}",
           "health": "unhealthy",
           "problem": "the agent doesn't answer: connection refused"
         },
@@ -205,11 +215,13 @@ func TestClusterStatusPrintsJSON(t *testing.T) {
           "name": "updater",
           "running": "1.0.0",
           "pinned": "1.0.0",
+          "pinned_build": "{updater}",
           "health": "healthy"
         },
         {
           "name": "containerd",
           "pinned": "2.0.0",
+          "pinned_build": "{containerd}",
           "health": "unknown"
         }
       ]
@@ -217,6 +229,7 @@ func TestClusterStatusPrintsJSON(t *testing.T) {
   ]
 }
 `
+	want = strings.NewReplacer("{agent}", fileBuild("agent"), "{updater}", fileBuild("updater"), "{containerd}", fileBuild("containerd")).Replace(want)
 	if r.stdout != want {
 		t.Errorf("cluster status --json printed\n%s\nwant\n%s", r.stdout, want)
 	}
@@ -276,4 +289,11 @@ func TestClusterStatusJSONSaysHowEachNodesGenerationDiffers(t *testing.T) {
 	if n := strings.Count(r.stdout, "generation_problem"); n != 2 {
 		t.Errorf("cluster status --json gives %d generation problems, want 2, for node2 and node3:\n%s", n, r.stdout)
 	}
+}
+
+// fileBuild is the build of the component of the one file name whose
+// content is its name, as statusCluster writes it.
+func fileBuild(name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return buildid.FromSums(map[string]string{name: hex.EncodeToString(sum[:])})
 }

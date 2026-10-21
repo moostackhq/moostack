@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
-	"github.com/moostackhq/moostack/internal/nodeclient"
 )
 
 // NodeComponents are the node components that an update installs on
@@ -15,25 +15,39 @@ import (
 // which the new agent swaps, then containerd, which it restarts.
 var NodeComponents = []string{"agent", "updater", "containerd"}
 
-// Component is a node component as an update installs it: its version,
-// and its files by name. The agent and the updater are a file each,
-// named for them.
+// Component is a node component as an update installs it: its version
+// and build, as node status says them, and its files by name. The agent
+// and the updater are a file each, named for them.
 type Component struct {
-	Version string
-	Files   map[string][]byte
+	Version, Build string
+	Files          map[string][]byte
+}
+
+// Service is a cluster service as an update runs it: its version and
+// build, as node status says them, the gRPC service name of its API, and
+// its image, an OCI image layout archive, which imports as the image
+// named Image.
+type Service struct {
+	Name, Version, Build, API, Image string
+	Archive                          []byte
 }
 
 // NodeRelease is what an update installs on one node: a release's node
-// components, for the node's architecture, by name.
-type NodeRelease map[string]Component
+// components, for the node's architecture, by name, and its cluster
+// services, in the order the update runs them.
+type NodeRelease struct {
+	Components map[string]Component
+	Services   []Service
+}
 
 // ReleaseOf is what an update installs on the node called name.
 type ReleaseOf func(name string) (NodeRelease, error)
 
-// Step is a step of a node's update, as UpdateNodes tells it.
+// Step is a step of a node's update, as Update tells it.
 type Step struct {
-	// Node is the node's name, and Component the one the step updates,
-	// as "the agent", "the updater" or "containerd", to Version.
+	// Node is the node's name, and Component the node component or
+	// cluster service the step updates, as "the agent", "the updater",
+	// "containerd" or "the dns service", to Version.
 	Node, Component, Version string
 	// Already says the node runs Component at Version already, healthy,
 	// so the step is skipped.
@@ -41,94 +55,190 @@ type Step struct {
 }
 
 // updateTimeout bounds each step of updating one node: sending the
-// binaries, and waiting for the new component, or the one it replaced,
-// to become healthy.
-const updateTimeout = 5 * time.Minute
+// binaries or the image, and waiting for the new component or service,
+// or the component it replaced, to become healthy.
+var updateTimeout = 5 * time.Minute
 
-// UpdateNodes updates every node the cluster has a connection to, one
-// node at a time, in the order the preflight reached them, to what
-// releaseOf gives it: on each node each of NodeComponents in turn. It
-// skips the agent and the updater where the node runs them at the target
-// already, healthy, so that a rerun reaches containerd on a node whose
-// containerd doesn't answer, where a new agent would be refused. told is
-// told each step as it starts or is skipped. Each new component has a
-// fifth of a lease time to restart and become healthy, and the one it
-// replaced as long again if it is rolled back. The last renewal the
-// node answered may be a third of a lease time old when its agent stops
-// answering, and the operation gives up a tenth early, so both end
-// before it may lose the lock. Once a node's agent has restarted, the
-// lease is renewed on it. UpdateNodes stops at the first step that
-// fails, with a *NodeError naming the node and the step, and, before or
-// after any step, once the operation can't be sure it holds the lock.
-func (c *Cluster) UpdateNodes(ctx context.Context, releaseOf ReleaseOf, told func(Step)) error {
+// Update updates every node the cluster has a connection to, in the
+// order the preflight reached them, to what releaseOf gives it: first
+// each node in turn, each of NodeComponents in turn, then, once every
+// node's are done, each node in turn, each of its cluster services in
+// turn, so that the services always run on updated agents. It skips a
+// step where the node runs the component or service at the target
+// already, healthy, and of the target's build when both say which, so
+// that a rerun goes on from where an update stopped, an update of a
+// cluster that is up to date changes nothing, and another build of the
+// target version is replaced. told is told each step as it starts or is
+// skipped. Update stops at the first step that fails, with a *NodeError
+// naming the node and the step, and, before or after any step, once the
+// operation can't be sure it holds the lock.
+func (c *Cluster) Update(ctx context.Context, releaseOf ReleaseOf, told func(Step)) error {
 	c.mu.Lock()
 	conns := slices.Clone(c.conns)
 	c.mu.Unlock()
-	healthTimeout := c.ttl / 5
 	for _, n := range conns {
-		rel, err := releaseOf(n.name)
-		if err != nil {
-			return &NodeError{Node: n.name, Err: err}
+		if err := c.updateComponents(ctx, n, releaseOf, told); err != nil {
+			return err
 		}
-		statusCtx, cancel := context.WithTimeout(ctx, c.reachTimeout)
-		running := runningHealthy(n.conn.Status(statusCtx))
-		cancel()
-		update := map[string]func(ctx context.Context, c Component) error{
-			"agent": func(ctx context.Context, comp Component) error {
-				err := n.conn.UpdateAgent(ctx, comp.Version, comp.Files["agent"], healthTimeout)
-				// The agent restarted, whether the update succeeded or
-				// rolled back.
-				renewErr := c.renewRestarted(ctx, n)
-				if err == nil && renewErr != nil {
-					return &unansweredError{renewErr}
-				}
-				return err
-			},
-			"updater": func(ctx context.Context, comp Component) error {
-				return n.conn.UpdateUpdater(ctx, comp.Version, comp.Files["updater"], healthTimeout)
-			},
-			"containerd": func(ctx context.Context, comp Component) error {
-				return n.conn.UpdateContainerd(ctx, comp.Version, comp.Files, healthTimeout)
-			},
+	}
+	for _, n := range conns {
+		if err := c.updateServices(ctx, n, releaseOf, told); err != nil {
+			return err
 		}
-		for _, name := range NodeComponents {
-			comp := rel[name]
-			step := Step{Node: n.name, Component: ComponentNoun(name), Version: comp.Version}
-			// The lock doesn't fence the update, and keepLease may not
-			// have noticed yet that the lease ran out, as after the
-			// machine slept.
-			if err := c.CheckLock(); err != nil {
-				return err
+	}
+	return nil
+}
+
+// updateComponents updates the node components of n, each of
+// NodeComponents in turn. It skips the agent and the updater where the
+// node runs them at the target already, healthy, so that a rerun reaches
+// containerd on a node whose containerd doesn't answer, where a new agent
+// would be refused. Each new component has a fifth of a lease time to
+// restart and become healthy, and the one it replaced as long again if
+// it is rolled back. The last renewal the node answered may be a third
+// of a lease time old when its agent stops answering, and the operation
+// gives up a tenth early, so both end before it may lose the lock. Once
+// the node's agent has restarted, the lease is renewed on it.
+func (c *Cluster) updateComponents(ctx context.Context, n *namedConn, releaseOf ReleaseOf, told func(Step)) error {
+	healthTimeout := c.ttl / 5
+	rel, err := releaseOf(n.name)
+	if err != nil {
+		return &NodeError{Node: n.name, Err: err}
+	}
+	statusCtx, cancel := context.WithTimeout(ctx, c.reachTimeout)
+	running := runningHealthy(n.conn.Status(statusCtx).Components)
+	cancel()
+	update := map[string]func(ctx context.Context, c Component) error{
+		"agent": func(stepCtx context.Context, comp Component) error {
+			err := n.conn.UpdateAgent(stepCtx, comp.Version, comp.Files["agent"], healthTimeout)
+			// The agent restarted, whether the update succeeded or
+			// rolled back. The renewal has its own time, not what is
+			// left of the step's.
+			renewErr := c.renewRestarted(ctx, n)
+			if err == nil && renewErr != nil {
+				return &unansweredError{renewErr}
 			}
-			// containerd's step runs every time, so that it puts binaries
-			// that are part old and part new in place again.
-			if v, ok := running[name]; ok && v == comp.Version && name != "containerd" {
-				step.Already = true
-				told(step)
-				continue
-			}
-			if name != "containerd" && comp.Files[name] == nil {
-				return &NodeError{Node: n.name, Err: fmt.Errorf("the release has no binary of %s", step.Component)}
-			}
-			told(step)
-			stepCtx, cancel := context.WithTimeout(ctx, updateTimeout)
-			err := update[name](stepCtx, comp)
-			cancel()
-			if r, ok := err.(*unansweredError); ok {
-				return &NodeError{Node: n.name, Err: fmt.Errorf("%s updated to %s doesn't answer mooctl: %w", step.Component, step.Version, r.err)}
-			}
-			if err != nil && ctx.Err() != nil {
-				return &NodeError{Node: n.name, Err: fmt.Errorf("mooctl stopped waiting for the update of %s to %s, which goes on on the node: %w", step.Component, step.Version, context.Cause(ctx))}
-			}
-			if err != nil {
-				return &NodeError{Node: n.name, Err: fmt.Errorf("updating %s to %s: %w", step.Component, step.Version, err)}
-			}
-		}
-		// The renewals may have found the lease lost, on this node or on
-		// another, the last one too.
+			return err
+		},
+		"updater": func(ctx context.Context, comp Component) error {
+			return n.conn.UpdateUpdater(ctx, comp.Version, comp.Files["updater"], healthTimeout)
+		},
+		"containerd": func(ctx context.Context, comp Component) error {
+			return n.conn.UpdateContainerd(ctx, comp.Version, comp.Files, healthTimeout)
+		},
+	}
+	for _, name := range NodeComponents {
+		comp := rel.Components[name]
+		step := Step{Node: n.name, Component: ComponentNoun(name), Version: comp.Version}
+		// The lock doesn't fence the update, and keepLease may not have
+		// noticed yet that the lease ran out, as after the machine slept.
 		if err := c.CheckLock(); err != nil {
 			return err
 		}
+		// containerd reports itself healthy only with its shim at its
+		// version, so binaries part old and part new are updated again.
+		if atTarget(running[name], comp.Version, comp.Build) {
+			step.Already = true
+			told(step)
+			continue
+		}
+		if name != "containerd" && comp.Files[name] == nil {
+			return &NodeError{Node: n.name, Err: fmt.Errorf("the release has no binary of %s", step.Component)}
+		}
+		told(step)
+		if err := c.runStep(ctx, n, step, func(ctx context.Context) error { return update[name](ctx, comp) }); err != nil {
+			return err
+		}
+	}
+	// The renewals may have found the lease lost, on this node or on
+	// another, the last one too.
+	return c.CheckLock()
+}
+
+// updateServices updates the cluster services of n, each in turn: it
+// imports the service's image and runs the service from it, and waits
+// for the service to answer its health call at the new version, for up
+// to the cluster's service timeout. It skips a service the node runs at
+// the target already, healthy.
+func (c *Cluster) updateServices(ctx context.Context, n *namedConn, releaseOf ReleaseOf, told func(Step)) error {
+	rel, err := releaseOf(n.name)
+	if err != nil {
+		return &NodeError{Node: n.name, Err: err}
+	}
+	statusCtx, cancel := context.WithTimeout(ctx, c.reachTimeout)
+	running := runningHealthy(n.conn.Status(statusCtx).Services)
+	cancel()
+	for _, svc := range rel.Services {
+		step := Step{Node: n.name, Component: "the " + svc.Name + " service", Version: svc.Version}
+		if err := c.CheckLock(); err != nil {
+			return err
+		}
+		if atTarget(running[svc.Name], svc.Version, svc.Build) {
+			step.Already = true
+			told(step)
+			continue
+		}
+		told(step)
+		if err := c.runStep(ctx, n, step, func(ctx context.Context) error { return c.updateService(ctx, n, svc) }); err != nil {
+			return err
+		}
+	}
+	return c.CheckLock()
+}
+
+// updateService imports svc's image on n, runs svc from it, once sure the
+// operation still holds the lock, and waits for it to answer its health
+// call at its version.
+func (c *Cluster) updateService(ctx context.Context, n *namedConn, svc Service) error {
+	images, err := n.conn.ImportImage(ctx, svc.Archive)
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(images, svc.Image) {
+		return fmt.Errorf("its image imported %s, not %s", strings.Join(images, ", "), svc.Image)
+	}
+	// The import may have outlasted the lease, as when the machine slept,
+	// and running the service replaces the one that runs.
+	if err := c.CheckLock(); err != nil {
+		return err
+	}
+	err = n.conn.RunService(ctx, &nodev1.Service{Name: svc.Name, Version: svc.Version, Api: svc.API, Image: svc.Image})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.serviceTimeout)
+	defer cancel()
+	for {
+		statusCtx, cancelStatus := context.WithTimeout(ctx, c.reachTimeout)
+		status := n.conn.Status(statusCtx)
+		cancelStatus()
+		if atTarget(runningHealthy(status.Services)[svc.Name], svc.Version, svc.Build) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("it didn't become healthy within %s", c.serviceTimeout)
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+// runStep runs the step of n, update, within updateTimeout, and says why
+// it failed, naming the node and the step.
+func (c *Cluster) runStep(ctx context.Context, n *namedConn, step Step, update func(ctx context.Context) error) error {
+	stepCtx, cancel := context.WithTimeout(ctx, updateTimeout)
+	err := update(stepCtx)
+	cancel()
+	// The operation ending, as when it is stopped or its lock lost, ends
+	// a renewal on the restarted agent too, which is no fault of the agent.
+	if err != nil && ctx.Err() != nil {
+		return &NodeError{Node: n.name, Err: fmt.Errorf("mooctl stopped waiting for the update of %s to %s, which goes on on the node: %w", step.Component, step.Version, context.Cause(ctx))}
+	}
+	if r, ok := err.(*unansweredError); ok {
+		return &NodeError{Node: n.name, Err: fmt.Errorf("%s updated to %s doesn't answer mooctl: %w", step.Component, step.Version, r.err)}
+	}
+	if err != nil {
+		return &NodeError{Node: n.name, Err: fmt.Errorf("updating %s to %s: %w", step.Component, step.Version, err)}
 	}
 	return nil
 }
@@ -142,16 +252,23 @@ func ComponentNoun(name string) string {
 	return "the " + name
 }
 
-// runningHealthy are the versions of the node components that status
-// reports healthy, by name.
-func runningHealthy(status nodeclient.Status) map[string]string {
-	running := map[string]string{}
-	for _, c := range status.Components {
+// runningHealthy are the components or services that a node reports
+// healthy, by name.
+func runningHealthy(reported []*nodev1.Component) map[string]*nodev1.Component {
+	running := map[string]*nodev1.Component{}
+	for _, c := range reported {
 		if c.Health == nodev1.Health_HEALTH_HEALTHY {
-			running[c.Name] = c.Version
+			running[c.Name] = c
 		}
 	}
 	return running
+}
+
+// atTarget reports whether running, healthy, is the target: at version,
+// and the build, unless the node or the release doesn't say which, as a
+// release before builds were reported doesn't.
+func atTarget(running *nodev1.Component, version, build string) bool {
+	return running != nil && running.Version == version && (build == "" || running.Build == "" || running.Build == build)
 }
 
 // unansweredError is why the agent that an update restarted doesn't

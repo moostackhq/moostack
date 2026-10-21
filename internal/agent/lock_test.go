@@ -140,7 +140,7 @@ func acquire(t *testing.T, n *nodetest.Node, lease string, ttl time.Duration) *n
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	res, err := n.Agent.AcquireLock(ctx, &nodev1.AcquireLockRequest{
-		Lock: &nodev1.Lock{Lease: lease, Holder: "alice", Machine: "laptop-" + lease},
+		Lock: &nodev1.Lock{Lease: lease, Holder: "alice", Machine: "laptop-" + lease, Operation: "cluster update"},
 		Ttl:  durationpb.New(ttl),
 	})
 	if err != nil {
@@ -258,5 +258,17 @@ func TestARenewedLeaseOutlivesARestart(t *testing.T) {
 	n.Restart(t, "agent")
 	if got := n.EventuallyHealthy(t).GetLock(); got.GetLease() != "a" {
 		t.Errorf("after a restart, status reports the lock %v, want the renewed lease a", got)
+	}
+}
+
+func TestTheLockRecordsTheOperationThatHoldsItAcrossARestart(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	if got := acquire(t, n, "a", time.Minute); got.GetOperation() != "cluster update" {
+		t.Fatalf("acquiring the lock: %v, want it held for cluster update", got)
+	}
+	n.Restart(t, "agent")
+	if got := n.EventuallyHealthy(t).GetLock(); got.GetOperation() != "cluster update" {
+		t.Errorf("after a restart, status reports the lock %v, want it held for cluster update", got)
 	}
 }

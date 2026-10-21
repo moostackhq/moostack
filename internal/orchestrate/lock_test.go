@@ -303,3 +303,19 @@ func wantContains(t *testing.T, what, s string, want ...string) {
 }
 
 var _ orchestrate.Node = (*node)(nil)
+
+func TestPreflightTakesTheLockForTheOperationItRuns(t *testing.T) {
+	f := fakes{"node1": {generation: 1}}
+	cl, err := orchestrate.Preflight(t.Context(), inOrder(f, "node1"), 1, false, orchestrate.Holder{Who: "alice", Machine: "laptop", Operation: "cluster update"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	l := f["node1"].heldLock()
+	if l == nil || l.Operation != "cluster update" {
+		t.Fatalf("node1's lock is %+v, want it held for cluster update", l)
+	}
+	if got := orchestrate.DescribeLock(*l); !strings.HasSuffix(got, ", for cluster update") {
+		t.Errorf("DescribeLock says %q, want it to end with the operation", got)
+	}
+}

@@ -10,6 +10,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -145,4 +147,32 @@ func describe(mediaType string, b []byte) descriptor {
 func digest(b []byte) string {
 	sum := sha256.Sum256(b)
 	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// Digest is the digest of the image in the OCI image layout archive
+// archive, an image of one manifest as Write writes, which containerd
+// knows the image by once imported. Another build of an image, under the
+// same name, has another.
+func Digest(archive []byte) (string, error) {
+	r := tar.NewReader(bytes.NewReader(archive))
+	for {
+		h, err := r.Next()
+		if err == io.EOF {
+			return "", errors.New("the archive has no index.json")
+		}
+		if err != nil {
+			return "", err
+		}
+		if h.Name != "index.json" {
+			continue
+		}
+		var index struct{ Manifests []descriptor }
+		if err := json.NewDecoder(r).Decode(&index); err != nil {
+			return "", fmt.Errorf("index.json: %w", err)
+		}
+		if len(index.Manifests) != 1 {
+			return "", fmt.Errorf("index.json lists %d images, not one", len(index.Manifests))
+		}
+		return index.Manifests[0].Digest, nil
+	}
 }

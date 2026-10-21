@@ -15,7 +15,7 @@ func TestNodeAddByANonRecipientListsTheRecipientsBeforeTryingTheHost(t *testing.
 	alice := newOperator(t, "alice")
 	source := statusCluster(t, alice)
 	bob := newOperator(t, "bob")
-	bob.dir = alice.dir
+	bob.dir, bob.version = alice.dir, alice.version
 	r := bob.run("--release-source", source, "node", "add", unreachable)
 	if r.err == nil {
 		t.Fatal("node add by someone who isn't a recipient succeeded")
@@ -31,7 +31,7 @@ func TestNodeAddByATeammateWhoIsARecipientGetsPastTheCAKey(t *testing.T) {
 	source := statusCluster(t, alice)
 	bob := newOperator(t, "bob")
 	alice.mustRun("secret", "recipients", "add", bob.recipient.String())
-	bob.dir = alice.dir
+	bob.dir, bob.version = alice.dir, alice.version
 	r := bob.run("--release-source", source, "node", "add", unreachable)
 	if r.err == nil || !strings.Contains(r.err.Error(), unreachable) {
 		t.Errorf("node add by a recipient: %v, want it to fail reaching %s", r.err, unreachable)

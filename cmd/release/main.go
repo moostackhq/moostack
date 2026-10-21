@@ -2,7 +2,11 @@
 // mooctl that belongs to it. Run it from the checkout's root, with Go and
 // cargo:
 //
-//	go run ./cmd/release -version 0.1.0 [-out dist] [-dev]
+//	go run ./cmd/release -version 0.1.0 [-previous 0.0.9] [-out dist] [-dev]
+//
+// -previous names the release before it: the one that clusters update to
+// this release from, and that its mooctl operates besides its own. The
+// first release names none.
 //
 // It writes mooctl for this machine to <out>/mooctl, and the release to
 // <out>/releases/<version>, so that <out>/releases is a release source.
@@ -25,21 +29,27 @@ import (
 
 func main() {
 	version := flag.String("version", "", "the release's version")
+	previous := flag.String("previous", "", "the version of the release before it, none for the first")
 	out := flag.String("out", "dist", "the directory to write to")
 	dev := flag.Bool("dev", false, "make mooctl a dev build, which reads MOOSTACK_DEV_* settings")
 	flag.Parse()
-	if err := build(context.Background(), *version, *out, *dev); err != nil {
+	if err := build(context.Background(), *version, *previous, *out, *dev); err != nil {
 		fmt.Fprintf(os.Stderr, "release: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func build(ctx context.Context, version, out string, dev bool) error {
+func build(ctx context.Context, version, previous, out string, dev bool) error {
 	if version == "" || flag.NArg() != 0 {
-		return errors.New("usage: go run ./cmd/release -version VERSION [-out DIR] [-dev]")
+		return errors.New("usage: go run ./cmd/release -version VERSION [-previous VERSION] [-out DIR] [-dev]")
 	}
 	if err := release.CheckVersion(version); err != nil {
 		return err
+	}
+	if previous != "" {
+		if err := release.CheckVersion(previous); err != nil {
+			return err
+		}
 	}
 	cache, err := os.UserCacheDir()
 	if err != nil {
@@ -54,7 +64,7 @@ func build(ctx context.Context, version, out string, dev bool) error {
 	for _, arch := range release.Architectures {
 		archDir := filepath.Join(dir, "linux-"+arch)
 		for _, program := range []string{"agent", "updater"} {
-			if err := goBuild(version, "linux", arch, filepath.Join(archDir, program), "./cmd/"+program, false); err != nil {
+			if err := goBuild(version, previous, "linux", arch, filepath.Join(archDir, program), "./cmd/"+program, false); err != nil {
 				return err
 			}
 		}
@@ -68,21 +78,12 @@ func build(ctx context.Context, version, out string, dev bool) error {
 			return err
 		}
 	}
-	err = release.Write(dir, release.Manifest{
-		Version: version,
-		Components: []release.Component{
-			{Name: "agent", Version: version, Files: []string{"agent"}},
-			{Name: "updater", Version: version, Files: []string{"updater"}},
-			{Name: "containerd", Version: release.ContainerdVersion, Files: release.ContainerdFiles},
-			{Name: "runc", Version: release.RuncVersion, Files: []string{"runc"}},
-		},
-		Services: services,
-	})
+	err = release.Write(dir, manifest(version, previous, services))
 	if err != nil {
 		return err
 	}
 	mooctl := filepath.Join(out, "mooctl")
-	if err := goBuild(version, runtime.GOOS, runtime.GOARCH, mooctl, "./cmd/mooctl", dev); err != nil {
+	if err := goBuild(version, previous, runtime.GOOS, runtime.GOARCH, mooctl, "./cmd/mooctl", dev); err != nil {
 		return err
 	}
 	fmt.Printf("Built release %s in %s and %s\n", version, dir, mooctl)
@@ -92,11 +93,33 @@ func build(ctx context.Context, version, out string, dev bool) error {
 	return nil
 }
 
+// manifest is the manifest of the release at version, after previous,
+// with its cluster services services.
+func manifest(version, previous string, services []release.Service) release.Manifest {
+	return release.Manifest{
+		Version:  version,
+		Previous: previous,
+		Components: []release.Component{
+			{Name: "agent", Version: version, Files: []string{"agent"}},
+			{Name: "updater", Version: version, Files: []string{"updater"}},
+			{Name: "containerd", Version: release.ContainerdVersion, Files: release.ContainerdFiles},
+			{Name: "runc", Version: release.RuncVersion, Files: []string{"runc"}},
+		},
+		Services: services,
+	}
+}
+
+// ldflags stamps a program with the release at version, and previous.
+func ldflags(version, previous string) string {
+	return "-X github.com/moostackhq/moostack/internal/buildinfo.Version=" + version +
+		" -X github.com/moostackhq/moostack/internal/buildinfo.Previous=" + previous
+}
+
 // goBuild builds pkg for goos and goarch into the file out, stamped with
-// version, and with the dev tag if dev.
-func goBuild(version, goos, goarch, out, pkg string, dev bool) error {
+// version and the previous release's, and with the dev tag if dev.
+func goBuild(version, previous, goos, goarch, out, pkg string, dev bool) error {
 	args := []string{"build", "-trimpath",
-		"-ldflags", "-X github.com/moostackhq/moostack/internal/buildinfo.Version=" + version,
+		"-ldflags", ldflags(version, previous),
 		"-o", out}
 	if dev {
 		args = append(args, "-tags", "dev")

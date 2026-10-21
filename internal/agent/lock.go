@@ -35,11 +35,13 @@ type operationLock struct {
 
 // heldLease is a lease that holds the lock, as the lock file keeps it.
 type heldLease struct {
-	Lease   string        `json:"lease"`
-	Holder  string        `json:"holder"`
-	Machine string        `json:"machine"`
-	Since   time.Time     `json:"since"`
-	TTL     time.Duration `json:"ttl"`
+	Lease   string `json:"lease"`
+	Holder  string `json:"holder"`
+	Machine string `json:"machine"`
+	// Operation is the command the operation runs.
+	Operation string        `json:"operation,omitempty"`
+	Since     time.Time     `json:"since"`
+	TTL       time.Duration `json:"ttl"`
 	// Until is when the lease runs out unless renewed, on the wall clock.
 	Until time.Time `json:"until"`
 }
@@ -50,7 +52,7 @@ func (h *heldLease) proto(until time.Time) *nodev1.Lock {
 	if h == nil {
 		return nil
 	}
-	return &nodev1.Lock{Lease: h.Lease, Holder: h.Holder, Machine: h.Machine, Since: timestamppb.New(h.Since), Until: timestamppb.New(until)}
+	return &nodev1.Lock{Lease: h.Lease, Holder: h.Holder, Machine: h.Machine, Operation: h.Operation, Since: timestamppb.New(h.Since), Until: timestamppb.New(until)}
 }
 
 // loadLock is the lock kept in file, held from now for its lease's ttl,
@@ -127,7 +129,7 @@ func (s *agentServer) AcquireLock(_ context.Context, req *nodev1.AcquireLockRequ
 	if h != nil && h.Lease != want.GetLease() {
 		return &nodev1.AcquireLockResponse{Lock: h.proto(l.expires)}, nil
 	}
-	next := &heldLease{Lease: want.GetLease(), Holder: want.GetHolder(), Machine: want.GetMachine(), Since: now, TTL: ttl, Until: now.Add(ttl)}
+	next := &heldLease{Lease: want.GetLease(), Holder: want.GetHolder(), Machine: want.GetMachine(), Operation: want.GetOperation(), Since: now, TTL: ttl, Until: now.Add(ttl)}
 	if h != nil {
 		next.Since = h.Since
 	}

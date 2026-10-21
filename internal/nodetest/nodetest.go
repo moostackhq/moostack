@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -337,6 +339,13 @@ func (n *Node) dial(t *testing.T, socket string) *grpc.ClientConn {
 	if !ok {
 		t.Fatalf("no program serves %s", socket)
 	}
+	return n.dialThrough(t, program, socket)
+}
+
+// dialThrough is a connection to socket through program's relay, run as
+// root in the container.
+func (n *Node) dialThrough(t *testing.T, program, socket string) *grpc.ClientConn {
+	t.Helper()
 	conn, err := grpc.NewClient("passthrough:///"+filepath.Base(program),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return n.relay(program, socket) }))
@@ -419,6 +428,32 @@ func (n *Node) ImportImage(t *testing.T, name string) {
 	n.importImage(t, name+".tar", release.ImageRef(name, Version))
 }
 
+// DeleteImage deletes the image called name from the node's containerd,
+// as an operator who cleans up by hand would, leaving the containers made
+// from it.
+func (n *Node) DeleteImage(t *testing.T, name string) {
+	t.Helper()
+	client, err := containerd.NewWithConn(n.dialThrough(t, hostlayout.Agent, hostlayout.ContainerdSocket))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := namespaces.WithNamespace(t.Context(), hostlayout.ContainerdNamespace)
+	if err := client.ImageService().Delete(ctx, name); err != nil {
+		t.Fatalf("deleting the image %s: %v", name, err)
+	}
+}
+
+// ImageArchive is the image archive of the cluster service called name,
+// as ImportImage imports it.
+func ImageArchive(t *testing.T, name string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(binaries(t), imagesDir, name+".tar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
 // ImportFixtures has the agent import the images of Fixture and Broken.
 func (n *Node) ImportFixtures(t *testing.T) {
 	t.Helper()
@@ -436,6 +471,23 @@ func (n *Node) ImportFixtureAs(t *testing.T, svc *nodev1.Service) {
 	}
 	var archive bytes.Buffer
 	if err := ociimage.Write(&archive, fixtureImageOf(program, svc)); err != nil {
+		t.Fatal(err)
+	}
+	n.importArchive(t, svc.Image, archive.Bytes(), svc.Image)
+}
+
+// ImportFixtureRebuiltAs is ImportFixtureAs, but of another build of
+// that image, under the same name: one with a file more.
+func (n *Node) ImportFixtureRebuiltAs(t *testing.T, svc *nodev1.Service) {
+	t.Helper()
+	program, err := os.ReadFile(filepath.Join(binaries(t), imagesDir, fixtureProgram))
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := fixtureImageOf(program, svc)
+	img.Files = append(img.Files, ociimage.File{Name: "rebuilt", Mode: 0o644, Data: []byte("another build\n")})
+	var archive bytes.Buffer
+	if err := ociimage.Write(&archive, img); err != nil {
 		t.Fatal(err)
 	}
 	n.importArchive(t, svc.Image, archive.Bytes(), svc.Image)

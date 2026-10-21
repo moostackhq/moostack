@@ -12,6 +12,7 @@ import (
 	"github.com/urfave/cli/v3"
 	"golang.org/x/crypto/ssh"
 
+	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/bootstrap"
 	"github.com/moostackhq/moostack/internal/cluster"
 	"github.com/moostackhq/moostack/internal/hostlayout"
@@ -49,7 +50,7 @@ func nodeCommand(env Env) *cli.Command {
 					if err := wantArgs(cmd, 1); err != nil {
 						return err
 					}
-					return nodeAdd(ctx, env, cmd)
+					return withHint(nodeAdd(ctx, env, cmd))
 				},
 			},
 			{
@@ -67,7 +68,7 @@ func nodeCommand(env Env) *cli.Command {
 					if err := wantArgs(cmd, 1); err != nil {
 						return err
 					}
-					return nodeRemove(ctx, env, cmd)
+					return withHint(nodeRemove(ctx, env, cmd))
 				},
 			},
 		},
@@ -88,11 +89,14 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	rel, err := openRelease(cmd, d)
+	if err := installable(env, d.Cluster.Release); err != nil {
+		return err
+	}
+	rel, err := openRelease(ctx, env, cmd, d)
 	if err != nil {
 		return err
 	}
-	cl, err := preflight(ctx, env, cmd, d, "")
+	cl, err := preflight(ctx, env, cmd, d, "", nil)
 	if err != nil {
 		return err
 	}
@@ -215,7 +219,7 @@ func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {
 	if unreachable {
 		skip = name
 	}
-	cl, err := preflight(ctx, env, cmd, d, skip)
+	cl, err := preflight(ctx, env, cmd, d, skip, nil)
 	if perr := (*orchestrate.PreflightError)(nil); !unreachable && errors.As(err, &perr) && perr.Unreachable(name) {
 		return fmt.Errorf("%w\nIf %s can't be reached, remove it without reaching it with mooctl node remove %s --unreachable.", err, name, name)
 	}
@@ -310,6 +314,10 @@ func (n unreachedNode) UpdateUpdater(context.Context, string, []byte, time.Durat
 func (n unreachedNode) UpdateContainerd(context.Context, string, map[string][]byte, time.Duration) error {
 	return n.err
 }
+
+func (n unreachedNode) ImportImage(context.Context, []byte) ([]string, error) { return nil, n.err }
+
+func (n unreachedNode) RunService(context.Context, *nodev1.Service) error { return n.err }
 
 func (n unreachedNode) Close() error { return nil }
 

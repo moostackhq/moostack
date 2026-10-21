@@ -191,3 +191,33 @@ func digest(b []byte) string {
 	sum := sha256.Sum256(b)
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
+
+func TestTheDigestOfAnArchiveIsItsImagesAndNamesItsBuild(t *testing.T) {
+	digest := func(img ociimage.Image) string {
+		t.Helper()
+		var archive bytes.Buffer
+		if err := ociimage.Write(&archive, img); err != nil {
+			t.Fatal(err)
+		}
+		d, err := ociimage.Digest(archive.Bytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	img := ociimage.Image{Name: "moostack.local/dns:1.0.0", Architecture: "amd64", Entrypoint: []string{"/dns"}, Files: []ociimage.File{{Name: "dns", Mode: 0o755, Data: []byte("one build")}}}
+	first := digest(img)
+	if !strings.HasPrefix(first, "sha256:") || len(first) != len("sha256:")+64 {
+		t.Errorf("the digest is %q, want sha256: and 64 hex digits", first)
+	}
+	if again := digest(img); again != first {
+		t.Errorf("the same image has the digests %s and %s", first, again)
+	}
+	img.Files[0].Data = []byte("another build")
+	if other := digest(img); other == first {
+		t.Errorf("another build under the same name has the same digest, %s", first)
+	}
+	if _, err := ociimage.Digest([]byte("not an archive")); err == nil {
+		t.Error("Digest of something that isn't an archive succeeded")
+	}
+}

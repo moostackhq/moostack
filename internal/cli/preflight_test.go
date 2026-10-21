@@ -119,7 +119,7 @@ func TestForceNamesTheNodesTheLatestGenerationListsButTheDirectoryDoesnt(t *test
 func TestThePreflightRefusesANodeThatCantTellItsGenerationUnlessForced(t *testing.T) {
 	o := newOperator(t, "op")
 	source := preflightCluster(t, o)
-	o.nodes["node3"] = &fakeNode{status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, GenerationUnknown: "reading /var/lib/moostack/generation: invalid character"}}
+	o.nodes["node3"] = generationUnknown("reading /var/lib/moostack/generation: invalid character")
 	nodeAddRefused(t, o, source, "node3: it can't tell the generation it has applied: reading /var/lib/moostack/generation")
 	r := nodeAddPassesPreflight(t, o, source, "--force")
 	wantContains(t, "node add --force's warnings", r.stderr, "node3: it can't tell the generation it has applied")
@@ -215,7 +215,7 @@ func TestThePreflightSuggestsForceOnlyWhenItWouldPass(t *testing.T) {
 func TestThePreflightSuggestsForceForANodeThatCantTellItsGeneration(t *testing.T) {
 	o := newOperator(t, "op")
 	source := preflightCluster(t, o)
-	o.nodes["node3"] = &fakeNode{status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, GenerationUnknown: "unreadable"}}
+	o.nodes["node3"] = generationUnknown("unreadable")
 	nodeAddRefused(t, o, source, "node3: it can't tell the generation", "pass --force to apply this cluster directory anyway, and have every node record its generation")
 }
 
@@ -223,7 +223,7 @@ func TestThePreflightSuggestsForceForEachKindOfRefusalItWouldPass(t *testing.T) 
 	o := newOperator(t, "op")
 	source := preflightCluster(t, o)
 	o.nodes["node2"] = healthyNode(5)
-	o.nodes["node3"] = &fakeNode{status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, GenerationUnknown: "unreadable"}}
+	o.nodes["node3"] = generationUnknown("unreadable")
 	nodeAddRefused(t, o, source,
 		"Pull the latest cluster directory, or pass --force to apply this one anyway",
 		"pass --force to apply this cluster directory anyway, and have every node record its generation")

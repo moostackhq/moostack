@@ -46,10 +46,14 @@ service Agent {
   // have imported, and routes calls of its API to it from then on, across
   // restarts of the agent and the node. Running a service that already
   // runs as asked changes nothing; running a service of a name the node
-  // runs already, at another version, from another image or of another
-  // API, replaces it, and the API it served before is routed no more. It
+  // runs already, at another version, from another image or another
+  // build of its image, or of another API, replaces it, and the API it
+  // served before is routed no more. It
   // refuses a service whose API a service of another name serves, with
-  // FAILED_PRECONDITION.
+  // FAILED_PRECONDITION. Once the agent has the call, it goes on running
+  // the service even if the call ends. Once the service runs, the agent
+  // deletes the image of the one it replaced, unless another service
+  // runs from it.
   rpc RunService(RunServiceRequest) returns (RunServiceResponse);
   // RemoveIdentities adds node identities, by their fingerprints, to
   // those the node holds as removed from the cluster, and refuses peers
@@ -163,6 +167,9 @@ message Lock {
   // Until is when the lease runs out on the node unless renewed, on the
   // node's clock. A request leaves it unset.
   google.protobuf.Timestamp until = 5;
+  // Operation is the command the operation runs, such as "cluster
+  // update", empty from a release that didn't say.
+  string operation = 6;
 }
 
 message AcquireLockRequest {
@@ -335,6 +342,12 @@ message Component {
   Health health = 3;
   // Problem says why the component is unhealthy.
   string problem = 4;
+  // Build is which build of version runs, empty when the node can't
+  // tell: for a node component, sha256: and the hex SHA-256 of the lines
+  // "<file> <its hex SHA-256>\n" of its files, by the names a release
+  // gives them, in order of name; for a cluster service, its image's
+  // digest.
+  string build = 5;
 }
 
 enum Health {

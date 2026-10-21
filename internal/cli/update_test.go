@@ -15,15 +15,17 @@ import (
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/cluster"
+	"github.com/moostackhq/moostack/internal/ociimage"
 	"github.com/moostackhq/moostack/internal/release"
 )
 
 // updateCluster makes the operator's cluster directory, on release
 // 1.0.0, with node1 and node3 on amd64 and node2 on arm64, all healthy at
-// generation 1, and a release source with 1.0.0 and 1.1.0, each of whose
-// agents, updaters and containerd binaries says its architecture and
-// version, and whose containerd is at 2.0.0 and 2.1.0. It pins 1.1.0, as an
-// operator does before cluster update, and returns the release source.
+// generation 1, their agents at 1.0.0, and a release source with 1.0.0
+// and 1.1.0, the release after it, as writeUpdateRelease writes them,
+// with containerd at 2.0.0 and 2.1.0. The operator's mooctl is 1.1.0's.
+// It pins 1.1.0, as an operator does before cluster update, and returns
+// the release source.
 func updateCluster(t *testing.T, o *operator) string {
 	t.Helper()
 	o.version = "1.0.0"
@@ -50,27 +52,48 @@ func updateCluster(t *testing.T, o *operator) string {
 		if err != nil {
 			t.Fatal(err)
 		}
-		o.nodes[n.name] = healthyNode(1)
+		o.nodes[n.name] = healthyNode(1).runs("1.0.0", "agent")
 	}
 	source := t.TempDir()
-	for version, containerd := range map[string]string{"1.0.0": "2.0.0", "1.1.0": "2.1.0"} {
-		dir := filepath.Join(source, version)
-		for _, arch := range release.Architectures {
-			for _, f := range append([]string{"agent", "updater"}, release.ContainerdFiles...) {
-				writeFile(t, filepath.Join(dir, "linux-"+arch, f), []byte(f+" for "+arch+" at "+version))
-			}
-		}
-		err = release.Write(dir, release.Manifest{Version: version, Components: []release.Component{
-			{Name: "agent", Version: version, Files: []string{"agent"}},
-			{Name: "updater", Version: version, Files: []string{"updater"}},
-			{Name: "containerd", Version: containerd, Files: release.ContainerdFiles},
-		}})
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeUpdateRelease(t, source, "1.0.0", "", "2.0.0")
+	writeUpdateRelease(t, source, "1.1.0", "1.0.0", "2.1.0")
+	o.version, o.previous = "1.1.0", "1.0.0"
 	pin(t, o, "1.1.0")
 	return source
+}
+
+// writeUpdateRelease writes the release version into the release source
+// at source, after the release previous, with its agent and updater at
+// version, containerd at containerd, and the dns and proxy services at
+// version. Each binary says its architecture and version, and each
+// service's image is an image of a program that says them.
+func writeUpdateRelease(t *testing.T, source, version, previous, containerd string) {
+	t.Helper()
+	dir := filepath.Join(source, version)
+	services := []release.Service{
+		{Name: "dns", Version: version, API: "moostack.dns.v1.DNS", Image: "dns.tar"},
+		{Name: "proxy", Version: version, API: "moostack.proxy.v1.Proxy", Image: "proxy.tar"},
+	}
+	for _, arch := range release.Architectures {
+		for _, f := range append([]string{"agent", "updater"}, release.ContainerdFiles...) {
+			writeFile(t, filepath.Join(dir, "linux-"+arch, f), []byte(f+" for "+arch+" at "+version))
+		}
+		for _, svc := range services {
+			img := ociimage.Image{Name: release.ImageRef(svc.Name, svc.Version), Architecture: arch, Entrypoint: []string{"/" + svc.Name},
+				Files: []ociimage.File{{Name: svc.Name, Mode: 0o755, Data: []byte(svc.Name + " for " + arch)}}}
+			if err := ociimage.WriteFile(filepath.Join(dir, "linux-"+arch, svc.Image), img); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	err := release.Write(dir, release.Manifest{Version: version, Previous: previous, Components: []release.Component{
+		{Name: "agent", Version: version, Files: []string{"agent"}},
+		{Name: "updater", Version: version, Files: []string{"updater"}},
+		{Name: "containerd", Version: containerd, Files: release.ContainerdFiles},
+	}, Services: services})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 // pin pins version in the operator's cluster file, as an operator edits
@@ -90,7 +113,7 @@ func pin(t *testing.T, o *operator, version string) {
 	writeFile(t, path, []byte(pinned))
 }
 
-func TestClusterUpdateSendsEachNodeThePinnedComponentsForItsArchitecture(t *testing.T) {
+func TestClusterUpdateSendsEachNodeThePinnedComponentsThenTheServicesForItsArchitecture(t *testing.T) {
 	o := newOperator(t, "op")
 	source := updateCluster(t, o)
 	before := snapshot(t, o.dir)
@@ -100,6 +123,8 @@ func TestClusterUpdateSendsEachNodeThePinnedComponentsForItsArchitecture(t *test
 			"agent 1.1.0 agent for " + arch + " at 1.1.0",
 			"updater 1.1.0 updater for " + arch + " at 1.1.0",
 			"containerd 2.1.0 containerd: containerd for " + arch + " at 1.1.0 containerd-shim-runc-v2: containerd-shim-runc-v2 for " + arch + " at 1.1.0",
+			"service dns 1.1.0 moostack.local/dns:1.1.0",
+			"service proxy 1.1.0 moostack.local/proxy:1.1.0",
 		}
 		if got := o.nodes[name].nodeUpdates(); !slices.Equal(got, want) {
 			t.Errorf("%s was updated to\n%s\nwant\n%s", name, strings.Join(got, "\n"), strings.Join(want, "\n"))
@@ -110,8 +135,8 @@ func TestClusterUpdateSendsEachNodeThePinnedComponentsForItsArchitecture(t *test
 		if g := o.nodes[name].generations(); len(g) > 0 {
 			t.Errorf("cluster update recorded the generations %v on %s, which it doesn't change", g, name)
 		}
-		if n := len(o.nodes[name].granted()); n != 1 {
-			t.Errorf("%s granted the lock %d times, want once, in the preflight", name, n)
+		if g := o.nodes[name].granted(); len(g) != 1 || g[0].Operation != "cluster update" {
+			t.Errorf("%s granted the locks %+v, want one, in the preflight, for cluster update", name, g)
 		}
 	}
 	var want string
@@ -120,7 +145,11 @@ func TestClusterUpdateSendsEachNodeThePinnedComponentsForItsArchitecture(t *test
 			"Updating the updater on " + name + " to 1.1.0\n" +
 			"Updating containerd on " + name + " to 2.1.0\n"
 	}
-	want += "Every node runs the agent, the updater and containerd of release 1.1.0.\n"
+	for _, name := range []string{"node1", "node2", "node3"} {
+		want += "Updating the dns service on " + name + " to 1.1.0\n" +
+			"Updating the proxy service on " + name + " to 1.1.0\n"
+	}
+	want += "Every node runs release 1.1.0.\n"
 	if r.stdout != want {
 		t.Errorf("cluster update printed\n%s\nwant\n%s", r.stdout, want)
 	}
@@ -139,8 +168,8 @@ func TestClusterUpdateSkipsTheAgentAndTheUpdaterANodeRunsAlready(t *testing.T) {
 		{Name: "updater", Version: "1.1.0", Health: healthy},
 	}
 	r := o.mustRun("--release-source", source, "cluster", "update")
-	if got := o.nodes["node1"].nodeUpdates(); len(got) != 1 || !strings.HasPrefix(got[0], "containerd 2.1.0") {
-		t.Errorf("node1 was updated to %q, want containerd only", got)
+	if got := o.nodes["node1"].nodeUpdates(); len(got) != 3 || !strings.HasPrefix(got[0], "containerd 2.1.0") || !strings.HasPrefix(got[1], "service ") {
+		t.Errorf("node1 was updated to %q, want containerd only, then the services", got)
 	}
 	wantContains(t, "cluster update's output", r.stdout,
 		"node1 runs the agent at 1.1.0 already\nnode1 runs the updater at 1.1.0 already\nUpdating containerd on node1 to 2.1.0\nUpdating the agent on node2 to 1.1.0\n")
@@ -210,6 +239,9 @@ func TestClusterUpdateRefusesAReleaseWithoutANodeComponent(t *testing.T) {
 				t.Fatal(err)
 			}
 			pin(t, o, "1.2.0")
+			// A mooctl of the release, so that what refuses it is its
+			// files.
+			o.version, o.previous = "1.2.0", "1.1.0"
 			r := o.run("--release-source", source, "cluster", "update")
 			if r.err == nil || !strings.Contains(r.err.Error(), "release 1.2.0 pins no "+missing) {
 				t.Errorf("cluster update of a release without %s: %v", missing, r.err)
@@ -254,6 +286,9 @@ func TestClusterUpdateRefusesANodeComponentWithOtherFiles(t *testing.T) {
 				t.Fatal(err)
 			}
 			pin(t, o, "1.2.0")
+			// A mooctl of the release, so that what refuses it is its
+			// files.
+			o.version, o.previous = "1.2.0", "1.1.0"
 			r := o.run("--release-source", source, "cluster", "update")
 			if r.err == nil || !strings.Contains(r.err.Error(), c.want) {
 				t.Errorf("cluster update of a release with %s: %v, want it refused saying %q", c.name, r.err, c.want)
@@ -272,10 +307,27 @@ func TestClusterUpdateRefusesAnAgentThatDoesntMatchItsChecksum(t *testing.T) {
 	source := updateCluster(t, o)
 	writeFile(t, filepath.Join(source, "1.1.0", "linux-arm64", "agent"), []byte("tampered"))
 	r := o.run("--release-source", source, "cluster", "update")
-	if r.err == nil || !strings.Contains(r.err.Error(), "node2") || !strings.Contains(r.err.Error(), "doesn't match its checksum") {
+	if r.err == nil || !strings.Contains(r.err.Error(), "linux-arm64/agent doesn't match its checksum") {
 		t.Errorf("cluster update with a tampered agent: %v", r.err)
 	}
-	if n := len(o.nodes["node2"].agentUpdates()); n != 0 {
-		t.Errorf("node2 was sent the tampered agent")
+	for name, n := range o.nodes {
+		if n.dialed() > 0 {
+			t.Errorf("cluster update reached %s with a tampered release", name)
+		}
+	}
+}
+
+func TestClusterUpdateRefusesAServiceImageThatDoesntMatchItsChecksumBeforeReachingANode(t *testing.T) {
+	o := newOperator(t, "op")
+	source := updateCluster(t, o)
+	writeFile(t, filepath.Join(source, "1.1.0", "linux-amd64", "proxy.tar"), []byte("image moostack.local/proxy:1.1.0\ntampered"))
+	r := o.run("--release-source", source, "cluster", "update")
+	if r.err == nil || !strings.Contains(r.err.Error(), "linux-amd64/proxy.tar doesn't match its checksum") {
+		t.Errorf("cluster update with a tampered image: %v", r.err)
+	}
+	for name, n := range o.nodes {
+		if n.dialed() > 0 {
+			t.Errorf("cluster update reached %s with a tampered release", name)
+		}
 	}
 }

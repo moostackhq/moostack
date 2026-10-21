@@ -22,6 +22,7 @@ import (
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/hostlayout"
+	"github.com/moostackhq/moostack/internal/rootsocket"
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
@@ -69,11 +70,15 @@ func Dial(c *sshclient.Client) (*Node, error) {
 
 // dialUnix is a gRPC connection to socket on the node over c.
 func dialUnix(c *sshclient.Client, socket string) (*grpc.ClientConn, error) {
-	return grpc.NewClient("passthrough:///"+socket,
+	return dial(socket, func(ctx context.Context) (net.Conn, error) { return c.DialUnix(ctx, socket) })
+}
+
+// dial is a connection to socket, called name, through d.
+func dial(name string, d func(ctx context.Context) (net.Conn, error)) (*grpc.ClientConn, error) {
+	return grpc.NewClient("passthrough:///"+name,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
-			return c.DialUnix(ctx, socket)
-		}))
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return d(ctx) }),
+		rootsocket.Reconnect)
 }
 
 // Close closes the connections.
@@ -176,6 +181,9 @@ type Lock struct {
 	Lease string
 	// Holder is who runs the operation, and Machine where.
 	Holder, Machine string
+	// Operation is the command the operation runs, such as "cluster
+	// update", empty if the node didn't say.
+	Operation string
 	// Since is when the node granted the lease, and Until when it runs
 	// out on the node unless renewed.
 	Since, Until time.Time
@@ -186,7 +194,7 @@ func lockOf(l *nodev1.Lock) *Lock {
 	if l == nil {
 		return nil
 	}
-	return &Lock{Lease: l.Lease, Holder: l.Holder, Machine: l.Machine, Since: l.Since.AsTime(), Until: l.Until.AsTime()}
+	return &Lock{Lease: l.Lease, Holder: l.Holder, Machine: l.Machine, Operation: l.Operation, Since: l.Since.AsTime(), Until: l.Until.AsTime()}
 }
 
 // AcquireLock asks the agent for the node's operation lock for lock's
@@ -194,7 +202,7 @@ func lockOf(l *nodev1.Lock) *Lock {
 // by lock's lease if granted, or by another.
 func (n *Node) AcquireLock(ctx context.Context, lock Lock, ttl time.Duration) (Lock, error) {
 	res, err := n.Agent.AcquireLock(ctx, &nodev1.AcquireLockRequest{
-		Lock: &nodev1.Lock{Lease: lock.Lease, Holder: lock.Holder, Machine: lock.Machine},
+		Lock: &nodev1.Lock{Lease: lock.Lease, Holder: lock.Holder, Machine: lock.Machine, Operation: lock.Operation},
 		Ttl:  durationpb.New(ttl),
 	})
 	if err != nil {
@@ -280,6 +288,19 @@ func ImportImage(ctx context.Context, agent nodev1.AgentClient, data []byte) ([]
 		return nil, err
 	}
 	return res.Images, nil
+}
+
+// ImportImage has the agent import the OCI image layout archive into
+// the node's containerd, and returns the names of the images imported.
+func (n *Node) ImportImage(ctx context.Context, archive []byte) ([]string, error) {
+	return ImportImage(ctx, n.Agent, archive)
+}
+
+// RunService has the agent run the cluster service svc from its image,
+// replacing the one of its name that runs.
+func (n *Node) RunService(ctx context.Context, svc *nodev1.Service) error {
+	_, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: svc})
+	return err
 }
 
 // UpdateAgent has the updater replace the agent with binary, the agent at

@@ -1,6 +1,8 @@
 package filelock_test
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -55,6 +57,28 @@ func TestLockCreatesTheFile(t *testing.T) {
 	unlock, err = filelock.Lock(path)
 	if err != nil {
 		t.Fatalf("relocking: %v", err)
+	}
+	unlock()
+}
+
+func TestLockContextGivesUpWhenItsContextEndsAndLeavesTheLockFree(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lock")
+	unlock, err := filelock.Lock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := filelock.LockContext(ctx, path); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("LockContext of a held lock: %v, want it to give up when its context ends", err)
+	}
+	unlock()
+	// The wait it gave up on doesn't keep the lock once it is free.
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	unlock, err = filelock.LockContext(ctx, path)
+	if err != nil {
+		t.Fatalf("LockContext once the lock is free: %v", err)
 	}
 	unlock()
 }

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/pem"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -32,8 +33,11 @@ type operator struct {
 	key       string
 	recipient secretstore.Recipient
 	terminal  *scriptedTerminal
-	// version is the release version mooctl was built for.
-	version string
+	// version is the release version mooctl was built for, and previous
+	// the release before it.
+	version, previous string
+	// client downloads releases from an https release source.
+	client *http.Client
 	// nodes, if set, answer for the nodes, by name, instead of SSH.
 	nodes map[string]*fakeNode
 
@@ -104,6 +108,9 @@ func writeFile(t *testing.T, path string, data []byte) {
 	}
 }
 
+// cache is the operator's cache of downloaded releases.
+func (o *operator) cache() string { return filepath.Join(o.home, ".cache", "mooctl", "releases") }
+
 // result is what a mooctl run printed and returned.
 type result struct {
 	stdout, stderr string
@@ -115,13 +122,16 @@ func (o *operator) run(args ...string) result {
 	o.t.Helper()
 	var stdout, stderr bytes.Buffer
 	env := cli.Env{
-		Version:   o.version,
-		Home:      o.home,
-		LocalUser: "alice",
-		Machine:   "laptop",
-		Stdout:    &stdout,
-		Stderr:    &stderr,
-		DialNode:  o.dialNode(),
+		Version:    o.version,
+		Previous:   o.previous,
+		Home:       o.home,
+		LocalUser:  "alice",
+		Machine:    "laptop",
+		Stdout:     &stdout,
+		Stderr:     &stderr,
+		DialNode:   o.dialNode(),
+		HTTPClient: o.client,
+		Cache:      o.cache(),
 		Terminal: func(func(int)) (terminal.Terminal, io.Closer) {
 			if o.terminal == nil {
 				return nil, nil

@@ -30,6 +30,7 @@ import (
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	servicev1 "github.com/moostackhq/moostack/api/service/v1"
 	"github.com/moostackhq/moostack/internal/abslot"
+	"github.com/moostackhq/moostack/internal/buildid"
 	"github.com/moostackhq/moostack/internal/gateway"
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/identity"
@@ -164,6 +165,11 @@ func Serve(ctx context.Context, cfg Config) error {
 	server := grpc.NewServer(gw.ServerOptions(servicev1.CallerKind_CALLER_KIND_OPERATOR)...)
 	agent := &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: client, shim: filepath.Join(cfg.ContainerdBinDir, hostlayout.ContainerdShim), runc: cfg.Runc, services: services, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile), removed: removed, updater: updater}
 	agent.containerdBinaries = &containerdBinaries{dir: cfg.ContainerdBinDir, files: cfg.ContainerdFiles, restart: cfg.RestartContainerd, wait: agent.waitContainerd}
+	// The builds are hashed from the start, in the background, so that
+	// status says them by the time an operation asks.
+	agent.build(map[string]string{"agent": executable()})
+	agent.build(agent.containerdFiles())
+	agent.build(map[string]string{"runc": agent.runc})
 	nodev1.RegisterAgentServer(server, agent)
 	peers := grpc.NewServer(grpc.Creds(newPeerCredentials(id, removed)))
 	healthpb.RegisterHealthServer(peers, health.NewServer())
@@ -223,13 +229,15 @@ type agentServer struct {
 	removed            *removedIdentities
 	updater            *abslot.Component
 	containerdBinaries *containerdBinaries
+	// builds tells the builds of the node components' files.
+	builds buildid.Cache
 }
 
 func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nodev1.StatusResponse, error) {
 	res := &nodev1.StatusResponse{
 		Mode: s.mode,
 		Components: []*nodev1.Component{
-			{Name: "agent", Version: s.version, Health: nodev1.Health_HEALTH_HEALTHY},
+			{Name: "agent", Version: s.version, Build: s.build(map[string]string{"agent": executable()}), Health: nodev1.Health_HEALTH_HEALTHY},
 			s.containerdStatus(ctx),
 			s.runcStatus(ctx),
 		},
@@ -337,7 +345,7 @@ func syncDir(path string) error {
 func (s *agentServer) containerdStatus(ctx context.Context) *nodev1.Component {
 	ctx, cancel := context.WithTimeout(ctx, containerdTimeout)
 	defer cancel()
-	c := &nodev1.Component{Name: "containerd", Health: nodev1.Health_HEALTH_UNHEALTHY}
+	c := &nodev1.Component{Name: "containerd", Build: s.build(s.containerdFiles()), Health: nodev1.Health_HEALTH_UNHEALTHY}
 	v, err := s.containerd.Version(ctx)
 	if err != nil {
 		c.Problem = err.Error()
@@ -371,6 +379,32 @@ func (s *agentServer) shimVersion(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("%s -v doesn't say its version", s.shim)
 }
 
+// build is the build of the files at the paths, by the names a release
+// gives them, empty until they are hashed, which status doesn't wait
+// for, or if they can't be read.
+func (s *agentServer) build(paths map[string]string) string {
+	return s.builds.Peek(paths)
+}
+
+// containerdFiles are containerd's files, by name, at their paths.
+func (s *agentServer) containerdFiles() map[string]string {
+	files := map[string]string{}
+	for _, f := range s.containerdBinaries.files {
+		files[f] = filepath.Join(s.containerdBinaries.dir, f)
+	}
+	return files
+}
+
+// executable is the file this program runs from, empty if it can't
+// tell.
+func executable() string {
+	path, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return path
+}
+
 // runcTimeout bounds asking runc for its version.
 const runcTimeout = 2 * time.Second
 
@@ -378,7 +412,7 @@ const runcTimeout = 2 * time.Second
 func (s *agentServer) runcStatus(ctx context.Context) *nodev1.Component {
 	ctx, cancel := context.WithTimeout(ctx, runcTimeout)
 	defer cancel()
-	c := &nodev1.Component{Name: "runc", Health: nodev1.Health_HEALTH_UNHEALTHY}
+	c := &nodev1.Component{Name: "runc", Build: s.build(map[string]string{"runc": s.runc}), Health: nodev1.Health_HEALTH_UNHEALTHY}
 	out, err := exec.CommandContext(ctx, s.runc, "--version").Output()
 	if err != nil {
 		c.Problem = fmt.Sprintf("running %s --version: %v", s.runc, err)
@@ -421,10 +455,18 @@ func (s *agentServer) ImportImage(stream nodev1.Agent_ImportImageServer) error {
 	return stream.SendAndClose(&nodev1.ImportImageResponse{Images: images})
 }
 
+// serviceRunTimeout bounds running a cluster service, which goes on once
+// its call ends: unpacking its image and starting its container.
+const serviceRunTimeout = 5 * time.Minute
+
 func (s *agentServer) RunService(ctx context.Context, req *nodev1.RunServiceRequest) (*nodev1.RunServiceResponse, error) {
 	if req.Service == nil {
 		return nil, status.Error(codes.InvalidArgument, "no service")
 	}
+	// The run goes on if the call ends, as when mooctl is stopped, since
+	// it may have removed the service's old container already.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serviceRunTimeout)
+	defer cancel()
 	if err := s.services.Run(ctx, req.Service); err != nil {
 		if _, ok := status.FromError(err); ok {
 			return nil, err
