@@ -36,12 +36,16 @@ func TestCheckLockCancelsAnOperationWhoseLeaseRanOutWhileTheMachineSlept(t *test
 	l.expiresWall = l.expiresWall.Add(-time.Minute)
 	c := &Cluster{conns: []*namedConn{{name: "node1", lease: l}}}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
+	c.held, c.endHeld = context.WithCancelCause(context.Background())
 	err := c.CheckLock()
 	if !errors.Is(err, ErrLockLost) {
 		t.Errorf("CheckLock says %v, want ErrLockLost", err)
 	}
 	if cause := context.Cause(c.ctx); !errors.Is(cause, ErrLockLost) {
 		t.Errorf("the operation's context ended with %v, want ErrLockLost", cause)
+	}
+	if cause := context.Cause(c.Held()); !errors.Is(cause, ErrLockLost) {
+		t.Errorf("the operation's held context ended with %v, want ErrLockLost", cause)
 	}
 }
 
@@ -81,6 +85,7 @@ func TestUpdateSendsNoUpdateOnceTheLeaseRanOutWhileTheMachineSlept(t *testing.T)
 	node := &updateRecorder{}
 	c := &Cluster{conns: []*namedConn{{name: "node1", conn: node, lease: l}}, ttl: time.Minute}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
+	c.held, c.endHeld = context.WithCancelCause(context.Background())
 	releaseOf := func(string) (NodeRelease, error) {
 		return NodeRelease{Components: map[string]Component{"agent": {Version: "2.0.0", Files: map[string][]byte{"agent": []byte("agent")}}}}, nil
 	}
@@ -134,6 +139,7 @@ func TestUpdateTakesNoNextStepOnceTheLeaseRanOutWhileTheMachineSlept(t *testing.
 	n := &namedConn{name: "node1", conn: node, lease: l}
 	c := &Cluster{conns: []*namedConn{n}, ttl: time.Minute, lease: nodeclient.Lock{Lease: "ours"}}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
+	c.held, c.endHeld = context.WithCancelCause(context.Background())
 	node.onUpdater = func() {
 		c.mu.Lock()
 		n.lease.expiresWall = time.Now().Add(-time.Second)
@@ -196,6 +202,7 @@ func TestTheRenewalAfterALateAgentUpdateHasItsOwnTime(t *testing.T) {
 	node := &lateAgent{took: 450 * time.Millisecond, restarting: 300 * time.Millisecond}
 	c := &Cluster{conns: []*namedConn{{name: "node1", conn: node, lease: l}}, ttl: time.Minute, lease: nodeclient.Lock{Lease: "ours"}}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
+	c.held, c.endHeld = context.WithCancelCause(context.Background())
 	releaseOf := func(string) (NodeRelease, error) {
 		return NodeRelease{Components: map[string]Component{
 			"agent":      {Version: "2.0.0", Files: map[string][]byte{"agent": []byte("agent")}},
@@ -246,6 +253,7 @@ func TestUpdateRunsNoNextServiceOnceTheLeaseRanOutWhileTheMachineSlept(t *testin
 	n := &namedConn{name: "node1", conn: node, lease: l}
 	c := &Cluster{conns: []*namedConn{n}, ttl: time.Minute, lease: nodeclient.Lock{Lease: "ours"}, serviceTimeout: time.Second, reachTimeout: time.Second}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
+	c.held, c.endHeld = context.WithCancelCause(context.Background())
 	node.onRun = func() {
 		c.mu.Lock()
 		n.lease.expiresWall = time.Now().Add(-time.Second)
@@ -276,6 +284,7 @@ func TestUpdateRunsNoServiceOnceTheLeaseRanOutWhileItsImageImported(t *testing.T
 	n := &namedConn{name: "node1", conn: node, lease: l}
 	c := &Cluster{conns: []*namedConn{n}, ttl: time.Minute, lease: nodeclient.Lock{Lease: "ours"}, serviceTimeout: time.Second, reachTimeout: time.Second}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
+	c.held, c.endHeld = context.WithCancelCause(context.Background())
 	node.onImport = func() {
 		c.mu.Lock()
 		n.lease.expiresWall = time.Now().Add(-time.Second)
@@ -339,6 +348,7 @@ func TestTheRenewalAfterAnAgentUpdateEndsWithTheOperation(t *testing.T) {
 			node := &stoppedAgent{updated: make(chan struct{})}
 			cl := &Cluster{conns: []*namedConn{{name: "node1", conn: node, lease: l}}, ttl: time.Minute, lease: nodeclient.Lock{Lease: "ours"}}
 			cl.ctx, cl.cancel = context.WithCancelCause(context.Background())
+			cl.held, cl.endHeld = context.WithCancelCause(context.Background())
 			go func() {
 				<-node.updated
 				time.Sleep(100 * time.Millisecond)

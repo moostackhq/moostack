@@ -338,6 +338,19 @@ func TestFreeNodeNameIsTheFirstFreeNodeN(t *testing.T) {
 	}
 }
 
+func TestFreeNodeNameSkipsTheNamesGiven(t *testing.T) {
+	d := newCluster(t)
+	if err := d.AddNode(node(t, "node1"), 2); err != nil {
+		t.Fatal(err)
+	}
+	if name, err := d.FreeNodeName("node2", "node4", "web"); err != nil || name != "node3" {
+		t.Errorf("FreeNodeName with node1 taken, skipping node2 and node4: %q, %v, want node3", name, err)
+	}
+	if name, err := d.FreeNodeName("node2", "node3"); err != nil || name != "node4" {
+		t.Errorf("FreeNodeName with node1 taken, skipping node2 and node3: %q, %v, want node4", name, err)
+	}
+}
+
 func TestCheckNewNodeRefusesWhatAddNodeWould(t *testing.T) {
 	d := newCluster(t)
 	if err := d.CheckNewNode(node(t, "web-1")); err != nil {

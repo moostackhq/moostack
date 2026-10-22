@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
@@ -31,6 +32,14 @@ type fakeNode struct {
 	// dialing, if set, is called when mooctl starts to reach the node,
 	// and mooctl reaches it once dialing returns.
 	dialing func(ctx context.Context)
+	// removing, if set, is called as each push of the removed identities
+	// starts, with the push's count, from 1, before the call finds
+	// whether its context has ended, as the node API's would; pushed is
+	// called once a push that found its context alive is done, with its
+	// context and count, before the call returns.
+	removing func(push int)
+	pushed   func(ctx context.Context, push int)
+	pushes   atomic.Int32
 
 	mu sync.Mutex
 	// recorded are the generations recorded on the node, in order.
@@ -101,7 +110,17 @@ func (n *fakeNode) dialed() int {
 	return n.dials
 }
 
-func (n *fakeNode) RemoveIdentities(_ context.Context, identities []string, lease string) error {
+func (n *fakeNode) RemoveIdentities(ctx context.Context, identities []string, lease string) error {
+	push := int(n.pushes.Add(1))
+	if n.removing != nil {
+		n.removing(push)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if n.pushed != nil {
+		defer n.pushed(ctx, push)
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.lock == nil || n.lock.Lease != lease {
@@ -216,7 +235,10 @@ func (n *fakeNode) Status(context.Context) nodeclient.Status {
 	return s
 }
 
-func (n *fakeNode) RecordGeneration(_ context.Context, g int64, _ []string, lease string) error {
+func (n *fakeNode) RecordGeneration(ctx context.Context, g int64, _ []string, lease string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.lock == nil || n.lock.Lease != lease {

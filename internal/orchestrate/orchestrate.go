@@ -206,6 +206,11 @@ type Cluster struct {
 	// closed.
 	ctx    context.Context
 	cancel context.CancelCauseFunc
+	// held ends as ctx does, but not with the context the preflight was
+	// given: the lease is kept in it, and new nodes locked, so that what
+	// ends the caller's work, such as a signal, doesn't end the lease.
+	held    context.Context
+	endHeld context.CancelCauseFunc
 	// stop ends keepLease, which closes kept once it has.
 	stop, kept chan struct{}
 	mu         sync.Mutex
@@ -314,6 +319,7 @@ func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, h
 		return fail(err)
 	}
 	c.ctx, c.cancel = context.WithCancelCause(ctx)
+	c.held, c.endHeld = context.WithCancelCause(context.WithoutCancel(ctx))
 	c.stop, c.kept = make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(c.kept)
@@ -394,6 +400,14 @@ func refresh(ctx context.Context, reached []Reached, timeout time.Duration) {
 // does once the preflight has passed runs in it.
 func (c *Cluster) Context() context.Context { return c.ctx }
 
+// Held is the operation's context apart from what ends the context the
+// preflight was given: it ends, with a cause that wraps ErrLockLost, when
+// the operation can no longer be sure it holds the operation lock, or
+// when the cluster is closed, but a signal that ends the caller's work
+// doesn't end it. Telling the nodes of a change already made runs in it,
+// so that they are told once the change is made.
+func (c *Cluster) Held() context.Context { return c.held }
+
 // CheckLock fails, and ends the operation's context, if the operation
 // can't be sure it still holds the operation lock. keepLease calls it
 // every twentieth of a lease time, but its timer runs on the monotonic
@@ -403,6 +417,7 @@ func (c *Cluster) Context() context.Context { return c.ctx }
 // as an install.
 func (c *Cluster) CheckLock() error {
 	if err := c.lost(time.Now().Add(c.ttl / 10)); err != nil {
+		c.endHeld(err)
 		c.cancel(err)
 		return err
 	}
@@ -519,7 +534,7 @@ func (c *Cluster) Next(generation int64) int64 { return max(generation, c.Latest
 // removed identities from its install, not from Add.
 func (c *Cluster) Add(name string, conn Node) {
 	n := &namedConn{name: name, conn: conn}
-	sent, err := c.take(c.ctx, conn, c.reachTimeout)
+	sent, err := c.take(c.held, conn, c.reachTimeout)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err != nil {
@@ -619,6 +634,7 @@ func (c *Cluster) Record(ctx context.Context, generation int64) error {
 func (c *Cluster) Close() error {
 	// Cancelling first ends a renewal in flight, which keepLease waits
 	// for.
+	c.endHeld(context.Canceled)
 	c.cancel(context.Canceled)
 	close(c.stop)
 	<-c.kept

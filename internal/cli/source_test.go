@@ -482,8 +482,8 @@ func TestClusterStatusMarksDevelopmentBuilds(t *testing.T) {
 	o.nodes["node2"].runsServices(devVersion, "dns")
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	wantContains(t, "cluster status", r.stdout,
-		"node1  yes        direct  agent       "+devVersion+" (development build)  1.1.0   healthy",
-		"node2  yes        direct  dns         "+devVersion+" (development build)  1.1.0   healthy")
+		"\nnode1  direct\n  agent       "+devVersion+" (development build)  1.1.0   healthy\n",
+		"\nnode2  direct\n  agent       1.0.0                                   1.1.0   healthy\n    dns       "+devVersion+" (development build)  1.1.0   healthy\n")
 	if n := strings.Count(r.stdout, "(development build)"); n != 2 {
 		t.Errorf("cluster status marks %d development builds, want 2:\n%s", n, r.stdout)
 	}

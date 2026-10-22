@@ -3,6 +3,7 @@ package cli_test
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
@@ -72,19 +73,21 @@ Update: refused, so cluster update won't run:
 node1: its dns service runs release 0.9.0, and release 1.0.0 updates nodes on 1.0.0 only
 Pin the release the nodes run, or the one after it, and run the mooctl of that release.
 
-NODE   REACHABLE  MODE    COMPONENT   RUNNING  PINNED  HEALTH
-node1  yes        direct  agent       1.0.0    1.0.0   healthy
-node1  yes        direct  updater     1.0.0    1.0.0   healthy
-node1  yes        direct  containerd  2.0.0    2.0.0   healthy
-node1  yes        direct  registry    1.0.0    1.0.0   healthy
-node1  yes        direct  dns         0.9.0    1.0.0   unhealthy
-node1  yes        direct  extra       0.1.0    -       healthy
-node2  yes        -       agent       -        1.0.0   unhealthy
-node2  yes        -       updater     1.0.0    1.0.0   healthy
-node2  yes        -       containerd  -        2.0.0   unknown
-node2  yes        -       registry    -        1.0.0   unknown
-node2  yes        -       dns         -        1.0.0   unknown
-node3  no         -       -           -        -       -
+NODE          RUNNING  PINNED  HEALTH
+node1  direct
+  agent       1.0.0    1.0.0   healthy
+    registry  1.0.0    1.0.0   healthy
+    dns       0.9.0    1.0.0   unhealthy
+    extra     0.1.0    -       healthy
+  updater     1.0.0    1.0.0   healthy
+  containerd  2.0.0    2.0.0   healthy
+node2  mode unknown
+  agent       -        1.0.0   unhealthy
+    registry  -        1.0.0   unknown
+    dns       -        1.0.0   unknown
+  updater     1.0.0    1.0.0   healthy
+  containerd  -        2.0.0   unknown
+node3  unreachable
 
 node1: dns: the service doesn't answer: connection refused
 node2: agent: the agent doesn't answer: connection refused
@@ -116,4 +119,98 @@ func TestClusterStatusJSONListsTheServicesApart(t *testing.T) {
           "health": "unknown"
         }
       ]`)
+}
+
+func TestClusterStatusTreeKeepsItsShapeWhateverTheNodesReport(t *testing.T) {
+	o := newOperator(t, "op")
+	source := statusCluster(t, o, "node1", "node2")
+	pinServices(t, source)
+	o.nodes = map[string]*fakeNode{
+		// The services' problems come in the tree's order, before the
+		// updater's.
+		"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_CONTROL_PLANE, Generation: 1, Components: []*nodev1.Component{
+			component("agent", "1.0.0", healthy, ""),
+			component("updater", "1.0.0", unhealthy, "it is stuck"),
+			component("containerd", "2.0.0", healthy, ""),
+		}, Services: []*nodev1.Component{
+			component("registry", "1.0.0", healthy, ""),
+			component("dns", "1.0.0", unhealthy, "the service doesn't answer"),
+		}}},
+		// The widest version, wider in bytes than in characters, and one
+		// that would add a line of its own.
+		"node2": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: upToDate(), Services: []*nodev1.Component{
+			component("registry", "1.0.0-ünïcödé-ünïcödé-ünïcödé", healthy, ""),
+			component("dns", "1.0.0\nnode9  unreachable", healthy, ""),
+		}}},
+	}
+	r := o.mustRun("--release-source", source, "cluster", "status")
+	_, tree, _ := strings.Cut(r.stdout, "\nNODE")
+	want := `          RUNNING                        PINNED  HEALTH
+node1  control plane
+  agent       1.0.0                          1.0.0   healthy
+    registry  1.0.0                          1.0.0   healthy
+    dns       1.0.0                          1.0.0   unhealthy
+  updater     1.0.0                          1.0.0   unhealthy
+  containerd  2.0.0                          2.0.0   healthy
+node2  direct
+  agent       1.0.0                          1.0.0   healthy
+    registry  1.0.0-ünïcödé-ünïcödé-ünïcödé  1.0.0   healthy
+    dns       "1.0.0\nnode9  unreachable"    1.0.0   healthy
+  updater     1.0.0                          1.0.0   healthy
+  containerd  2.0.0                          2.0.0   healthy
+
+node1: dns: the service doesn't answer
+node1: updater: it is stuck
+`
+	if tree != want {
+		t.Errorf("cluster status printed the tree\nNODE%s\nwant\nNODE%s", tree, want)
+	}
+}
+
+func TestClusterStatusPutsServicesWithoutAnAgentAtTheComponentsLevel(t *testing.T) {
+	o := newOperator(t, "op")
+	statusCluster(t, o, "node1")
+	o.nodes = map[string]*fakeNode{"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: []*nodev1.Component{
+		component("updater", "1.0.0", healthy, ""),
+	}, Services: []*nodev1.Component{
+		component("registry", "1.0.0", healthy, ""),
+	}}}}
+	// A release source that is down, so that nothing pins the agent.
+	s := serveSource(t, t.TempDir())
+	o.client = s.Client()
+	s.Close()
+	r := o.mustRun("--release-source", s.URL, "cluster", "status")
+	wantContains(t, "cluster status", r.stdout, `
+NODE        RUNNING  PINNED  HEALTH
+node1  direct
+  updater   1.0.0    -       healthy
+  registry  1.0.0    -       healthy
+`)
+}
+
+func TestClusterStatusQuotesWhatNodesReportInItsProblems(t *testing.T) {
+	o := newOperator(t, "op")
+	source := statusCluster(t, o, "node1", "node2", "node3")
+	pinServices(t, source)
+	o.nodes = map[string]*fakeNode{
+		"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: upToDate(), Services: []*nodev1.Component{
+			component("registry", "1.0.0", healthy, ""),
+			component("dns", "1.0.0", healthy, ""),
+			component("extra\nnode9  unreachable", "0.1.0", unhealthy, "stuck\x1b[2A"),
+		}}},
+		"node2": generationUnknown("the file is bad\nnode9: connecting to root@node9.invalid: connection refused"),
+		"node3": {err: errors.New("dial tcp: banner\r\nnode9: forged")},
+	}
+	r := o.mustRun("--release-source", source, "cluster", "status")
+	_, problems, _ := strings.Cut(r.stdout, "\n\nnode1: ")
+	want := `"extra\nnode9  unreachable": "stuck\x1b[2A"
+node2: "it can't tell the generation it has applied: the file is bad\nnode9: connecting to root@node9.invalid: connection refused"
+node3: "dial tcp: banner\r\nnode9: forged"
+`
+	if problems != want {
+		t.Errorf("cluster status printed the problems\nnode1: %s\nwant\nnode1: %s", problems, want)
+	}
+	if strings.Contains(r.stdout, "\nnode9") {
+		t.Errorf("a node's report added a line to cluster status:\n%s", r.stdout)
+	}
 }

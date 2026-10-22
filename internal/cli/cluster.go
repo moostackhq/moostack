@@ -6,14 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 
 	"github.com/urfave/cli/v3"
 
@@ -360,43 +361,111 @@ func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
 // printStatus prints the cluster status view as a table, with the
 // problems it found below.
 func printStatus(env Env, view statusView) error {
-	fmt.Fprintf(env.Stdout, "Cluster %s on release %s\n", view.Cluster, view.Release)
-	fmt.Fprintf(env.Stdout, "Operation lock: %s\n", describeLocks(view.Lock, len(view.Nodes), view.answered))
+	var b strings.Builder
+	fmt.Fprintf(&b, "Cluster %s on release %s\n", view.Cluster, view.Release)
+	fmt.Fprintf(&b, "Operation lock: %s\n", describeLocks(view.Lock, len(view.Nodes), view.answered))
 	update := updateLines[view.Update]
 	if view.Refusal != "" {
 		update += "\n" + view.Refusal
 	}
-	fmt.Fprintf(env.Stdout, "Update: %s\n\n", update)
-	w := tabwriter.NewWriter(env.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "NODE\tREACHABLE\tMODE\tCOMPONENT\tRUNNING\tPINNED\tHEALTH")
-	var problems []string
+	fmt.Fprintf(&b, "Update: %s\n\n", update)
+	var t statusTree
 	for _, n := range view.Nodes {
 		if !n.Reachable {
-			fmt.Fprintf(w, "%s\tno\t-\t-\t-\t-\t-\n", n.Name)
-			problems = append(problems, fmt.Sprintf("%s: %s", n.Name, n.Error))
+			t.node(n.Name, "unreachable")
+			t.problem(n.Name + ": " + nodeclient.Printable(n.Error))
 			continue
 		}
-		for _, c := range append(slices.Clone(n.Components), n.Services...) {
-			running := dash(c.Running)
-			if c.Development {
-				running += " (development build)"
+		mode := n.Mode
+		if mode == "" {
+			mode = "mode unknown"
+		}
+		t.node(n.Name, mode)
+		// The cluster services sit under the agent that runs them. A node
+		// whose agent isn't listed has them after its node components, at
+		// their level, so that they read as no other component's.
+		services := n.Services
+		for _, c := range n.Components {
+			t.component(n.Name, 1, c)
+			if c.Name == "agent" {
+				for _, s := range services {
+					t.component(n.Name, 2, s)
+				}
+				services = nil
 			}
-			fmt.Fprintf(w, "%s\tyes\t%s\t%s\t%s\t%s\t%s\n", n.Name, dash(n.Mode), c.Name, running, dash(c.Pinned), c.Health)
-			if c.Problem != "" {
-				problems = append(problems, fmt.Sprintf("%s: %s: %s", n.Name, c.Name, c.Problem))
-			}
+		}
+		for _, s := range services {
+			t.component(n.Name, 1, s)
 		}
 		if n.GenerationProblem != "" {
-			problems = append(problems, fmt.Sprintf("%s: %s", n.Name, n.GenerationProblem))
+			t.problem(n.Name + ": " + nodeclient.Printable(n.GenerationProblem))
 		}
 	}
-	if err := w.Flush(); err != nil {
-		return err
+	t.print(&b)
+	if len(t.problems) > 0 {
+		fmt.Fprintf(&b, "\n%s\n", strings.Join(t.problems, "\n"))
 	}
-	if len(problems) > 0 {
-		fmt.Fprintf(env.Stdout, "\n%s\n", strings.Join(problems, "\n"))
+	_, err := io.WriteString(env.Stdout, b.String())
+	return err
+}
+
+// statusTree is cluster status's tree: a line for each node, with its
+// node components indented below it and its cluster services below the
+// agent, their versions and health in columns under one header, and the
+// problems it found, in the tree's order.
+type statusTree struct {
+	// lines are the tree's lines, each its cells: a node's line has one,
+	// a component's four.
+	lines    [][]string
+	problems []string
+}
+
+// node adds the line of the node called name, a name of the cluster
+// directory, in state: its mode, "mode unknown" or "unreachable".
+func (t *statusTree) node(name, state string) {
+	t.lines = append(t.lines, []string{name + "  " + state})
+}
+
+// component adds the line of c, a component of node, indented depth
+// levels below it, and its problem, if it has one.
+func (t *statusTree) component(node string, depth int, c componentStatusView) {
+	running := nodeclient.Printable(dash(c.Running))
+	if c.Development {
+		running += " (development build)"
 	}
-	return nil
+	t.lines = append(t.lines, []string{strings.Repeat("  ", depth) + nodeclient.Printable(c.Name), running, nodeclient.Printable(dash(c.Pinned)), nodeclient.Printable(c.Health)})
+	if c.Problem != "" {
+		t.problem(fmt.Sprintf("%s: %s: %s", node, nodeclient.Printable(c.Name), nodeclient.Printable(c.Problem)))
+	}
+}
+
+// problem adds p to the problems listed below the tree.
+func (t *statusTree) problem(p string) { t.problems = append(t.problems, p) }
+
+// print writes the tree to w, under its header, with each column of the
+// components' lines as wide as its widest cell, in characters, two spaces
+// apart. A node's line takes no part in the columns.
+func (t *statusTree) print(w io.Writer) {
+	lines := append([][]string{{"NODE", "RUNNING", "PINNED", "HEALTH"}}, t.lines...)
+	widths := make([]int, 4)
+	for _, l := range lines {
+		if len(l) == 1 {
+			continue
+		}
+		for i, cell := range l {
+			widths[i] = max(widths[i], utf8.RuneCountInString(cell))
+		}
+	}
+	for _, l := range lines {
+		var b strings.Builder
+		for i, cell := range l {
+			b.WriteString(cell)
+			if i < len(l)-1 {
+				b.WriteString(strings.Repeat(" ", widths[i]-utf8.RuneCountInString(cell)+2))
+			}
+		}
+		fmt.Fprintln(w, b.String())
+	}
 }
 
 // statusView is what cluster status shows, as a table or as JSON.
@@ -512,16 +581,7 @@ func clusterUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 // a shell, so that it can be pasted. A release source with a user or a
 // password in it is left out, so as not to show them.
 func rerun(cmd *cli.Command) string {
-	args := []string{"mooctl"}
-	if dir := cmd.String("dir"); dir != "." {
-		args = append(args, "-C", dir)
-	}
-	if source := cmd.String("release-source"); source != "" {
-		if u, err := url.Parse(source); err != nil || u.User == nil {
-			args = append(args, "--release-source", source)
-		}
-	}
-	args = append(args, "cluster", "update")
+	args := append(mooctlIn(cmd), "cluster", "update")
 	if cmd.Bool("force") {
 		args = append(args, "--force")
 	}
@@ -532,6 +592,22 @@ func rerun(cmd *cli.Command) string {
 		args[i] = shellQuote(arg)
 	}
 	return strings.Join(args, " ")
+}
+
+// mooctlIn is mooctl, run in cmd's cluster directory, from its release
+// source, which it leaves out if it holds a user or a password, so as not
+// to show them.
+func mooctlIn(cmd *cli.Command) []string {
+	args := []string{"mooctl"}
+	if dir := cmd.String("dir"); dir != "." {
+		args = append(args, "-C", dir)
+	}
+	if source := cmd.String("release-source"); source != "" {
+		if u, err := url.Parse(source); err != nil || u.User == nil {
+			args = append(args, "--release-source", source)
+		}
+	}
+	return args
 }
 
 // shellQuote is arg as a shell, POSIX or zsh, reads it back: as it is,

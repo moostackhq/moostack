@@ -99,14 +99,16 @@ func TestClusterStatusShowsEachPinnedComponentOfEachNode(t *testing.T) {
 Operation lock: free on the nodes whose agent answered
 Update: stopped partway; run mooctl cluster update again to finish it
 
-NODE   REACHABLE  MODE    COMPONENT   RUNNING  PINNED  HEALTH
-node1  yes        direct  agent       1.0.0    1.0.0   healthy
-node1  yes        direct  updater     1.0.0    1.0.0   healthy
-node1  yes        direct  containerd  1.9.0    2.0.0   healthy
-node2  yes        -       agent       -        1.0.0   unhealthy
-node2  yes        -       updater     1.0.0    1.0.0   healthy
-node2  yes        -       containerd  -        2.0.0   unknown
-node3  no         -       -           -        -       -
+NODE          RUNNING  PINNED  HEALTH
+node1  direct
+  agent       1.0.0    1.0.0   healthy
+  updater     1.0.0    1.0.0   healthy
+  containerd  1.9.0    2.0.0   healthy
+node2  mode unknown
+  agent       -        1.0.0   unhealthy
+  updater     1.0.0    1.0.0   healthy
+  containerd  -        2.0.0   unknown
+node3  unreachable
 
 node2: agent: the agent doesn't answer: connection refused
 node3: dial tcp: no route to host
@@ -130,11 +132,12 @@ func TestClusterStatusShowsAComponentTheReleaseDoesntPin(t *testing.T) {
 Operation lock: free
 Update: none needed
 
-NODE   REACHABLE  MODE    COMPONENT   RUNNING  PINNED  HEALTH
-node1  yes        direct  agent       1.0.0    1.0.0   healthy
-node1  yes        direct  updater     1.0.0    1.0.0   healthy
-node1  yes        direct  containerd  2.0.0    2.0.0   healthy
-node1  yes        direct  extra       0.1.0    -       unhealthy
+NODE          RUNNING  PINNED  HEALTH
+node1  direct
+  agent       1.0.0    1.0.0   healthy
+  updater     1.0.0    1.0.0   healthy
+  containerd  2.0.0    2.0.0   healthy
+  extra       0.1.0    -       unhealthy
 
 node1: extra: it is broken
 `

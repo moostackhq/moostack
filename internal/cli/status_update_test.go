@@ -112,7 +112,7 @@ func TestClusterStatusShowsTheNodesWhenItCantOpenThePinnedRelease(t *testing.T) 
 	o.client = s.Client()
 	s.Close()
 	r := o.mustRun("--release-source", s.URL, "cluster", "status")
-	wantContains(t, "cluster status", r.stdout, "Cluster prod on release 1.1.0\n", "Update: unknown, as mooctl can't open the pinned release\n", "node3  yes")
+	wantContains(t, "cluster status", r.stdout, "Cluster prod on release 1.1.0\n", "Update: unknown, as mooctl can't open the pinned release\n", "\nnode3  direct\n  agent  1.0.0    -       healthy\n")
 	wantContains(t, "cluster status's warnings", r.stderr, "can't open release 1.1.0", "showing what the nodes run without it")
 	r = o.mustRun("--release-source", s.URL, "cluster", "status", "--json")
 	var view struct{ Update string }

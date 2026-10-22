@@ -10,9 +10,11 @@ import (
 	"maps"
 	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -78,8 +80,42 @@ func dial(name string, d func(ctx context.Context) (net.Conn, error)) (*grpc.Cli
 	return grpc.NewClient("passthrough:///"+name,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return d(ctx) }),
+		grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+			return quotedStatus(invoker(ctx, method, req, reply, cc, opts...))
+		}),
+		grpc.WithChainStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			// A stream that fails to open fails here, before the node says
+			// anything; what it answers comes with the stream's messages.
+			s, err := streamer(ctx, desc, cc, method, opts...)
+			if err != nil {
+				return nil, err
+			}
+			return quotedStream{s}, nil
+		}),
 		rootsocket.Reconnect)
 }
+
+// quotedStatus is err, with the message of the status a node answered
+// with made Printable, since mooctl repeats it to the operator.
+func quotedStatus(err error) error {
+	if err == nil {
+		return nil
+	}
+	s, ok := status.FromError(err)
+	if !ok || Printable(s.Message()) == s.Message() {
+		return err
+	}
+	p := s.Proto()
+	p.Message = Printable(p.Message)
+	return status.ErrorProto(p)
+}
+
+// quotedStream is a stream whose errors are made Printable.
+type quotedStream struct{ grpc.ClientStream }
+
+func (s quotedStream) SendMsg(m any) error { return quotedStatus(s.ClientStream.SendMsg(m)) }
+
+func (s quotedStream) RecvMsg(m any) error { return quotedStatus(s.ClientStream.RecvMsg(m)) }
 
 // Close closes the connections.
 func (n *Node) Close() error {
@@ -151,6 +187,26 @@ func (n *Node) Status(ctx context.Context) Status {
 		s.Components = append(s.Components, updater.Updater)
 		s.UpdaterMode = updater.Mode
 	}
+	s.GenerationUnknown = Printable(s.GenerationUnknown)
+	for i, name := range s.Nodes {
+		s.Nodes[i] = Printable(name)
+	}
+	for _, c := range append(slices.Clone(s.Components), s.Services...) {
+		c.Name, c.Version, c.Build, c.Problem = Printable(c.Name), Printable(c.Version), Printable(c.Build), Printable(c.Problem)
+	}
+	return s
+}
+
+// Printable is s, a text that a node reported, quoted if it holds a rune
+// that isn't printable, such as a line break or an escape, or isn't
+// valid UTF-8, whose stray bytes some terminals take as controls, so that
+// whatever repeats it to the operator shows it as one piece of text,
+// which can't add lines of its own or move the terminal's cursor. A text
+// that is printable is as it was.
+func Printable(s string) string {
+	if !utf8.ValidString(s) || strings.ContainsFunc(s, func(r rune) bool { return !strconv.IsPrint(r) }) {
+		return strconv.Quote(s)
+	}
 	return s
 }
 
@@ -198,7 +254,7 @@ func lockOf(l *nodev1.Lock) *Lock {
 	if l == nil {
 		return nil
 	}
-	return &Lock{Lease: l.Lease, Holder: l.Holder, Machine: l.Machine, Operation: l.Operation, Since: l.Since.AsTime(), Until: l.Until.AsTime()}
+	return &Lock{Lease: l.Lease, Holder: Printable(l.Holder), Machine: Printable(l.Machine), Operation: Printable(l.Operation), Since: l.Since.AsTime(), Until: l.Until.AsTime()}
 }
 
 // AcquireLock asks the agent for the node's operation lock for lock's
@@ -291,7 +347,11 @@ func ImportImage(ctx context.Context, agent nodev1.AgentClient, data []byte) ([]
 	if err != nil {
 		return nil, err
 	}
-	return res.Images, nil
+	images := make([]string, len(res.Images))
+	for i, image := range res.Images {
+		images[i] = Printable(image)
+	}
+	return images, nil
 }
 
 // ImportImage has the agent import the OCI image layout archive into

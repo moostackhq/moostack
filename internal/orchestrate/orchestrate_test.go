@@ -165,8 +165,13 @@ func (n *node) RecordGeneration(ctx context.Context, g int64, nodes []string, le
 	return nil
 }
 
-// hang waits until ctx ends and returns true if the node doesn't answer.
+// hang waits until ctx ends and returns true if the node doesn't answer,
+// or if ctx has ended already, as a call on an ended context fails at
+// once.
 func (n *node) hang(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
 	n.mu.Lock()
 	hangs := n.hangs || n.hanging
 	n.mu.Unlock()

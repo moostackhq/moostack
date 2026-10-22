@@ -61,6 +61,25 @@ func TestNodeAddWithAJoinTokenRefusesANameAndForce(t *testing.T) {
 	joinRefused(t, o, source, []string{"--join-token", joinToken, "--force"}, "--force")
 }
 
+func TestNodeAddWithAJoinTokenRefusesANameInTheTarget(t *testing.T) {
+	o := newOperator(t, "op")
+	source := preflightCluster(t, o)
+	r := o.run("--release-source", source, "node", "add", unreachable+",name=web", "--join-token", joinToken)
+	if r.err == nil {
+		t.Fatal("node add --join-token with a name in its target succeeded")
+	}
+	wantContains(t, "node add's error", r.err.Error(), "name=", "control plane names")
+	if strings.Contains(r.stdout, "host key") {
+		t.Errorf("node add --join-token with a name in its target reached the host:\n%s", r.stdout)
+	}
+}
+
+func TestNodeAddWithAJoinTokenTakesOneTarget(t *testing.T) {
+	o := newOperator(t, "op")
+	source := preflightCluster(t, o)
+	joinRefused(t, o, source, []string{"other.invalid", "--join-token", joinToken}, "1 argument, not 2")
+}
+
 func TestNodeAddWithAJoinTokenNeedsNeitherTheCAKeyNorTheClustersNodes(t *testing.T) {
 	o := newOperator(t, "op")
 	source := preflightCluster(t, o)
@@ -107,5 +126,23 @@ func TestNodeAddRefusesAPrivateAddressThatIsntOne(t *testing.T) {
 		if r.err == nil || !strings.Contains(r.err.Error(), unreachable) {
 			t.Errorf("node add %v with an empty --private-address: %v, want it to go on to %s", join, r.err, unreachable)
 		}
+	}
+}
+
+func TestNodeAddWithAJoinTokenTakesAnAddressInTheTarget(t *testing.T) {
+	o := newOperator(t, "op")
+	source := preflightCluster(t, o)
+	r := o.run("--release-source", source, "node", "add", unreachable+",private-address=10.0.0.5", "--join-token", joinToken)
+	if r.err == nil || !strings.Contains(r.err.Error(), "fetching the host key of "+unreachable) {
+		t.Errorf("node add --join-token with an address in the target: %v, want it to go on to %s", r.err, unreachable)
+	}
+}
+
+func TestNodeAddWithAJoinTokenTakesAnEmptyNameAsAbsent(t *testing.T) {
+	o := newOperator(t, "op")
+	source := preflightCluster(t, o)
+	r := o.run("--release-source", source, "node", "add", unreachable, "--join-token", joinToken, "--name", "")
+	if r.err == nil || !strings.Contains(r.err.Error(), "fetching the host key of "+unreachable) {
+		t.Errorf("node add --join-token with an empty --name: %v, want it to go on to %s", r.err, unreachable)
 	}
 }

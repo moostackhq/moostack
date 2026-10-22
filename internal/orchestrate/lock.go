@@ -191,7 +191,7 @@ func (c *Cluster) renewAll() {
 	var wg sync.WaitGroup
 	for _, n := range holding {
 		wg.Go(func() {
-			ctx, cancel := context.WithTimeout(c.ctx, c.ttl/3)
+			ctx, cancel := context.WithTimeout(c.held, c.ttl/3)
 			defer cancel()
 			c.renew(ctx, n)
 		})

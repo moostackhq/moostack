@@ -1,13 +1,17 @@
 package cli_test
 
 import (
+	"context"
 	"errors"
 	"maps"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/cluster"
@@ -200,5 +204,122 @@ func TestEveryOperationPushesTheRemovedIdentitiesToANodeThatMissedThem(t *testin
 	nodeAddPassesPreflight(t, o, source)
 	if ids := o.nodes["node1"].removedIdentities(); !slices.Equal(ids, []string{identityOf("node3")}) {
 		t.Errorf("after the next operation, node1 holds the identities %v as removed, want node3's", ids)
+	}
+}
+
+func TestCtrlCStopsNodeRemoveBeforeItsUninstallAndGivesBackTheLock(t *testing.T) {
+	interrupt := func(ctx context.Context) {
+		syscall.Kill(os.Getpid(), syscall.SIGINT)
+		<-ctx.Done()
+	}
+	for name, c := range map[string]struct {
+		set  func(o *operator)
+		want string
+	}{
+		"the preflight": {func(o *operator) { o.nodes["node2"].dialing = interrupt }, "node remove interrupted"},
+		// node3's host accepts the connection and never answers.
+		"reaching the host": {func(o *operator) {
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { l.Close() })
+			go func() {
+				for {
+					c, err := l.Accept()
+					if err != nil {
+						return
+					}
+					t.Cleanup(func() { c.Close() })
+					syscall.Kill(os.Getpid(), syscall.SIGINT)
+				}
+			}()
+			_, port, _ := net.SplitHostPort(l.Addr().String())
+			writeFile(t, filepath.Join(o.home, ".ssh", "config"), []byte("Host node3.invalid\n  HostName 127.0.0.1\n  Port "+port+"\n"))
+		}, "reaching node3's host to clean it, which stays in the cluster directory: interrupted"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			o := newOperator(t, "op")
+			source := preflightCluster(t, o)
+			c.set(o)
+			before := snapshot(t, o.dir)
+			r := o.run("--release-source", source, "node", "remove", "node3")
+			if r.err == nil {
+				t.Fatal("node remove succeeded")
+			}
+			wantContains(t, "node remove's error", r.err.Error(), c.want)
+			if got := o.exitCodes(); len(got) > 0 {
+				t.Errorf("mooctl exited with %v, want it to return", got)
+			}
+			for name, n := range o.nodes {
+				if l := n.heldLock(); l != nil {
+					t.Errorf("after the interrupted node remove, %s holds the lock %+v", name, l)
+				}
+			}
+			wantSnapshot(t, o.dir, before)
+		})
+	}
+}
+
+func TestCtrlCOnceTheLockIsHeldStopsNodeRemoveUnreachableBeforeAnythingChanges(t *testing.T) {
+	o := newOperator(t, "op")
+	source := preflightCluster(t, o)
+	// The signal comes once node1 has taken the removed identities the
+	// preflight pushes, before it answers.
+	o.nodes["node1"].pushed = func(ctx context.Context, push int) {
+		if push == 1 {
+			syscall.Kill(os.Getpid(), syscall.SIGINT)
+			<-ctx.Done()
+		}
+	}
+	before := snapshot(t, o.dir)
+	r := o.run("--release-source", source, "node", "remove", "node3", "--unreachable")
+	if r.err == nil || !strings.Contains(r.err.Error(), "interrupted before removing node3") {
+		t.Fatalf("node remove --unreachable interrupted once the lock is held: %v, want it to stop before removing node3", r.err)
+	}
+	wantSnapshot(t, o.dir, before)
+	if got := o.exitCodes(); len(got) > 0 {
+		t.Errorf("mooctl exited with %v, want it to return", got)
+	}
+	for name, n := range o.nodes {
+		if l := n.heldLock(); l != nil {
+			t.Errorf("after the interrupted node remove, %s holds the lock %+v", name, l)
+		}
+	}
+}
+
+func TestCtrlCOnceANodeIsRemovedStillTellsTheNodes(t *testing.T) {
+	o := newOperator(t, "op")
+	source := preflightCluster(t, o)
+	// The signal comes as node remove starts to tell the nodes that node3
+	// is removed, their second push, and every node's push waits for it
+	// to land before it finds whether its context has ended.
+	for name, n := range o.nodes {
+		n.removing = func(push int) {
+			if push != 2 {
+				return
+			}
+			if name == "node1" {
+				syscall.Kill(os.Getpid(), syscall.SIGINT)
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	r := o.run("--release-source", source, "node", "remove", "node3", "--unreachable")
+	if r.err == nil || !strings.Contains(r.err.Error(), "node remove interrupted once node3 was removed, which the nodes were told") {
+		t.Errorf("node remove interrupted as it told the nodes: %v, want it to say so once they were told", r.err)
+	}
+	wantContains(t, "node remove's stderr", r.stderr, "Interrupted, but node3 is removed: mooctl tells the nodes first. Interrupt again to stop now")
+	for _, name := range []string{"node1", "node2"} {
+		n := o.nodes[name]
+		if !slices.Contains(n.removedIdentities(), identityOf("node3")) {
+			t.Errorf("%s holds the removed identities %v, want node3's", name, n.removedIdentities())
+		}
+		if !slices.Contains(n.generations(), 2) {
+			t.Errorf("%s recorded %v, want generation 2", name, n.generations())
+		}
+	}
+	if got := o.exitCodes(); len(got) > 0 {
+		t.Errorf("mooctl exited with %v, want it to return", got)
 	}
 }

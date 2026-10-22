@@ -3,6 +3,7 @@ package orchestrate_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -317,5 +318,56 @@ func TestPreflightTakesTheLockForTheOperationItRuns(t *testing.T) {
 	}
 	if got := orchestrate.DescribeLock(*l); !strings.HasSuffix(got, ", for cluster update") {
 		t.Errorf("DescribeLock says %q, want it to end with the operation", got)
+	}
+}
+
+// Once the preflight has passed, what ends the caller's context, such
+// as a signal, ends the operation's work but not its lease: the lease is
+// renewed, a new node is locked and the nodes record a generation in the
+// held context, which only the lock's loss ends.
+func TestTheLeaseOutlivesTheCallersContext(t *testing.T) {
+	f := fakes{"node1": {generation: 1}}
+	nodes := f.nodes()
+	nodes.LeaseTTL = 300 * time.Millisecond
+	ctx, cancel := context.WithCancel(t.Context())
+	cl, err := orchestrate.Preflight(ctx, nodes, 1, false, holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	cancel()
+	if cl.Context().Err() == nil {
+		t.Error("the operation's context goes on after its caller's ended")
+	}
+	time.Sleep(3 * nodes.LeaseTTL)
+	if err := cl.Held().Err(); err != nil {
+		t.Fatalf("the held context ended with its caller's: %v", context.Cause(cl.Held()))
+	}
+	if err := cl.CheckLock(); err != nil {
+		t.Fatalf("three lease times after its caller's context ended, the operation lost its lease: %v", err)
+	}
+	added := &node{generation: 0}
+	cl.Add("node2", added)
+	if l := added.heldLock(); l == nil {
+		t.Error("a node added after the caller's context ended wasn't locked")
+	}
+	if err := cl.Record(cl.Held(), 2); err != nil {
+		t.Errorf("recording in the held context: %v", err)
+	}
+	for name, n := range map[string]*node{"node1": f["node1"], "node2": added} {
+		if got := n.recorded; !slices.Contains(got, 2) {
+			t.Errorf("%s recorded %v, want generation 2", name, got)
+		}
+	}
+
+	// Another operation takes node1's lock, as when the lock is broken.
+	f["node1"].lockFor("bobs", time.Minute)
+	select {
+	case <-cl.Held().Done():
+		if cause := context.Cause(cl.Held()); !errors.Is(cause, orchestrate.ErrLockLost) {
+			t.Errorf("the held context ended with %v, want ErrLockLost", cause)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("the held context went on after the operation lost the lock")
 	}
 }

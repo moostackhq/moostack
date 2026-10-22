@@ -296,13 +296,16 @@ func (d *Dir) readNode(name string) (Node, error) {
 }
 
 // FreeNodeName is the first of node1, node2 and so on that no node in
-// the directory has.
-func (d *Dir) FreeNodeName() (string, error) {
+// the directory has, and that isn't one of skip.
+func (d *Dir) FreeNodeName(skip ...string) (string, error) {
 	nodes, err := d.Nodes()
 	if err != nil {
 		return "", err
 	}
 	taken := map[string]bool{}
+	for _, name := range skip {
+		taken[name] = true
+	}
 	for _, n := range nodes {
 		taken[n.Name] = true
 	}
