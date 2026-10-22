@@ -60,6 +60,26 @@ func TestClusterStatusSaysWhetherAnUpdateIsNeededInProgressOrStoppedPartway(t *t
 		{"refused, as mooctl doesn't operate a node's release", func(o *operator) {
 			o.nodes["node2"].runs("0.9.0", "agent")
 		}, "Update: refused, so cluster update won't run:\nnode2: it runs release 0.9.0, which this mooctl, of release 1.1.0, doesn't operate", "refused"},
+		{"development builds", func(o *operator) {
+			o.nodes["node1"].runs(devVersion, "agent")
+		}, "Update: development builds run; mooctl cluster update replaces them with the pinned release\n", "development_builds"},
+		{"up to date but for a development build of a service", func(o *operator) {
+			updatedTo110(o)
+			o.nodes["node2"].runsServices(devVersion, "dns")
+		}, "Update: development builds run; mooctl cluster update replaces them with the pinned release\n", "development_builds"},
+		{"in progress, from a source", func(o *operator) {
+			updatedTo110(o)
+			o.nodes["node2"].runs(devVersion, "updater")
+			for _, n := range o.nodes {
+				l := bobsLock
+				l.Operation = "cluster update"
+				n.locked(l)
+			}
+		}, "Update: in progress\n", "in_progress"},
+		{"refused, with a development build", func(o *operator) {
+			o.nodes["node1"].runs(devVersion, "agent")
+			o.nodes["node2"].runsServices("0.9.0", "dns")
+		}, "Update: refused, so cluster update won't run:\nnode2: its dns service runs release 0.9.0", "refused"},
 		{"another operation", func(o *operator) {
 			for _, n := range o.nodes {
 				n.locked(bobsLock)

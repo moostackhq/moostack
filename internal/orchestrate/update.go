@@ -21,6 +21,11 @@ var NodeComponents = []string{"agent", "updater", "containerd"}
 type Component struct {
 	Version, Build string
 	Files          map[string][]byte
+	// ManyBuilds says Version names more than one build, as a
+	// development build's does: the same commit built with other
+	// settings, or with other changes, has the same version. A node that
+	// doesn't say which build it runs isn't taken to run this one.
+	ManyBuilds bool
 }
 
 // Service is a cluster service as an update runs it: its version and
@@ -30,11 +35,14 @@ type Component struct {
 type Service struct {
 	Name, Version, Build, API, Image string
 	Archive                          []byte
+	// ManyBuilds is Component's.
+	ManyBuilds bool
 }
 
 // NodeRelease is what an update installs on one node: a release's node
 // components, for the node's architecture, by name, and its cluster
-// services, in the order the update runs them.
+// services, in the order the update runs them. An update installs only
+// the components and services it has, as a development build of some.
 type NodeRelease struct {
 	Components map[string]Component
 	Services   []Service
@@ -69,20 +77,30 @@ var updateTimeout = 5 * time.Minute
 // that a rerun goes on from where an update stopped, an update of a
 // cluster that is up to date changes nothing, and another build of the
 // target version is replaced. told is told each step as it starts or is
-// skipped. Update stops at the first step that fails, with a *NodeError
-// naming the node and the step, and, before or after any step, once the
-// operation can't be sure it holds the lock.
+// skipped. Update asks releaseOf for every node's release before any
+// step, and fails naming the first node it has none for. It stops at the
+// first step that fails, with a *NodeError naming the node and the step,
+// and, before or after any step, once the operation can't be sure it
+// holds the lock.
 func (c *Cluster) Update(ctx context.Context, releaseOf ReleaseOf, told func(Step)) error {
 	c.mu.Lock()
 	conns := slices.Clone(c.conns)
 	c.mu.Unlock()
+	rels := map[string]NodeRelease{}
 	for _, n := range conns {
-		if err := c.updateComponents(ctx, n, releaseOf, told); err != nil {
+		rel, err := releaseOf(n.name)
+		if err != nil {
+			return &NodeError{Node: n.name, Err: err}
+		}
+		rels[n.name] = rel
+	}
+	for _, n := range conns {
+		if err := c.updateComponents(ctx, n, rels[n.name], told); err != nil {
 			return err
 		}
 	}
 	for _, n := range conns {
-		if err := c.updateServices(ctx, n, releaseOf, told); err != nil {
+		if err := c.updateServices(ctx, n, rels[n.name], told); err != nil {
 			return err
 		}
 	}
@@ -90,21 +108,17 @@ func (c *Cluster) Update(ctx context.Context, releaseOf ReleaseOf, told func(Ste
 }
 
 // updateComponents updates the node components of n, each of
-// NodeComponents in turn. It skips the agent and the updater where the
-// node runs them at the target already, healthy, so that a rerun reaches
-// containerd on a node whose containerd doesn't answer, where a new agent
-// would be refused. Each new component has a fifth of a lease time to
+// NodeComponents that rel has in turn. It skips the agent and
+// the updater where the node runs them at the target already, healthy,
+// so that a rerun reaches containerd on a node whose containerd doesn't
+// answer, where a new agent would be refused. Each new component has a fifth of a lease time to
 // restart and become healthy, and the one it replaced as long again if
 // it is rolled back. The last renewal the node answered may be a third
 // of a lease time old when its agent stops answering, and the operation
 // gives up a tenth early, so both end before it may lose the lock. Once
 // the node's agent has restarted, the lease is renewed on it.
-func (c *Cluster) updateComponents(ctx context.Context, n *namedConn, releaseOf ReleaseOf, told func(Step)) error {
+func (c *Cluster) updateComponents(ctx context.Context, n *namedConn, rel NodeRelease, told func(Step)) error {
 	healthTimeout := c.ttl / 5
-	rel, err := releaseOf(n.name)
-	if err != nil {
-		return &NodeError{Node: n.name, Err: err}
-	}
 	statusCtx, cancel := context.WithTimeout(ctx, c.reachTimeout)
 	running := runningHealthy(n.conn.Status(statusCtx).Components)
 	cancel()
@@ -128,7 +142,10 @@ func (c *Cluster) updateComponents(ctx context.Context, n *namedConn, releaseOf 
 		},
 	}
 	for _, name := range NodeComponents {
-		comp := rel.Components[name]
+		comp, ok := rel.Components[name]
+		if !ok {
+			continue
+		}
 		step := Step{Node: n.name, Component: ComponentNoun(name), Version: comp.Version}
 		// The lock doesn't fence the update, and keepLease may not have
 		// noticed yet that the lease ran out, as after the machine slept.
@@ -137,7 +154,7 @@ func (c *Cluster) updateComponents(ctx context.Context, n *namedConn, releaseOf 
 		}
 		// containerd reports itself healthy only with its shim at its
 		// version, so binaries part old and part new are updated again.
-		if atTarget(running[name], comp.Version, comp.Build) {
+		if atTarget(running[name], comp.Version, comp.Build, comp.ManyBuilds) {
 			step.Already = true
 			told(step)
 			continue
@@ -155,16 +172,13 @@ func (c *Cluster) updateComponents(ctx context.Context, n *namedConn, releaseOf 
 	return c.CheckLock()
 }
 
-// updateServices updates the cluster services of n, each in turn: it
+// updateServices updates the cluster services of n that rel has, each in
+// turn: it
 // imports the service's image and runs the service from it, and waits
 // for the service to answer its health call at the new version, for up
 // to the cluster's service timeout. It skips a service the node runs at
 // the target already, healthy.
-func (c *Cluster) updateServices(ctx context.Context, n *namedConn, releaseOf ReleaseOf, told func(Step)) error {
-	rel, err := releaseOf(n.name)
-	if err != nil {
-		return &NodeError{Node: n.name, Err: err}
-	}
+func (c *Cluster) updateServices(ctx context.Context, n *namedConn, rel NodeRelease, told func(Step)) error {
 	statusCtx, cancel := context.WithTimeout(ctx, c.reachTimeout)
 	running := runningHealthy(n.conn.Status(statusCtx).Services)
 	cancel()
@@ -173,7 +187,7 @@ func (c *Cluster) updateServices(ctx context.Context, n *namedConn, releaseOf Re
 		if err := c.CheckLock(); err != nil {
 			return err
 		}
-		if atTarget(running[svc.Name], svc.Version, svc.Build) {
+		if atTarget(running[svc.Name], svc.Version, svc.Build, svc.ManyBuilds) {
 			step.Already = true
 			told(step)
 			continue
@@ -212,7 +226,7 @@ func (c *Cluster) updateService(ctx context.Context, n *namedConn, svc Service) 
 		statusCtx, cancelStatus := context.WithTimeout(ctx, c.reachTimeout)
 		status := n.conn.Status(statusCtx)
 		cancelStatus()
-		if atTarget(runningHealthy(status.Services)[svc.Name], svc.Version, svc.Build) {
+		if atTarget(runningHealthy(status.Services)[svc.Name], svc.Version, svc.Build, svc.ManyBuilds) {
 			return nil
 		}
 		select {
@@ -266,9 +280,17 @@ func runningHealthy(reported []*nodev1.Component) map[string]*nodev1.Component {
 
 // atTarget reports whether running, healthy, is the target: at version,
 // and the build, unless the node or the release doesn't say which, as a
-// release before builds were reported doesn't.
-func atTarget(running *nodev1.Component, version, build string) bool {
-	return running != nil && running.Version == version && (build == "" || running.Build == "" || running.Build == build)
+// release before builds were reported doesn't, or the node hasn't hashed
+// its files yet. A version of many builds is the target only by a build
+// the node says.
+func atTarget(running *nodev1.Component, version, build string, manyBuilds bool) bool {
+	if running == nil || running.Version != version {
+		return false
+	}
+	if manyBuilds {
+		return running.Build != "" && running.Build == build
+	}
+	return build == "" || running.Build == "" || running.Build == build
 }
 
 // unansweredError is why the agent that an update restarted doesn't

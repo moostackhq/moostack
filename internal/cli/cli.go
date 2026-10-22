@@ -335,7 +335,7 @@ type unknownReleaseError struct{}
 func (unknownReleaseError) Error() string { return "its agent doesn't say which release it runs" }
 
 func (unknownReleaseError) Hint() string {
-	return "Check the node with mooctl cluster status: its agent may be broken, or a development build."
+	return "Check the node with mooctl cluster status: its agent may be broken."
 }
 
 // mooctlRelease is the release this mooctl belongs to, as far as it
@@ -398,7 +398,10 @@ func withHint(err error) error {
 }
 
 // operated fails if the node whose status is s runs a release that this
-// mooctl doesn't operate, with an *unoperatedError.
+// mooctl doesn't operate, with an *unoperatedError. A node whose agent is
+// a development build is on no release: development builds sit outside
+// the releases mooctl operates, so that cluster update puts a release
+// back.
 func operated(env Env, s nodeclient.Status) error {
 	if env.Version == "" {
 		return nil
@@ -407,7 +410,7 @@ func operated(env Env, s nodeclient.Status) error {
 	if err != nil {
 		return err
 	}
-	if operates(env, running) {
+	if operates(env, running) || release.IsDevVersion(running) {
 		return nil
 	}
 	return &unoperatedError{running: running, own: mooctlRelease(env)}
@@ -439,18 +442,20 @@ func (e *unoperatedError) Hint() string {
 // skips no release for any of them; and any of them on pinned counts as
 // a node that still runs it. A part that doesn't say which release it
 // runs, as a service whose container the node can't read, may be on any:
-// only the release the node's agent runs updates it, which repairs it.
+// only the release the node's agent runs updates it, which repairs it, or
+// any, if the agent is a development build. A part on a development build
+// may be on any, which pinned replaces.
 func updates(env Env, pinned release.Manifest, s nodeclient.Status, all []nodeclient.Status) error {
 	agent, err := agentRelease(s)
 	if err != nil {
 		return err
 	}
 	for _, r := range releasesOf(s) {
-		if r.service != "" && !slices.ContainsFunc(pinned.Services, func(svc release.Service) bool { return svc.Name == r.service }) {
+		if (r.service != "" && !slices.ContainsFunc(pinned.Services, func(svc release.Service) bool { return svc.Name == r.service })) || release.IsDevVersion(r.release) {
 			continue
 		}
 		if r.release == "" {
-			if pinned.Version == agent {
+			if pinned.Version == agent || release.IsDevVersion(agent) {
 				continue
 			}
 			return &skippedReleaseError{what: r.what, pinned: pinned}

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -343,17 +344,24 @@ func (n *Node) dial(t *testing.T, socket string) *grpc.ClientConn {
 }
 
 // dialThrough is a connection to socket through program's relay, run as
-// root in the container.
-func (n *Node) dialThrough(t *testing.T, program, socket string) *grpc.ClientConn {
+// root in the container, with opts.
+func (n *Node) dialThrough(t *testing.T, program, socket string, opts ...grpc.DialOption) *grpc.ClientConn {
 	t.Helper()
-	conn, err := grpc.NewClient("passthrough:///"+filepath.Base(program),
+	conn, err := grpc.NewClient("passthrough:///"+filepath.Base(program), append([]grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return n.relay(program, socket) }))
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return n.relay(program, socket) }),
+	}, opts...)...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
 	return conn
+}
+
+// ContainerdConn is a connection to the node's containerd, with opts.
+func (n *Node) ContainerdConn(t *testing.T, opts ...grpc.DialOption) *grpc.ClientConn {
+	t.Helper()
+	return n.dialThrough(t, hostlayout.Agent, hostlayout.ContainerdSocket, opts...)
 }
 
 // relay is a connection to socket through program's relay.
@@ -433,12 +441,8 @@ func (n *Node) ImportImage(t *testing.T, name string) {
 // from it.
 func (n *Node) DeleteImage(t *testing.T, name string) {
 	t.Helper()
-	client, err := containerd.NewWithConn(n.dialThrough(t, hostlayout.Agent, hostlayout.ContainerdSocket))
-	if err != nil {
-		t.Fatal(err)
-	}
 	ctx := namespaces.WithNamespace(t.Context(), hostlayout.ContainerdNamespace)
-	if err := client.ImageService().Delete(ctx, name); err != nil {
+	if err := n.Containerd(t).ImageService().Delete(ctx, name); err != nil {
 		t.Fatalf("deleting the image %s: %v", name, err)
 	}
 }
@@ -465,32 +469,119 @@ func (n *Node) ImportFixtures(t *testing.T) {
 // serves svc's API, named as svc's image.
 func (n *Node) ImportFixtureAs(t *testing.T, svc *nodev1.Service) {
 	t.Helper()
-	program, err := os.ReadFile(filepath.Join(binaries(t), imagesDir, fixtureProgram))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var archive bytes.Buffer
-	if err := ociimage.Write(&archive, fixtureImageOf(program, svc)); err != nil {
-		t.Fatal(err)
-	}
-	n.importArchive(t, svc.Image, archive.Bytes(), svc.Image)
+	n.importFixture(t, svc, func(*ociimage.Image) {})
 }
 
 // ImportFixtureRebuiltAs is ImportFixtureAs, but of another build of
 // that image, under the same name: one with a file more.
 func (n *Node) ImportFixtureRebuiltAs(t *testing.T, svc *nodev1.Service) {
 	t.Helper()
+	n.importFixture(t, svc, func(img *ociimage.Image) {
+		img.Files = append(img.Files, ociimage.File{Name: "rebuilt", Mode: 0o644, Data: []byte("another build\n")})
+	})
+}
+
+// ImportFixtureReconfiguredAs is ImportFixtureAs, but of another build
+// of that image, under the same name, that differs in its config alone:
+// its layer is the one ImportFixtureAs imports. Each build, from 1, is
+// another.
+func (n *Node) ImportFixtureReconfiguredAs(t *testing.T, svc *nodev1.Service, build int) {
+	t.Helper()
+	if build < 1 {
+		t.Fatalf("build %d of %s: builds count from 1", build, svc.Image)
+	}
+	n.importFixture(t, svc, func(img *ociimage.Image) {
+		// The same program, by another path.
+		img.Entrypoint[0] = "/" + strings.Repeat("./", build) + fixtureProgram
+	})
+}
+
+// ImportSlowFixtureAs is ImportFixtureAs, but of an image with a large
+// file more, so that running a service from it takes seconds, while
+// containerd unpacks it.
+func (n *Node) ImportSlowFixtureAs(t *testing.T, svc *nodev1.Service) {
+	t.Helper()
+	n.importFixture(t, svc, func(img *ociimage.Image) {
+		img.Files = append(img.Files, ociimage.File{Name: "large", Mode: 0o644, Data: make([]byte, 1<<30)})
+	})
+}
+
+// importFixture has the agent import an image of fixtureservice that
+// serves svc's API, named as svc's image, as edit changes it.
+func (n *Node) importFixture(t *testing.T, svc *nodev1.Service, edit func(*ociimage.Image)) {
+	t.Helper()
 	program, err := os.ReadFile(filepath.Join(binaries(t), imagesDir, fixtureProgram))
 	if err != nil {
 		t.Fatal(err)
 	}
 	img := fixtureImageOf(program, svc)
-	img.Files = append(img.Files, ociimage.File{Name: "rebuilt", Mode: 0o644, Data: []byte("another build\n")})
+	edit(&img)
 	var archive bytes.Buffer
 	if err := ociimage.Write(&archive, img); err != nil {
 		t.Fatal(err)
 	}
 	n.importArchive(t, svc.Image, archive.Bytes(), svc.Image)
+}
+
+// Containerd is a client of the node's containerd.
+func (n *Node) Containerd(t *testing.T) *containerd.Client {
+	t.Helper()
+	client, err := containerd.NewWithConn(n.ContainerdConn(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+// CollectGarbageOnce has the node's containerd collect garbage, and
+// returns once it has.
+func (n *Node) CollectGarbageOnce(t *testing.T) {
+	t.Helper()
+	if err := collectGarbage(namespaces.WithNamespace(t.Context(), hostlayout.ContainerdNamespace), n.Containerd(t)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// CollectGarbage has the node's containerd collect garbage, over and
+// over, until the returned stop is first called, which fails the test if
+// a collection failed.
+func (n *Node) CollectGarbage(t *testing.T) (stop func()) {
+	t.Helper()
+	client := n.Containerd(t)
+	ctx, cancel := context.WithCancel(namespaces.WithNamespace(t.Context(), hostlayout.ContainerdNamespace))
+	done := make(chan error, 1)
+	go func() {
+		for ctx.Err() == nil {
+			if err := collectGarbage(ctx, client); err != nil && ctx.Err() == nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	var once sync.Once
+	return func() {
+		t.Helper()
+		once.Do(func() {
+			cancel()
+			if err := <-done; err != nil {
+				t.Error(err)
+			}
+		})
+	}
+}
+
+// collectGarbage has client's containerd collect garbage, and returns
+// once it has: deleting a lease synchronously collects before it returns.
+func collectGarbage(ctx context.Context, client *containerd.Client) error {
+	l, err := client.LeasesService().Create(ctx, leases.WithRandomID())
+	if err == nil {
+		err = client.LeasesService().Delete(ctx, l, leases.SynchronousDelete)
+	}
+	if err != nil {
+		return fmt.Errorf("collecting garbage: %v", err)
+	}
+	return nil
 }
 
 // importImage has the agent import the image archive file in
@@ -713,7 +804,7 @@ func binaries(t *testing.T) string {
 		if binErr = release.FetchRunc(context.Background(), runtime.GOARCH, filepath.Join(cache, "moostack-release"), binDir); binErr != nil {
 			return
 		}
-		if _, binErr = release.BuildServices(context.Background(), checkout(), runtime.GOARCH, Version, filepath.Join(binDir, imagesDir)); binErr != nil {
+		if _, binErr = release.BuildServices(context.Background(), checkout(), runtime.GOARCH, Version, filepath.Join(binDir, imagesDir), release.ClusterServices); binErr != nil {
 			return
 		}
 		binErr = writeFixtureImages(filepath.Join(binDir, imagesDir))

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -14,8 +15,10 @@ import (
 	"time"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
+	"github.com/moostackhq/moostack/internal/buildid"
 	"github.com/moostackhq/moostack/internal/cluster"
 	"github.com/moostackhq/moostack/internal/nodeclient"
+	"github.com/moostackhq/moostack/internal/ociimage"
 	"github.com/moostackhq/moostack/internal/orchestrate"
 )
 
@@ -55,6 +58,27 @@ type fakeNode struct {
 	// updates are the components the node was updated to, as the
 	// component, its version and its binaries, in order.
 	updates []string
+	// sent are the last binary of the agent and of the updater the node
+	// was sent, and the last archive of each image it imported, by the
+	// image's name.
+	sent map[string][]byte
+}
+
+// sentFile is the last binary of the agent or the updater, or archive of
+// the image, called name that the node was sent.
+func (n *fakeNode) sentFile(name string) []byte {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.sent[name]
+}
+
+// keep keeps data as the last file called name the node was sent. The
+// node's mu is held.
+func (n *fakeNode) keep(name string, data []byte) {
+	if n.sent == nil {
+		n.sent = map[string][]byte{}
+	}
+	n.sent[name] = data
 }
 
 // identityOf is the fingerprint of the identity of the node called name
@@ -147,9 +171,20 @@ func (n *fakeNode) runs(version string, components ...string) *fakeNode {
 
 // ran has the node report that it runs component at version, healthy.
 // The node's mu is held.
-func (n *fakeNode) ran(component, version string) {
+func (n *fakeNode) ran(component, version string) { n.ranBuild(component, version, "") }
+
+// ranBuild is ran, of the build build, unknown if empty. The node's mu is
+// held.
+func (n *fakeNode) ranBuild(component, version, build string) {
 	n.status.Components = slices.DeleteFunc(n.status.Components, func(c *nodev1.Component) bool { return c.Name == component })
-	n.status.Components = append(n.status.Components, &nodev1.Component{Name: component, Version: version, Health: nodev1.Health_HEALTH_HEALTHY})
+	n.status.Components = append(n.status.Components, &nodev1.Component{Name: component, Version: version, Build: build, Health: nodev1.Health_HEALTH_HEALTHY})
+}
+
+// buildOf is the build of the agent's or the updater's binary, as the
+// node reports it: by its checksum, as a release's SHA256SUMS gives it.
+func buildOf(name string, binary []byte) string {
+	sum := sha256.Sum256(binary)
+	return buildid.FromSums(map[string]string{name: hex.EncodeToString(sum[:])})
 }
 
 // runsServices has the node report that it runs each of services at
@@ -239,8 +274,9 @@ func (n *fakeNode) UpdateAgent(ctx context.Context, version string, binary []byt
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.updates = append(n.updates, "agent "+version+" "+string(binary))
+	n.keep("agent", binary)
 	if n.updateErr == nil {
-		n.ran("agent", version)
+		n.ranBuild("agent", version, buildOf("agent", binary))
 	}
 	return n.updateErr
 }
@@ -249,7 +285,8 @@ func (n *fakeNode) UpdateUpdater(_ context.Context, version string, binary []byt
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.updates = append(n.updates, "updater "+version+" "+string(binary))
-	n.ran("updater", version)
+	n.keep("updater", binary)
+	n.ranBuild("updater", version, buildOf("updater", binary))
 	return nil
 }
 
@@ -283,14 +320,19 @@ func (n *fakeNode) ImportImage(_ context.Context, archive []byte) ([]string, err
 		if err := json.NewDecoder(r).Decode(&index); err != nil || len(index.Manifests) != 1 {
 			return nil, fmt.Errorf("not an image: %v", err)
 		}
-		return []string{index.Manifests[0].Annotations["io.containerd.image.name"]}, nil
+		name := index.Manifests[0].Annotations["io.containerd.image.name"]
+		n.mu.Lock()
+		n.keep(name, archive)
+		n.mu.Unlock()
+		return []string{name}, nil
 	}
 }
 
 // RunService records an update to the service, as "service", its name,
 // version and image, and has the node report it running at its version,
-// healthy, unless serviceErr is set. Successful updates of components
-// show in the node's status too.
+// healthy, of the build of the image it imported under that name, unless
+// serviceErr is set. Successful updates of components show in the node's
+// status too, with the build of their binaries.
 func (n *fakeNode) RunService(_ context.Context, svc *nodev1.Service) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -299,7 +341,8 @@ func (n *fakeNode) RunService(_ context.Context, svc *nodev1.Service) error {
 		return n.serviceErr
 	}
 	n.status.Services = slices.DeleteFunc(n.status.Services, func(c *nodev1.Component) bool { return c.Name == svc.Name })
-	n.status.Services = append(n.status.Services, &nodev1.Component{Name: svc.Name, Version: svc.Version, Health: nodev1.Health_HEALTH_HEALTHY})
+	build, _ := ociimage.Digest(n.sent[svc.Image])
+	n.status.Services = append(n.status.Services, &nodev1.Component{Name: svc.Name, Version: svc.Version, Build: build, Health: nodev1.Health_HEALTH_HEALTHY})
 	return nil
 }
 

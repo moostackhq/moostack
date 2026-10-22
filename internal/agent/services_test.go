@@ -11,6 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/defaults"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
+	"github.com/opencontainers/image-spec/identity"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/mem"
@@ -506,7 +511,6 @@ func TestRunningAServiceAtAnotherVersionOrFromAnotherImageReplacesIt(t *testing.
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
 	n.StartServices(t)
-	n.ImportFixtures(t)
 	for _, c := range []struct {
 		what string
 		edit func(*nodev1.Service)
@@ -515,6 +519,8 @@ func TestRunningAServiceAtAnotherVersionOrFromAnotherImageReplacesIt(t *testing.
 		{"another image", func(s *nodev1.Service) { s.Image = nodetest.Fixture().Image }},
 	} {
 		n.RunService(t, "dns")
+		// Running dns deletes its other images, as the fixture's.
+		n.ImportFixtures(t)
 		before := servicePID(t, n, "dns")
 		svc := nodetest.Service("dns")
 		c.edit(svc)
@@ -809,6 +815,97 @@ func TestRunningAServiceFromAnotherImageDeletesTheImageItReplaced(t *testing.T) 
 	n.RunService(t, "proxy")
 }
 
+// An update stopped between importing a service's image and running it,
+// or whose run failed, leaves the image unused: the service's next run
+// deletes it, with the image it replaced.
+func TestRunningAServiceDeletesItsImagesThatNeverRan(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.StartServices(t)
+	stopped := nodetest.Service("dns")
+	stopped.Version, stopped.Image = "stopped", release.ImageRef("dns", "stopped")
+	n.ImportFixtureAs(t, stopped)
+	n.ImportFixtures(t)
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Fixture()}); err != nil {
+		t.Fatal(err)
+	}
+	for _, gone := range []*nodev1.Service{stopped, nodetest.Service("dns")} {
+		_, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: gone})
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "the node has no image "+gone.Image) {
+			t.Errorf("running dns from %s: %v, want it refused, the image gone", gone.Image, err)
+		}
+	}
+	// The images of other services stay, the broken one's that never ran
+	// too.
+	n.RunService(t, "proxy")
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Broken()}); err != nil && strings.Contains(err.Error(), "the node has no image") {
+		t.Errorf("running broken: %v, want its image kept", err)
+	}
+}
+
+// A run goes on on the node after mooctl stops waiting for it. The next
+// update's import, of another tag or of the image that run replaced, is
+// kept: the run's deletion of the service's other images is over before
+// the import.
+func TestARunThatGoesOnKeepsTheImageTheNextUpdateImports(t *testing.T) {
+	for name, next := range map[string]func(n *nodetest.Node) *nodev1.Service{
+		"another tag": func(n *nodetest.Node) *nodev1.Service {
+			svc := nodetest.Service("dns")
+			svc.Version, svc.Image = "next", release.ImageRef("dns", "next")
+			n.ImportFixtureAs(t, svc)
+			return svc
+		},
+		"the image it replaced": func(n *nodetest.Node) *nodev1.Service {
+			n.ImportImage(t, "dns")
+			return nodetest.Service("dns")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			n := nodetest.Start(t)
+			n.EventuallyHealthy(t)
+			n.StartServices(t)
+			slow := nodetest.Service("dns")
+			slow.Version, slow.Image = "slow", release.ImageRef("dns", "slow")
+			n.ImportSlowFixtureAs(t, slow)
+			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+			defer cancel()
+			if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: slow}); status.Code(err) != codes.DeadlineExceeded {
+				t.Fatalf("running dns from the slow image within 50ms: %v, want the call to end first", err)
+			}
+			svc := next(n)
+			ctx, cancel = context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: svc}); err != nil {
+				t.Errorf("running dns from %s, imported while the stopped run went on: %v, want it run", svc.Image, err)
+			}
+		})
+	}
+}
+
+// A service's run keeps the images of its repository that another service
+// runs, and those of another repository whose name starts as its does.
+func TestRunningAServiceKeepsTheImagesOtherServicesRun(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.StartServices(t)
+	shared := &nodev1.Service{Name: "dnsb", Version: "shared", Api: otherAPI, Image: release.ImageRef("dns", "shared")}
+	n.ImportFixtureAs(t, shared)
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: shared}); err != nil {
+		t.Fatal(err)
+	}
+	prefixed := &nodev1.Service{Name: "dnsx", Version: "1", Api: "moostack.dnsx.v1.DNSX", Image: "moostack.local/dnsx:1"}
+	n.ImportFixtureAs(t, prefixed)
+	n.ImportFixtures(t)
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Fixture()}); err != nil {
+		t.Fatal(err)
+	}
+	for _, kept := range []*nodev1.Service{shared, prefixed} {
+		if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: kept}); err != nil && strings.Contains(err.Error(), "the node has no image") {
+			t.Errorf("running %s from %s after dns ran: %v, want its image kept", kept.Name, kept.Image, err)
+		}
+	}
+}
+
 // A release built again under the same version names its images as the
 // build before did: running a service from the new build replaces the
 // one that runs from the old.
@@ -829,4 +926,151 @@ func TestRunningAServiceFromARebuildOfItsImageReplacesIt(t *testing.T) {
 	if _, err := n.Output("root", "test", "-e", "/proc/"+before); err == nil {
 		t.Errorf("dns runs on as pid %s from the build it ran from, rather than from the rebuild", before)
 	}
+}
+
+// A rebuild of a service's image that changes only its config has the
+// old build's layer: running the service from it keeps that layer's
+// snapshot, whenever containerd collects garbage meanwhile.
+func TestRunningAServiceFromARebuildOfItsConfigAloneSurvivesGarbageCollection(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.StartServices(t)
+	n.ImportFixtures(t)
+	fixture := nodetest.Fixture()
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+		t.Fatal(err)
+	}
+	digest, chain := imageOf(t, n, fixture.Image)
+	stop := n.CollectGarbage(t)
+	defer stop()
+	for build := 1; build <= 5; build++ {
+		before := servicePID(t, n, "fixtureservice")
+		n.ImportFixtureReconfiguredAs(t, fixture, build)
+		rebuilt, rebuiltChain := imageOf(t, n, fixture.Image)
+		if rebuilt == digest || rebuiltChain != chain {
+			t.Fatalf("rebuild %d is %s on the layers %s, want another image on the layers %s of %s", build, rebuilt, rebuiltChain, chain, digest)
+		}
+		digest = rebuilt
+		if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+			t.Fatalf("running dns from rebuild %d: %v", build, err)
+		}
+		if _, err := n.Output("root", "test", "-e", "/proc/"+before); err == nil {
+			t.Fatalf("dns runs on as pid %s, rather than from rebuild %d", before, build)
+		}
+	}
+}
+
+// The snapshot of a layer that a service's rebuilds shared goes once the
+// service runs from other layers, so that a node keeps no layer per
+// rebuild.
+func TestTheLayerOfAServicesRebuildsGoesOnceItRunsFromAnother(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.StartServices(t)
+	n.ImportFixtures(t)
+	fixture := nodetest.Fixture()
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+		t.Fatal(err)
+	}
+	_, chain := imageOf(t, n, fixture.Image)
+	n.ImportFixtureReconfiguredAs(t, fixture, 1)
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+		t.Fatal(err)
+	}
+	n.ImportFixtureRebuiltAs(t, fixture)
+	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+		t.Fatal(err)
+	}
+	stop := n.CollectGarbage(t)
+	defer stop()
+	client := n.Containerd(t)
+	ctx := namespaces.WithNamespace(t.Context(), hostlayout.ContainerdNamespace)
+	nodetest.Eventually(t, 10*time.Second, func() error {
+		if _, err := client.SnapshotService(defaults.DefaultSnapshotter).Stat(ctx, chain); !errdefs.IsNotFound(err) {
+			return fmt.Errorf("the snapshot %s of the rebuilds' layer: %v, want it gone", chain, err)
+		}
+		return nil
+	})
+}
+
+// An agent killed while it unpacks a service's image, and started again,
+// runs the service from it when asked again.
+func TestAServiceRunsAfterTheAgentIsKilledWhileItUnpacks(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.StartServices(t)
+	slow := nodetest.Service("dns")
+	slow.Version, slow.Image = "slow", release.ImageRef("dns", "slow")
+	n.ImportSlowFixtureAs(t, slow)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: slow}); status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("running dns from the slow image within 50ms: %v, want the call to end first", err)
+	}
+	n.Crash(t, "agent")
+	n.EventuallyHealthy(t)
+	nsCtx := namespaces.WithNamespace(t.Context(), hostlayout.ContainerdNamespace)
+	img, err := n.Containerd(t).GetImage(nsCtx, slow.Image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unpacked, err := img.IsUnpacked(nsCtx, defaults.DefaultSnapshotter); err != nil || unpacked {
+		t.Fatalf("the slow image unpacked: %v, %v, want the agent killed before it was", unpacked, err)
+	}
+	ctx, cancel = context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: slow}); err != nil {
+		t.Fatalf("running dns from the slow image after the agent was killed unpacking it: %v", err)
+	}
+	if status := n.EventuallyHealthy(t); !slices.ContainsFunc(status.Services, func(c *nodev1.Component) bool { return c.Name == "dns" && c.Version == slow.Version }) {
+		t.Errorf("the agent reports %v, want dns at %s", status.Services, slow.Version)
+	}
+}
+
+// A run whose call names a containerd lease, as containerd's own
+// clients name theirs, holds what it makes the container on in the
+// agent's lease all the same, and adds nothing to the one named.
+func TestARunHoldsItsSnapshotsInItsOwnLeaseWhateverLeaseItsCallNames(t *testing.T) {
+	for name, existing := range map[string]bool{"one that doesn't exist": false, "one that exists": true} {
+		t.Run(name, func(t *testing.T) {
+			n := nodetest.Start(t)
+			n.EventuallyHealthy(t)
+			n.StartServices(t)
+			n.ImportFixtures(t)
+			client := n.Containerd(t)
+			nsCtx := namespaces.WithNamespace(t.Context(), hostlayout.ContainerdNamespace)
+			named := leases.Lease{ID: "none"}
+			if existing {
+				var err error
+				if named, err = client.LeasesService().Create(nsCtx, leases.WithRandomID()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx := metadata.AppendToOutgoingContext(t.Context(), "containerd-lease", named.ID)
+			if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: nodetest.Fixture()}); err != nil {
+				t.Errorf("running dns with a call that names the lease %s: %v", named.ID, err)
+			}
+			if existing {
+				if held, err := client.LeasesService().ListResources(nsCtx, named); err != nil || len(held) != 0 {
+					t.Errorf("the lease the call named holds %v, %v, want nothing", held, err)
+				}
+			}
+		})
+	}
+}
+
+// imageOf is the digest of the image ref in n's containerd, and the
+// chain of its layers.
+func imageOf(t *testing.T, n *nodetest.Node, ref string) (digest, chain string) {
+	t.Helper()
+	ctx := namespaces.WithNamespace(t.Context(), hostlayout.ContainerdNamespace)
+	img, err := n.Containerd(t).GetImage(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diffIDs, err := img.RootFS(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return img.Target().Digest.String(), identity.ChainID(diffIDs).String()
 }

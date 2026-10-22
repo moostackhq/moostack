@@ -61,7 +61,7 @@ func TestARerunOfClusterUpdateGoesOnFromTheStepThatFailed(t *testing.T) {
 		t.Fatal("cluster update succeeded")
 	}
 	wantContains(t, "cluster update's error", r.err.Error(), "node2: updating the dns service to 1.1.0: the disk is full",
-		"Once that is fixed, run mooctl cluster update again: it goes on from there.")
+		"Once that is fixed, run mooctl -C "+o.dir+" --release-source "+source+" cluster update again: it goes on from there.")
 	// Every node's components were done before node2 failed; node3's
 	// services weren't started.
 	for name, want := range map[string]int{"node1": 5, "node2": 4, "node3": 3} {
@@ -237,6 +237,22 @@ func TestAServiceOfUnknownReleaseIsUpdatedOnlyAtTheAgentsRelease(t *testing.T) {
 	}
 }
 
+// A node whose agent is a development build is on no release, so a part
+// of it that doesn't say its release may be on any: the pinned release
+// replaces it with the agent.
+func TestAServiceOfUnknownReleaseBesideADevelopmentAgentIsUpdated(t *testing.T) {
+	o := newOperator(t, "op")
+	source := updateCluster(t, o)
+	updatedTo110(o)
+	o.nodes["node3"].runs(devVersion, "agent")
+	unknownService(o.nodes["node3"], "dns")
+	r := o.run("--release-source", source, "cluster", "update")
+	if r.err != nil {
+		t.Fatalf("cluster update was refused: %v", r.err)
+	}
+	wantContains(t, "cluster update's output", r.stdout, "Updating the agent on node3 to 1.1.0\n", "Updating the dns service on node3 to 1.1.0\n")
+}
+
 // A service that the pinned release doesn't have, as one an earlier
 // release dropped, stays on the node at its release, and doesn't count.
 func TestAServiceThePinnedReleaseDoesntHaveDoesntCount(t *testing.T) {
@@ -298,12 +314,16 @@ func TestEveryOperationRefusesAClusterOnAReleaseThisMooctlDoesntOperate(t *testi
 		args []string
 	}{
 		{"cluster update", []string{"cluster", "update"}},
+		{"cluster update --source", nil},
 		{"node remove", []string{"node", "remove", "node1"}},
 		{"node add", []string{"node", "add", "root@new.invalid"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			o := newOperator(t, "op")
 			source := updateCluster(t, o)
+			if c.args == nil {
+				c.args = []string{"cluster", "update", "--source", devCheckout(t), "agent"}
+			}
 			o.nodes["node3"].runs("0.9.0", "agent")
 			refused(t, o, o.run(append([]string{"--release-source", source}, c.args...)...),
 				"node3: it runs release 0.9.0, which this mooctl, of release 1.1.0, doesn't operate: it operates clusters on 1.1.0 and 1.0.0 only",
@@ -318,15 +338,48 @@ func TestEveryOperationRefusesANodeThatDoesntSayItsRelease(t *testing.T) {
 		args []string
 	}{
 		{"cluster update", []string{"cluster", "update"}},
+		{"cluster update --source", nil},
 		{"node remove", []string{"node", "remove", "node1"}},
 		{"node add", []string{"node", "add", "root@new.invalid"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			o := newOperator(t, "op")
 			source := updateCluster(t, o)
+			if c.args == nil {
+				c.args = []string{"cluster", "update", "--source", devCheckout(t), "agent"}
+			}
 			o.nodes["node2"].status.Components = nil
 			refused(t, o, o.run(append([]string{"--release-source", source}, c.args...)...), "node2: its agent doesn't say which release it runs",
-				"Check the node with mooctl cluster status: its agent may be broken, or a development build.")
+				"Check the node with mooctl cluster status: its agent may be broken.")
+		})
+	}
+}
+
+// A development build sits outside the releases mooctl operates.
+func TestEveryOperationOperatesANodeWhoseAgentIsADevelopmentBuild(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		args []string
+	}{
+		{"cluster update", []string{"cluster", "update"}},
+		{"cluster update --source", nil},
+		{"node remove", []string{"node", "remove", "node1"}},
+		{"node add", []string{"node", "add", "root@new.invalid"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			o := newOperator(t, "op")
+			source := updateCluster(t, o)
+			if c.args == nil {
+				c.args = []string{"cluster", "update", "--source", devCheckout(t), "agent"}
+			}
+			o.nodes["node3"].runs(devVersion, "agent")
+			r := o.run(append([]string{"--release-source", source}, c.args...)...)
+			if r.err != nil && strings.Contains(r.err.Error(), "node3") {
+				t.Errorf("%s refused node3, whose agent is a development build: %v", c.name, r.err)
+			}
+			if g := o.nodes["node3"].granted(); len(g) != 1 || g[0].Operation != strings.TrimSuffix(c.name, " --source") {
+				t.Errorf("node3 granted the locks %+v, want one, in the preflight of %s", g, c.name)
+			}
 		})
 	}
 }
@@ -427,7 +480,7 @@ func TestCtrlCStopsClusterUpdateAndGivesBackTheLock(t *testing.T) {
 	if r.err == nil {
 		t.Fatal("cluster update succeeded")
 	}
-	wantContains(t, "cluster update's error", r.err.Error(), "cluster update interrupted", "node1", "Run mooctl cluster update again: it goes on from there.")
+	wantContains(t, "cluster update's error", r.err.Error(), "cluster update interrupted", "node1", "Run mooctl -C "+o.dir+" --release-source "+source+" cluster update again: it goes on from there.")
 	if got := o.exitCodes(); len(got) > 0 {
 		t.Errorf("mooctl exited with %v, want it to return", got)
 	}
@@ -472,7 +525,7 @@ func TestCtrlCWhileClusterUpdateDownloadsOrRunsThePreflightStopsIt(t *testing.T)
 			if r.err == nil {
 				t.Fatal("cluster update succeeded")
 			}
-			wantContains(t, "cluster update's error", r.err.Error(), "cluster update interrupted", "Run mooctl cluster update again: it goes on from there.")
+			wantContains(t, "cluster update's error", r.err.Error(), "cluster update interrupted", "Run mooctl -C "+o.dir+" --release-source "+source+" cluster update again: it goes on from there.")
 			if got := o.exitCodes(); len(got) > 0 {
 				t.Errorf("mooctl exited with %v, want it to return", got)
 			}

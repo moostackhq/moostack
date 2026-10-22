@@ -257,7 +257,7 @@ func TestUpdateRunsNoNextServiceOnceTheLeaseRanOutWhileTheMachineSlept(t *testin
 			{Name: "proxy", Version: "2.0.0", Image: "proxy", Archive: []byte("proxy")},
 		}}, nil
 	}
-	err := c.updateServices(context.Background(), n, releaseOf, func(Step) {})
+	err := c.updateServices(context.Background(), n, must(releaseOf("node1")), func(Step) {})
 	if !errors.Is(err, ErrLockLost) {
 		t.Errorf("updateServices says %v, want ErrLockLost", err)
 	}
@@ -284,7 +284,7 @@ func TestUpdateRunsNoServiceOnceTheLeaseRanOutWhileItsImageImported(t *testing.T
 	releaseOf := func(string) (NodeRelease, error) {
 		return NodeRelease{Services: []Service{{Name: "dns", Version: "2.0.0", Image: "dns", Archive: []byte("dns")}}}, nil
 	}
-	err := c.updateServices(context.Background(), n, releaseOf, func(Step) {})
+	err := c.updateServices(context.Background(), n, must(releaseOf("node1")), func(Step) {})
 	if !errors.Is(err, ErrLockLost) {
 		t.Errorf("updateServices says %v, want ErrLockLost", err)
 	}
@@ -354,4 +354,12 @@ func TestTheRenewalAfterAnAgentUpdateEndsWithTheOperation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// must is rel, which err must not have failed.
+func must(rel NodeRelease, err error) NodeRelease {
+	if err != nil {
+		panic(err)
+	}
+	return rel
 }

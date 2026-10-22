@@ -21,11 +21,14 @@ import (
 	"github.com/containerd/containerd/api/types/runc/options"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
+	"github.com/opencontainers/image-spec/identity"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -46,6 +49,21 @@ const (
 	// from, so that a rebuild of an image under the same name, as of a
 	// release built again, is told apart.
 	digestLabel = "moostack.image-digest"
+)
+
+// snapshotter is the snapshotter the services' images are unpacked into
+// and their containers made on. Each call names it, so that all agree,
+// whatever default the namespace names.
+const snapshotter = defaults.DefaultSnapshotter
+
+// The leases of ownLease. One that isn't let go, as by an agent killed
+// while it holds it, expires after leaseExpiry. leaseReleaseTimeout
+// bounds letting one go, which goes on once the context it was taken in
+// ends, so that a containerd that doesn't answer holds the services no
+// longer than it would any other call.
+const (
+	leaseExpiry         = 24 * time.Hour
+	leaseReleaseTimeout = 10 * time.Second
 )
 
 // serviceName is what a cluster service may be called: its name names
@@ -129,9 +147,19 @@ func namespaced(ctx context.Context) context.Context {
 }
 
 // Import imports the images of the OCI image layout archive r, and
-// returns their names.
+// returns their names. It waits for a run of a service to end, as one
+// that goes on after its call ended, so that the run's deletion of the
+// service's other images doesn't take the one imported.
 func (s *services) Import(ctx context.Context, r io.Reader) ([]string, error) {
-	images, err := s.client.Import(namespaced(ctx), r)
+	s.running.Lock()
+	defer s.running.Unlock()
+	// A lease holds what the import writes until the images hold it.
+	ctx, _, release, err := s.ownLease(namespaced(ctx))
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	images, err := s.client.Import(ctx, r)
 	if err != nil {
 		return nil, err
 	}
@@ -190,13 +218,41 @@ func (s *services) Run(ctx context.Context, svc *nodev1.Service) error {
 	if err := s.start(ctx, svc, true); err != nil {
 		return err
 	}
-	// The image of the service replaced goes, unless another service
-	// runs it, so that a node keeps no image per release. Failing to
-	// delete it leaves it, which doesn't affect the service.
-	if replaced != nil && replaced.Image != svc.Image && !slices.ContainsFunc(list, func(other *nodev1.Service) bool { return other.Image == replaced.Image }) {
-		s.client.ImageService().Delete(namespaced(ctx), replaced.Image)
+	// The service's other images go, unless another service runs them:
+	// the one of the service replaced, and the other tags of its image,
+	// which an update imported but never ran, as when it stopped before
+	// the run, so that a node keeps no image per release. Failing to
+	// delete one leaves it, which doesn't affect the service.
+	unused := otherTags(namespaced(ctx), s.client, svc.Image)
+	if replaced != nil && replaced.Image != svc.Image {
+		unused = append(unused, replaced.Image)
+	}
+	for _, image := range unused {
+		if !slices.ContainsFunc(list, func(other *nodev1.Service) bool { return other.Image == image }) {
+			s.client.ImageService().Delete(namespaced(ctx), image)
+		}
 	}
 	return nil
+}
+
+// otherTags are the images that client holds of image's repository under
+// another tag, none if image has no tag or they can't be listed.
+func otherTags(ctx context.Context, client *containerd.Client, image string) []string {
+	i := strings.LastIndex(image, ":")
+	if i < 0 || i < strings.LastIndex(image, "/") {
+		return nil
+	}
+	images, err := client.ImageService().List(ctx)
+	if err != nil {
+		return nil
+	}
+	var others []string
+	for _, img := range images {
+		if img.Name != image && strings.HasPrefix(img.Name, image[:i+1]) {
+			others = append(others, img.Name)
+		}
+	}
+	return others
 }
 
 // store writes list to the file.
@@ -305,7 +361,13 @@ func (s *services) ensure(ctx context.Context, svc *nodev1.Service, repair bool)
 	if imgErr != nil {
 		return imgErr
 	}
-	if err := unpack(ctx, img); err != nil {
+	// A lease holds what the new container is made on until it holds it.
+	ctx, lease, release, err := s.ownLease(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := unpack(ctx, s.client, lease, img); err != nil {
 		return err
 	}
 	if c != nil {
@@ -317,12 +379,13 @@ func (s *services) ensure(ctx context.Context, svc *nodev1.Service, repair bool)
 		}
 	}
 	// A container that was removed only in part leaves its snapshot.
-	if err := s.client.SnapshotService("").Remove(ctx, svc.Name); err != nil && !errdefs.IsNotFound(err) {
+	if err := s.client.SnapshotService(snapshotter).Remove(ctx, svc.Name); err != nil && !errdefs.IsNotFound(err) {
 		return err
 	}
 	dir := filepath.Join(s.dir, svc.Name)
 	c, err = s.client.NewContainer(ctx, svc.Name,
 		containerd.WithImage(img),
+		containerd.WithSnapshotter(snapshotter),
 		containerd.WithNewSnapshot(svc.Name, img),
 		containerd.WithRuntime(plugins.RuntimeRuncV2, &options.Options{Root: hostlayout.RuncRoot}),
 		containerd.WithContainerLabels(map[string]string{versionLabel: svc.Version, imageLabel: svc.Image, apiLabel: svc.Api, digestLabel: digest}),
@@ -341,14 +404,44 @@ func (s *services) ensure(ctx context.Context, svc *nodev1.Service, repair bool)
 	return s.startTask(ctx, c, svc)
 }
 
-// unpack unpacks img into snapshots, unless it is already.
-func unpack(ctx context.Context, img containerd.Image) error {
-	if unpacked, err := img.IsUnpacked(ctx, ""); err != nil {
+// ownLease creates a lease of the agent's own, and returns ctx with it
+// set, the lease, and a function that lets go of it. containerd's clients
+// take the lease set on ctx for theirs, rather than one that ctx's caller
+// names in its call's header. Letting go of it goes on once ctx ends.
+func (s *services) ownLease(ctx context.Context) (context.Context, leases.Lease, func(), error) {
+	lease, err := s.client.LeasesService().Create(ctx, leases.WithRandomID(), leases.WithExpiration(leaseExpiry))
+	if err != nil {
+		return nil, leases.Lease{}, nil, err
+	}
+	release := func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaseReleaseTimeout)
+		defer cancel()
+		s.client.LeasesService().Delete(ctx, lease)
+	}
+	return leases.WithLease(ctx, lease.ID), lease, release, nil
+}
+
+// unpack unpacks img into snapshots, unless it is already, holding them
+// in lease, which ctx carries, from before it finds them there. Once the import of a
+// rebuild that changes only the config replaced the image they were
+// unpacked for, nothing but a container holds them: the old one, which
+// goes before the new one is made on them, if there is one. Without the
+// lease, garbage collection could take them in between.
+func unpack(ctx context.Context, client *containerd.Client, lease leases.Lease, img containerd.Image) error {
+	diffIDs, err := img.RootFS(ctx)
+	if err != nil {
+		return err
+	}
+	if err := client.LeasesService().AddResource(ctx, lease,
+		leases.Resource{ID: identity.ChainID(diffIDs).String(), Type: "snapshots/" + snapshotter}); err != nil {
+		return err
+	}
+	if unpacked, err := img.IsUnpacked(ctx, snapshotter); err != nil {
 		return err
 	} else if !unpacked {
 		// The layers are synced before their snapshots are committed, so
 		// that a crash never leaves a service's files half written.
-		return img.Unpack(ctx, "", containerd.WithUnpackApplyOpts(diff.WithSyncFs(true)))
+		return img.Unpack(ctx, snapshotter, containerd.WithUnpackApplyOpts(diff.WithSyncFs(true)))
 	}
 	return nil
 }

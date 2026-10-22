@@ -501,3 +501,61 @@ func TestUpdateReplacesAnotherBuildOfTheTargetVersion(t *testing.T) {
 		}
 	}
 }
+
+func TestUpdateOfSomeComponentsAndServicesUpdatesOnlyThose(t *testing.T) {
+	f := fakes{"node1": {generation: 1}, "node2": {generation: 1}}
+	cl, err := orchestrate.Preflight(t.Context(), inOrder(f, "node1", "node2"), 1, false, holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	some := func(name string) (orchestrate.NodeRelease, error) {
+		all, _ := releaseOf(name)
+		return orchestrate.NodeRelease{
+			Components: map[string]orchestrate.Component{"updater": all.Components["updater"]},
+			Services:   all.Services[1:],
+		}, nil
+	}
+	var told []string
+	if err := cl.Update(cl.Context(), some, func(s orchestrate.Step) { told = append(told, s.Node+" "+s.Component) }); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"node1 the updater", "node2 the updater", "node1 the proxy service", "node2 the proxy service"}
+	if !slices.Equal(told, want) {
+		t.Errorf("the update told %q, want %q", told, want)
+	}
+	for _, name := range []string{"node1", "node2"} {
+		var got []string
+		for _, u := range f[name].componentUpdates("") {
+			got = append(got, u.component)
+		}
+		if want := []string{"updater", "service proxy"}; !slices.Equal(got, want) {
+			t.Errorf("%s was updated to %q, want %q", name, got, want)
+		}
+	}
+}
+
+// What each node is to install is known before any step, so a node that
+// has none, as one added to the cluster directory after the release was
+// read, stops the update before it changes anything.
+func TestUpdateGetsEveryNodesReleaseBeforeAnyStep(t *testing.T) {
+	f := fakes{"node1": {generation: 1}, "node2": {generation: 1}}
+	cl, err := orchestrate.Preflight(t.Context(), inOrder(f, "node1", "node2"), 1, false, holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	err = cl.Update(cl.Context(), func(name string) (orchestrate.NodeRelease, error) {
+		if name == "node2" {
+			return orchestrate.NodeRelease{}, errors.New("no build for it")
+		}
+		return releaseOf(name)
+	}, func(orchestrate.Step) {})
+	var nodeErr *orchestrate.NodeError
+	if !errors.As(err, &nodeErr) || nodeErr.Node != "node2" {
+		t.Fatalf("the update returned %v, want a NodeError naming node2", err)
+	}
+	if u := f["node1"].componentUpdates(""); len(u) > 0 {
+		t.Errorf("node1 was updated to %v, before the update found node2 has nothing to install", u)
+	}
+}

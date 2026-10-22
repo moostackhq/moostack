@@ -29,14 +29,15 @@ func TestTheReleaseNamesTheReleaseBefore(t *testing.T) {
 	}
 }
 
-func TestTheProgramsAreStampedWithTheReleaseAndTheOneBefore(t *testing.T) {
-	flags := ldflags("1.0.0", "0.9.0")
-	for _, want := range []string{
-		"-X github.com/moostackhq/moostack/internal/buildinfo.Version=1.0.0",
-		"-X github.com/moostackhq/moostack/internal/buildinfo.Previous=0.9.0",
-	} {
-		if !strings.Contains(flags, want) {
-			t.Errorf("the ldflags %q don't contain %q", flags, want)
+func TestBuildRefusesAReleaseVersionShapedLikeADevelopmentBuilds(t *testing.T) {
+	out := t.TempDir()
+	for _, args := range [][2]string{{"0123456789ab", ""}, {"0123456789ab-dirty", ""}, {"1.0.0", "0123456789ab"}} {
+		err := build(context.Background(), args[0], args[1], out, false)
+		if err == nil || !strings.Contains(err.Error(), "a development build's") {
+			t.Errorf("build of %s after %q: %v", args[0], args[1], err)
 		}
+	}
+	if left, _ := os.ReadDir(out); len(left) != 0 {
+		t.Errorf("the refused builds wrote %v", left)
 	}
 }

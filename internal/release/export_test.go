@@ -25,3 +25,7 @@ func SetWaitNotice(d time.Duration) (restore func()) {
 	waitNotice = d
 	return func() { waitNotice = before }
 }
+
+// Ldflags are the flags that stamp a program with the release at
+// version, and previous.
+var Ldflags = ldflags
