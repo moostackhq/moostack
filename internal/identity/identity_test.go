@@ -7,11 +7,14 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/moostackhq/moostack/internal/identity"
 )
@@ -132,4 +135,50 @@ func ecdsaRequest(t *testing.T) []byte {
 // requestPEM is der as a PEM certificate request.
 func requestPEM(der []byte) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+}
+
+// A certificate from the CA that names the node in its common name, but
+// not among its DNS names, which peers check its name against, is
+// refused, as is one naming another node there.
+func TestLoadRefusesACertificateThatPeersCantCheckTheNodesNameAgainst(t *testing.T) {
+	ca, err := identity.NewCA("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	caBlock, _ := pem.Decode(ca.CertPEM())
+	caCert, err := x509.ParseCertificate(caBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyBlock, _ := pem.Decode(ca.KeyPEM())
+	caKey, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, dnsNames := range map[string][]string{"no DNS names": nil, "another node's": {"node-2"}} {
+		dir := t.TempDir()
+		files := identity.Files{Key: filepath.Join(dir, "node.key"), Cert: filepath.Join(dir, "node.crt"), CA: filepath.Join(dir, "ca.crt")}
+		requestPEM, err := identity.NewKey(files.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reqBlock, _ := pem.Decode(requestPEM)
+		req, err := x509.ParseCertificateRequest(reqBlock.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+			SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "node-1"}, DNSNames: dnsNames,
+			NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+			KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		}, caCert, req.PublicKey, caKey.(ed25519.PrivateKey))
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.WriteFile(files.Cert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644)
+		os.WriteFile(files.CA, ca.CertPEM(), 0o644)
+		if _, err := identity.Load(files); err == nil || !strings.Contains(err.Error(), "DNS names") {
+			t.Errorf("loading a certificate with %s: %v, want it refused for its DNS names", name, err)
+		}
+	}
 }

@@ -207,32 +207,54 @@ func Load(files Files) (*Identity, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parse(keyPEM, certPEM, caPEM, files)
+}
+
+// Parse is the identity of the key keyPEM, the certificate certPEM and
+// the cluster CA's certificate caPEM, as Load checks it.
+func Parse(keyPEM, certPEM, caPEM []byte) (*Identity, error) {
+	return parse(keyPEM, certPEM, caPEM, Files{})
+}
+
+// parse is Parse, naming each part by its path in files, if it has one.
+func parse(keyPEM, certPEM, caPEM []byte, files Files) (*Identity, error) {
+	named := func(what, path string) string {
+		if path == "" {
+			return what
+		}
+		return what + " " + path
+	}
+	keyName, certName, caName := named("the key", files.Key), named("the certificate", files.Cert), named("the CA certificate", files.CA)
 	key, err := parseKey(keyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("the node's identity: %s: %w", files.Key, err)
+		return nil, fmt.Errorf("the node's identity: %s: %w", keyName, err)
 	}
 	cert, err := parseCert(certPEM)
 	if err != nil {
-		return nil, fmt.Errorf("the node's identity: %s: %w", files.Cert, err)
+		return nil, fmt.Errorf("the node's identity: %s: %w", certName, err)
 	}
 	ca, err := parseCert(caPEM)
 	if err != nil {
-		return nil, fmt.Errorf("the node's identity: %s: %w", files.CA, err)
+		return nil, fmt.Errorf("the node's identity: %s: %w", caName, err)
 	}
 	if !key.Public().(ed25519.PublicKey).Equal(cert.PublicKey) {
-		return nil, fmt.Errorf("the node's identity: %s isn't the certificate of the key in %s", files.Cert, files.Key)
+		return nil, fmt.Errorf("the node's identity: %s isn't for %s", certName, keyName)
 	}
 	cas := x509.NewCertPool()
 	cas.AddCert(ca)
-	_, err = cert.Verify(x509.VerifyOptions{
-		Roots:     cas,
-		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("the node's identity: %s wasn't issued by the cluster CA in %s: %w", files.Cert, files.CA, err)
+	// The node proves its identity both as a server and as a client.
+	for _, usage := range []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth} {
+		if _, err := cert.Verify(x509.VerifyOptions{Roots: cas, KeyUsages: []x509.ExtKeyUsage{usage}}); err != nil {
+			return nil, fmt.Errorf("the node's identity: %s wasn't issued by the cluster CA, %s, for a server and a client: %w", certName, caName, err)
+		}
 	}
 	if cert.Subject.CommonName == "" {
-		return nil, fmt.Errorf("the node's identity: %s names no node", files.Cert)
+		return nil, fmt.Errorf("the node's identity: %s names no node", certName)
+	}
+	// Peers check the node's name against the certificate's DNS names, as
+	// TLS checks a server's, never against its common name.
+	if err := cert.VerifyHostname(cert.Subject.CommonName); err != nil {
+		return nil, fmt.Errorf("the node's identity: %s doesn't name its node, %s, among its DNS names, which peers check: %w", certName, cert.Subject.CommonName, err)
 	}
 	return &Identity{
 		Node: cert.Subject.CommonName,

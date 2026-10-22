@@ -85,7 +85,21 @@ func TestThePreflightRefusesANodeInControlPlaneMode(t *testing.T) {
 	o := newOperator(t, "op")
 	source := preflightCluster(t, o)
 	o.nodes["node1"] = &fakeNode{status: nodeclient.Status{Mode: nodev1.Mode_MODE_CONTROL_PLANE, Generation: 1}}
-	nodeAddRefused(t, o, source, "node1", "control plane mode")
+	nodeAddRefused(t, o, source, "node1", "control plane mode", "agent detach")
+}
+
+// A node whose agent is detached, but whose updater still serves the
+// control plane, as for a second after a detach, isn't operated either.
+func TestThePreflightRefusesANodeWhoseUpdaterIsInControlPlaneMode(t *testing.T) {
+	o := newOperator(t, "op")
+	source := preflightCluster(t, o)
+	n := healthyNode(1)
+	n.status.UpdaterMode = nodev1.Mode_MODE_CONTROL_PLANE
+	o.nodes["node2"] = n
+	nodeAddRefused(t, o, source, "node2", "its updater is in control plane mode")
+	// An updater of a release before it said its mode is operated.
+	n.status.UpdaterMode = nodev1.Mode_MODE_UNSPECIFIED
+	nodeAddPassesPreflight(t, o, source)
 }
 
 func TestThePreflightRefusesANodeThatAppliedALaterGeneration(t *testing.T) {

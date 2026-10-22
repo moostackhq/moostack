@@ -2,7 +2,9 @@
 
 // Package agent is the node component that serves the node API, runs
 // the cluster services and carries calls to them, and listens for the
-// node's peers with mTLS.
+// node's peers with mTLS. On a node that has joined a control plane, it
+// serves the node API to the control plane over a tunnel it dials, and
+// its local socket serves only status and break-glass detach.
 package agent
 
 import (
@@ -12,12 +14,16 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
@@ -27,10 +33,12 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 
+	controlplanev1 "github.com/moostackhq/moostack/api/controlplane/v1"
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	servicev1 "github.com/moostackhq/moostack/api/service/v1"
 	"github.com/moostackhq/moostack/internal/abslot"
 	"github.com/moostackhq/moostack/internal/buildid"
+	"github.com/moostackhq/moostack/internal/controlplane"
 	"github.com/moostackhq/moostack/internal/gateway"
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/identity"
@@ -110,15 +118,14 @@ const containerdTimeout = 2 * time.Second
 // won't serve without a valid identity of its own, or with removed
 // identities it can't read. Calls on cfg.Socket that aren't the node
 // API's go to the cluster services, as an operator's, and the services
-// that aren't running are started.
+// that aren't running are started. On a node in control plane mode, it
+// also dials the control plane, and serves it the node API and the
+// cluster services over that tunnel, while cfg.Socket serves only status
+// and break-glass detach.
 func Serve(ctx context.Context, cfg Config) error {
-	data, err := os.ReadFile(cfg.NodeFile)
+	node, err := hostlayout.ReadNodeConfig(cfg.NodeFile)
 	if err != nil {
 		return err
-	}
-	node, err := hostlayout.ParseNodeConfig(data)
-	if err != nil {
-		return fmt.Errorf("%s: %w", cfg.NodeFile, err)
 	}
 	id, err := identity.Load(cfg.Identity)
 	if err != nil {
@@ -162,20 +169,30 @@ func Serve(ctx context.Context, cfg Config) error {
 		Restart:  cfg.RestartUpdater,
 		Healthy:  healthy,
 	}
-	server := grpc.NewServer(gw.ServerOptions(servicev1.CallerKind_CALLER_KIND_OPERATOR)...)
-	agent := &agentServer{version: cfg.Version, mode: modes[node.Mode], containerd: client, shim: filepath.Join(cfg.ContainerdBinDir, hostlayout.ContainerdShim), runc: cfg.Runc, services: services, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile), removed: removed, updater: updater}
+	agent := &agentServer{node: node, nodeFile: cfg.NodeFile, containerd: client, shim: filepath.Join(cfg.ContainerdBinDir, hostlayout.ContainerdShim), runc: cfg.Runc, services: services, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile), removed: removed, updater: updater, version: cfg.Version}
+	agent.controlPlane.Store(node.Mode == hostlayout.ModeControlPlane)
 	agent.containerdBinaries = &containerdBinaries{dir: cfg.ContainerdBinDir, files: cfg.ContainerdFiles, restart: cfg.RestartContainerd, wait: agent.waitContainerd}
 	// The builds are hashed from the start, in the background, so that
 	// status says them by the time an operation asks.
 	agent.build(map[string]string{"agent": executable()})
 	agent.build(agent.containerdFiles())
 	agent.build(map[string]string{"runc": agent.runc})
+	server := grpc.NewServer(append(gw.ServerOptions(servicev1.CallerKind_CALLER_KIND_OPERATOR),
+		controlplane.Lockout(agent.joined, "status and break-glass detach", nodev1.Agent_Status_FullMethodName, nodev1.Agent_Detach_FullMethodName)...)...)
 	nodev1.RegisterAgentServer(server, agent)
 	peers := grpc.NewServer(grpc.Creds(newPeerCredentials(id, removed)))
 	healthpb.RegisterHealthServer(peers, health.NewServer())
+	servers := map[*grpc.Server]net.Listener{server: l, peers: peerListener}
+	if node.Mode == hostlayout.ModeControlPlane {
+		agent.tunnel = controlplane.Listen(controlplane.Tunnel{Address: node.ControlPlane, Identity: id, Protocol: controlplanev1.ProtocolAgent, Log: log.Printf})
+		tunnel := grpc.NewServer(slices.Concat(gw.ServerOptions(servicev1.CallerKind_CALLER_KIND_CONTROL_PLANE), controlplane.ServerOptions(),
+			[]grpc.ServerOption{grpc.ChainUnaryInterceptor(refuseDetach)})...)
+		nodev1.RegisterAgentServer(tunnel, agent)
+		servers[tunnel] = agent.tunnel
+	}
 	go services.StartAll(ctx)
 	go recoverUpdater(ctx, updater)
-	return serveAll(ctx, map[*grpc.Server]net.Listener{server: l, peers: peerListener})
+	return serveAll(ctx, servers)
 }
 
 // serveAll serves each server on its listener until ctx ends or one of
@@ -212,13 +229,21 @@ func serveAll(ctx context.Context, servers map[*grpc.Server]net.Listener) error 
 	return err
 }
 
-// modes are the node API's modes by the node file's names for them.
-var modes = map[string]nodev1.Mode{hostlayout.ModeDirect: nodev1.Mode_MODE_DIRECT}
-
 type agentServer struct {
 	nodev1.UnimplementedAgentServer
-	version    string
-	mode       nodev1.Mode
+	version string
+	// node is what the node file said when the agent started, and
+	// nodeFile the file.
+	node     hostlayout.NodeConfig
+	nodeFile string
+	// controlPlane says whether the node is in control plane mode, rather
+	// than direct mode, until a detach.
+	controlPlane atomic.Bool
+	// tunnel is the tunnel to the control plane, nil on a node that
+	// started in direct mode.
+	tunnel *controlplane.Listener
+	// detaching is held by a detach.
+	detaching  sync.Mutex
 	containerd *containerd.Client
 	// shim is containerd's shim, which must be at containerd's version.
 	shim               string
@@ -235,7 +260,7 @@ type agentServer struct {
 
 func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nodev1.StatusResponse, error) {
 	res := &nodev1.StatusResponse{
-		Mode: s.mode,
+		Mode: s.mode(),
 		Components: []*nodev1.Component{
 			{Name: "agent", Version: s.version, Build: s.build(map[string]string{"agent": executable()}), Health: nodev1.Health_HEALTH_HEALTHY},
 			s.containerdStatus(ctx),
@@ -299,16 +324,25 @@ func (s *agentServer) applied() (appliedGeneration, error) {
 	return a, nil
 }
 
-// writeFile replaces the file at path with data, which a crash leaves
-// either whole or not written at all. Once it returns, the new file
-// survives a crash: its directory is synced after the rename.
+// writeFile replaces the file at path with data, readable by its owner
+// alone, which a crash leaves either whole or not written at all. Once it
+// returns, the new file survives a crash: its directory is synced after
+// the rename.
 func writeFile(path string, data []byte) error {
+	return writeFileMode(path, data, 0o600)
+}
+
+// writeFileMode is writeFile, with the file's mode perm.
+func writeFileMode(path string, data []byte, perm os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	_, err = tmp.Write(data)
+	err = tmp.Chmod(perm)
+	if err == nil {
+		_, err = tmp.Write(data)
+	}
 	if err == nil {
 		err = tmp.Sync()
 	}

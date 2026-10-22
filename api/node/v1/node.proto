@@ -9,7 +9,10 @@ option go_package = "github.com/moostackhq/moostack/api/node/v1;nodev1";
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
-// Agent is the node API that the agent serves.
+// Agent is the node API that the agent serves. On a node in control
+// plane mode, the agent's local socket serves only Status and Detach,
+// and refuses every other call, the cluster services' included, with
+// FAILED_PRECONDITION, so that the node is never operated in both modes.
 service Agent {
   // Status reports the node's mode and the state of its node components.
   rpc Status(StatusRequest) returns (StatusResponse);
@@ -87,10 +90,22 @@ service Agent {
   // while another runs, changing nothing. Once the agent has the
   // binaries, the update goes on even if the call ends.
   rpc UpdateContainerd(stream UpdateContainerdRequest) returns (UpdateContainerdResponse);
+  // Detach is the break-glass detach: it returns a node in control plane
+  // mode to direct mode, for good, once the control plane is lost. The
+  // agent logs it at warning level, records direct mode in the node
+  // file, closes its tunnel to the control plane and lifts the local
+  // socket's lockout. The updater, which reads the node file every
+  // second, then does the same, and reports direct mode in its status.
+  // It is refused over the control plane's tunnel with
+  // PERMISSION_DENIED, since only root on the node may detach it, and on
+  // a node in direct mode with FAILED_PRECONDITION.
+  rpc Detach(DetachRequest) returns (DetachResponse);
 }
 
 // Updater is the node API that the updater serves, on its own socket, so
-// that it answers whatever state the agent is in.
+// that it answers whatever state the agent is in. On a node in control
+// plane mode, the updater's local socket serves only Status, and refuses
+// its other methods with FAILED_PRECONDITION.
 service Updater {
   // Status reports the updater's own state.
   rpc Status(UpdaterStatusRequest) returns (UpdaterStatusResponse);
@@ -249,6 +264,9 @@ message UpdaterStatusRequest {}
 message UpdaterStatusResponse {
   // Updater is the updater itself.
   Component updater = 1;
+  // Mode is the mode the updater serves in, unspecified from a release
+  // before the updater said.
+  Mode mode = 2;
 }
 
 message UpdateAgentRequest {
@@ -322,6 +340,10 @@ message ContainerdFile {
 }
 
 message UpdateContainerdResponse {}
+
+message DetachRequest {}
+
+message DetachResponse {}
 
 // Mode is how the node is operated.
 enum Mode {

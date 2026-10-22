@@ -421,9 +421,11 @@ func check(r Reached) error {
 	case r.Status.UpdaterErr != nil:
 		return &UnreachableError{Err: fmt.Errorf("the updater doesn't answer: %w", r.Status.UpdaterErr)}
 	case r.Status.Mode == nodev1.Mode_MODE_CONTROL_PLANE:
-		return errors.New("it is in control plane mode")
+		return errors.New("it is in control plane mode: a control plane operates it. To operate it from here again, detach it from the control plane with agent detach, run as root on the node")
 	case r.Status.Mode != nodev1.Mode_MODE_DIRECT:
 		return fmt.Errorf("it is in mode %s, not direct mode", r.Status.Mode)
+	case r.Status.UpdaterMode == nodev1.Mode_MODE_CONTROL_PLANE:
+		return errors.New("its updater is in control plane mode, though its agent is in direct mode, as for a second after a detach; try again")
 	}
 	return nil
 }

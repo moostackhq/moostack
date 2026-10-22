@@ -94,6 +94,9 @@ type Status struct {
 	UpdaterErr error
 	// Mode is unspecified if the agent didn't answer.
 	Mode nodev1.Mode
+	// UpdaterMode is the mode the updater serves in, unspecified if it
+	// didn't answer or is of a release before it said.
+	UpdaterMode nodev1.Mode
 	// Generation is the generation of the cluster directory that the node
 	// last applied, 0 if none, and Nodes are the names of that
 	// directory's nodes. Both are unknown, and zero, if the agent didn't
@@ -146,6 +149,7 @@ func (n *Node) Status(ctx context.Context) Status {
 		s.Components = append(s.Components, notAnswering("updater", updaterErr))
 	} else {
 		s.Components = append(s.Components, updater.Updater)
+		s.UpdaterMode = updater.Mode
 	}
 	return s
 }

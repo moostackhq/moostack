@@ -33,13 +33,17 @@ const (
 	Agent_RemoveIdentities_FullMethodName = "/moostack.node.v1.Agent/RemoveIdentities"
 	Agent_UpdateUpdater_FullMethodName    = "/moostack.node.v1.Agent/UpdateUpdater"
 	Agent_UpdateContainerd_FullMethodName = "/moostack.node.v1.Agent/UpdateContainerd"
+	Agent_Detach_FullMethodName           = "/moostack.node.v1.Agent/Detach"
 )
 
 // AgentClient is the client API for Agent service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Agent is the node API that the agent serves.
+// Agent is the node API that the agent serves. On a node in control
+// plane mode, the agent's local socket serves only Status and Detach,
+// and refuses every other call, the cluster services' included, with
+// FAILED_PRECONDITION, so that the node is never operated in both modes.
 type AgentClient interface {
 	// Status reports the node's mode and the state of its node components.
 	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
@@ -117,6 +121,16 @@ type AgentClient interface {
 	// while another runs, changing nothing. Once the agent has the
 	// binaries, the update goes on even if the call ends.
 	UpdateContainerd(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpdateContainerdRequest, UpdateContainerdResponse], error)
+	// Detach is the break-glass detach: it returns a node in control plane
+	// mode to direct mode, for good, once the control plane is lost. The
+	// agent logs it at warning level, records direct mode in the node
+	// file, closes its tunnel to the control plane and lifts the local
+	// socket's lockout. The updater, which reads the node file every
+	// second, then does the same, and reports direct mode in its status.
+	// It is refused over the control plane's tunnel with
+	// PERMISSION_DENIED, since only root on the node may detach it, and on
+	// a node in direct mode with FAILED_PRECONDITION.
+	Detach(ctx context.Context, in *DetachRequest, opts ...grpc.CallOption) (*DetachResponse, error)
 }
 
 type agentClient struct {
@@ -246,11 +260,24 @@ func (c *agentClient) UpdateContainerd(ctx context.Context, opts ...grpc.CallOpt
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Agent_UpdateContainerdClient = grpc.ClientStreamingClient[UpdateContainerdRequest, UpdateContainerdResponse]
 
+func (c *agentClient) Detach(ctx context.Context, in *DetachRequest, opts ...grpc.CallOption) (*DetachResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DetachResponse)
+	err := c.cc.Invoke(ctx, Agent_Detach_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServer is the server API for Agent service.
 // All implementations must embed UnimplementedAgentServer
 // for forward compatibility.
 //
-// Agent is the node API that the agent serves.
+// Agent is the node API that the agent serves. On a node in control
+// plane mode, the agent's local socket serves only Status and Detach,
+// and refuses every other call, the cluster services' included, with
+// FAILED_PRECONDITION, so that the node is never operated in both modes.
 type AgentServer interface {
 	// Status reports the node's mode and the state of its node components.
 	Status(context.Context, *StatusRequest) (*StatusResponse, error)
@@ -328,6 +355,16 @@ type AgentServer interface {
 	// while another runs, changing nothing. Once the agent has the
 	// binaries, the update goes on even if the call ends.
 	UpdateContainerd(grpc.ClientStreamingServer[UpdateContainerdRequest, UpdateContainerdResponse]) error
+	// Detach is the break-glass detach: it returns a node in control plane
+	// mode to direct mode, for good, once the control plane is lost. The
+	// agent logs it at warning level, records direct mode in the node
+	// file, closes its tunnel to the control plane and lifts the local
+	// socket's lockout. The updater, which reads the node file every
+	// second, then does the same, and reports direct mode in its status.
+	// It is refused over the control plane's tunnel with
+	// PERMISSION_DENIED, since only root on the node may detach it, and on
+	// a node in direct mode with FAILED_PRECONDITION.
+	Detach(context.Context, *DetachRequest) (*DetachResponse, error)
 	mustEmbedUnimplementedAgentServer()
 }
 
@@ -370,6 +407,9 @@ func (UnimplementedAgentServer) UpdateUpdater(grpc.ClientStreamingServer[UpdateU
 }
 func (UnimplementedAgentServer) UpdateContainerd(grpc.ClientStreamingServer[UpdateContainerdRequest, UpdateContainerdResponse]) error {
 	return status.Error(codes.Unimplemented, "method UpdateContainerd not implemented")
+}
+func (UnimplementedAgentServer) Detach(context.Context, *DetachRequest) (*DetachResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Detach not implemented")
 }
 func (UnimplementedAgentServer) mustEmbedUnimplementedAgentServer() {}
 func (UnimplementedAgentServer) testEmbeddedByValue()               {}
@@ -557,6 +597,24 @@ func _Agent_UpdateContainerd_Handler(srv interface{}, stream grpc.ServerStream) 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Agent_UpdateContainerdServer = grpc.ClientStreamingServer[UpdateContainerdRequest, UpdateContainerdResponse]
 
+func _Agent_Detach_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DetachRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).Detach(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_Detach_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).Detach(ctx, req.(*DetachRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Agent_ServiceDesc is the grpc.ServiceDesc for Agent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -596,6 +654,10 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "RemoveIdentities",
 			Handler:    _Agent_RemoveIdentities_Handler,
 		},
+		{
+			MethodName: "Detach",
+			Handler:    _Agent_Detach_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -627,7 +689,9 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // Updater is the node API that the updater serves, on its own socket, so
-// that it answers whatever state the agent is in.
+// that it answers whatever state the agent is in. On a node in control
+// plane mode, the updater's local socket serves only Status, and refuses
+// its other methods with FAILED_PRECONDITION.
 type UpdaterClient interface {
 	// Status reports the updater's own state.
 	Status(ctx context.Context, in *UpdaterStatusRequest, opts ...grpc.CallOption) (*UpdaterStatusResponse, error)
@@ -689,7 +753,9 @@ type Updater_UpdateAgentClient = grpc.ClientStreamingClient[UpdateAgentRequest, 
 // for forward compatibility.
 //
 // Updater is the node API that the updater serves, on its own socket, so
-// that it answers whatever state the agent is in.
+// that it answers whatever state the agent is in. On a node in control
+// plane mode, the updater's local socket serves only Status, and refuses
+// its other methods with FAILED_PRECONDITION.
 type UpdaterServer interface {
 	// Status reports the updater's own state.
 	Status(context.Context, *UpdaterStatusRequest) (*UpdaterStatusResponse, error)

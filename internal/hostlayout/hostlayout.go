@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
 
 	"gopkg.in/yaml.v3"
 
+	controlplanev1 "github.com/moostackhq/moostack/api/controlplane/v1"
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/strictyaml"
 )
@@ -207,8 +209,14 @@ func ParseRemovedIdentities(data []byte) ([]string, error) {
 	return fingerprints, err
 }
 
-// ModeDirect is the mode of a node operated by mooctl over SSH.
-const ModeDirect = "direct"
+// The modes a node is operated in.
+const (
+	// ModeDirect is the mode of a node operated by mooctl over SSH.
+	ModeDirect = "direct"
+	// ModeControlPlane is the mode of a node that has joined a control
+	// plane, which operates it.
+	ModeControlPlane = "control_plane"
+)
 
 // NodeConfig is what the node knows about itself.
 type NodeConfig struct {
@@ -216,8 +224,12 @@ type NodeConfig struct {
 	Cluster string `yaml:"cluster"`
 	// Node is the node's name.
 	Node string `yaml:"node"`
-	// Mode is the mode of the node's cluster, ModeDirect for now.
+	// Mode is the mode the node is operated in, ModeDirect or
+	// ModeControlPlane.
 	Mode string `yaml:"mode"`
+	// ControlPlane is where the node dials the control plane it has
+	// joined, as host:port, in ModeControlPlane only.
+	ControlPlane string `yaml:"control_plane,omitempty"`
 	// PrivateAddress is the address other nodes reach the node at, where
 	// the agent listens for them.
 	PrivateAddress netip.Addr `yaml:"private_address"`
@@ -225,6 +237,19 @@ type NodeConfig struct {
 
 // Marshal is c as the node file holds it.
 func (c NodeConfig) Marshal() ([]byte, error) { return yaml.Marshal(c) }
+
+// ReadNodeConfig reads the node file at path, naming it in its errors.
+func ReadNodeConfig(path string) (NodeConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return NodeConfig{}, err
+	}
+	c, err := ParseNodeConfig(data)
+	if err != nil {
+		return NodeConfig{}, fmt.Errorf("%s: %w", path, err)
+	}
+	return c, nil
+}
 
 // ParseNodeConfig parses a node file.
 func ParseNodeConfig(data []byte) (NodeConfig, error) {
@@ -238,7 +263,16 @@ func ParseNodeConfig(data []byte) (NodeConfig, error) {
 	if !c.PrivateAddress.IsValid() {
 		return NodeConfig{}, errors.New("node file: no private address")
 	}
-	if c.Mode != ModeDirect {
+	switch c.Mode {
+	case ModeDirect:
+		if c.ControlPlane != "" {
+			return NodeConfig{}, errors.New("node file: a control plane's address in direct mode")
+		}
+	case ModeControlPlane:
+		if err := controlplanev1.CheckAddress(c.ControlPlane); err != nil {
+			return NodeConfig{}, fmt.Errorf("node file: the control plane's address %q: %w", c.ControlPlane, err)
+		}
+	default:
 		return NodeConfig{}, fmt.Errorf("node file: unknown mode %q", c.Mode)
 	}
 	return c, nil

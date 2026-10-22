@@ -12,6 +12,7 @@ import (
 	"github.com/urfave/cli/v3"
 	"golang.org/x/crypto/ssh"
 
+	controlplanev1 "github.com/moostackhq/moostack/api/controlplane/v1"
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/bootstrap"
 	"github.com/moostackhq/moostack/internal/cluster"
@@ -20,6 +21,7 @@ import (
 	"github.com/moostackhq/moostack/internal/interrupt"
 	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/orchestrate"
+	"github.com/moostackhq/moostack/internal/release"
 	"github.com/moostackhq/moostack/internal/secretstore"
 	"github.com/moostackhq/moostack/internal/sshclient"
 	"github.com/moostackhq/moostack/internal/sshconfig"
@@ -44,11 +46,18 @@ func nodeCommand(env Env) *cli.Command {
 						Name:  "name",
 						Usage: "the node's name, instead of the first free one of node1, node2 and so on",
 					},
+					&cli.StringFlag{
+						Name:  "join-token",
+						Usage: "join the host to the control plane that issued the token, instead of the cluster directory's cluster, installing the release the directory pins",
+					},
 					forceFlag,
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if err := wantArgs(cmd, 1); err != nil {
 						return err
+					}
+					if cmd.IsSet("join-token") {
+						return withHint(nodeJoin(ctx, env, cmd))
 					}
 					return withHint(nodeAdd(ctx, env, cmd))
 				},
@@ -78,21 +87,11 @@ func nodeCommand(env Env) *cli.Command {
 // nodeAdd is mooctl node add.
 func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	target := cmd.Args().First()
-	var private netip.Addr
-	if flag := cmd.String("private-address"); flag != "" {
-		var err error
-		if private, err = netip.ParseAddr(flag); err != nil {
-			return fmt.Errorf("--private-address: %w", err)
-		}
-	}
-	d, err := cluster.Open(cmd.String("dir"))
+	private, err := privateAddressFlag(cmd)
 	if err != nil {
 		return err
 	}
-	if err := installable(env, d.Cluster.Release); err != nil {
-		return err
-	}
-	rel, err := openRelease(ctx, env, cmd, d)
+	d, rel, err := pinnedRelease(ctx, env, cmd)
 	if err != nil {
 		return err
 	}
@@ -107,20 +106,11 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	opts := sshOptions(env)
-	settings, err := sshconfig.Resolve(target, opts.SSH)
+	h, err := reachHost(ctx, env, target, private, "Pinning the host key of %s: %s")
 	if err != nil {
 		return err
 	}
-	key, err := sshclient.FetchHostKey(ctx, target, opts)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(env.Stdout, "Pinning the host key of %s: %s %s\n", target, key.Type(), ssh.FingerprintSHA256(key))
-	c, err := sshclient.Dial(ctx, sshclient.Node{Target: target, HostKeys: []ssh.PublicKey{key}}, opts)
-	if err != nil {
-		return err
-	}
+	c, host, key, private, settings := h.c, h.host, h.key, h.private, h.settings
 	// Once the new node is added, the cluster closes the connection, after
 	// it has released the lock on the node over it.
 	added := false
@@ -129,20 +119,6 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 			c.Close()
 		}
 	}()
-
-	host, err := bootstrap.Check(ctx, c)
-	if err != nil {
-		return fmt.Errorf("%s can't become a node: %w", target, err)
-	}
-	if !private.IsValid() {
-		addrs, err := bootstrap.Addresses(ctx, c)
-		if err == nil {
-			private, err = bootstrap.PrivateAddress(addrs, hostOf(target), settings.HostName)
-		}
-		if err != nil {
-			return fmt.Errorf("%s: %w", target, err)
-		}
-	}
 	name := cmd.String("name")
 	if name == "" {
 		if name, err = d.FreeNodeName(); err != nil {
@@ -201,6 +177,129 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 		return fmt.Errorf("added %s, but cluster status shows these nodes behind until an operation that changes the cluster directory records its generation: %w", name, err)
 	}
 	return nil
+}
+
+// nodeJoin is mooctl node add --join-token: it installs the release the
+// cluster directory pins on the host, and joins it to the control plane
+// of the token, which operates it from then on. It runs no preflight,
+// and leaves the cluster directory as it is.
+func nodeJoin(ctx context.Context, env Env, cmd *cli.Command) error {
+	target := cmd.Args().First()
+	tok, err := controlplanev1.ParseToken(cmd.String("join-token"))
+	if err != nil {
+		return fmt.Errorf("--join-token: %w", err)
+	}
+	switch {
+	case cmd.IsSet("name"):
+		return errors.New("--name doesn't go with --join-token: the control plane names the node")
+	case cmd.Bool("force"):
+		return errors.New("--force doesn't go with --join-token: a node that joins a control plane applies no generation of the cluster directory")
+	}
+	private, err := privateAddressFlag(cmd)
+	if err != nil {
+		return err
+	}
+	_, rel, err := pinnedRelease(ctx, env, cmd)
+	if err != nil {
+		return err
+	}
+	h, err := reachHost(ctx, env, target, private, "Connecting to %s, whose host key is %s")
+	if err != nil {
+		return err
+	}
+	defer h.c.Close()
+	c, host, private := h.c, h.host, h.private
+	fmt.Fprintf(env.Stdout, "Installing release %s on %s (%s), and joining it to the control plane at %s\n", rel.Version, target, host.Architecture, tok.Address)
+	// From here on, a signal cancels the install, which then rolls back,
+	// rather than ending mooctl.
+	ctx, stop := interrupt.Context(ctx, env.Exit)
+	defer stop()
+	joined, err := bootstrap.Join(ctx, c, host, rel, private, tok)
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("joining %s: interrupted: %w", target, err)
+		}
+		return fmt.Errorf("joining %s: %w", target, err)
+	}
+	fmt.Fprintf(env.Stdout, "Joined %s to the control plane at %s, as node %s of cluster %s. The control plane operates it from now on, and its node API refuses changes over SSH.\n", target, tok.Address, joined.Node, joined.Cluster)
+	return nil
+}
+
+// privateAddressFlag is --private-address, invalid if it isn't set.
+func privateAddressFlag(cmd *cli.Command) (netip.Addr, error) {
+	flag := cmd.String("private-address")
+	if flag == "" {
+		return netip.Addr{}, nil
+	}
+	private, err := netip.ParseAddr(flag)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("--private-address: %w", err)
+	}
+	return private, nil
+}
+
+// pinnedRelease opens the cluster directory, and the release it pins,
+// which this mooctl must operate.
+func pinnedRelease(ctx context.Context, env Env, cmd *cli.Command) (*cluster.Dir, *release.Release, error) {
+	d, err := cluster.Open(cmd.String("dir"))
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := installable(env, d.Cluster.Release); err != nil {
+		return nil, nil, err
+	}
+	rel, err := openRelease(ctx, env, cmd, d)
+	if err != nil {
+		return nil, nil, err
+	}
+	return d, rel, nil
+}
+
+// reachedHost is a host that reachHost reached over SSH and checked.
+type reachedHost struct {
+	c        *sshclient.Client
+	settings sshconfig.Settings
+	key      ssh.PublicKey
+	host     bootstrap.Host
+	// private is the address other nodes reach it at.
+	private netip.Addr
+}
+
+// reachHost connects to target over SSH, trusting the host key it finds,
+// which it prints as says, with target and the key, checks that the host
+// can become a node, and finds the address other nodes reach it at,
+// unless private is given. Close the client when done.
+func reachHost(ctx context.Context, env Env, target string, private netip.Addr, says string) (*reachedHost, error) {
+	opts := sshOptions(env)
+	settings, err := sshconfig.Resolve(target, opts.SSH)
+	if err != nil {
+		return nil, err
+	}
+	key, err := sshclient.FetchHostKey(ctx, target, opts)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(env.Stdout, says+"\n", target, key.Type()+" "+ssh.FingerprintSHA256(key))
+	c, err := sshclient.Dial(ctx, sshclient.Node{Target: target, HostKeys: []ssh.PublicKey{key}}, opts)
+	if err != nil {
+		return nil, err
+	}
+	host, err := bootstrap.Check(ctx, c)
+	if err != nil {
+		c.Close()
+		return nil, fmt.Errorf("%s can't become a node: %w", target, err)
+	}
+	if !private.IsValid() {
+		addrs, err := bootstrap.Addresses(ctx, c)
+		if err == nil {
+			private, err = bootstrap.PrivateAddress(addrs, hostOf(target), settings.HostName)
+		}
+		if err != nil {
+			c.Close()
+			return nil, fmt.Errorf("%s: %w", target, err)
+		}
+	}
+	return &reachedHost{c: c, settings: settings, key: key, host: host, private: private}, nil
 }
 
 // nodeRemove is mooctl node remove.

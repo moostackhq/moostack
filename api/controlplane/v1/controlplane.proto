@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+// What a node needs of a control plane: joining it. Once joined, the
+// node's agent and updater each dial the control plane and serve their
+// node API to it over that connection, as contract.go says.
+package moostack.controlplane.v1;
+
+option go_package = "github.com/moostackhq/moostack/api/controlplane/v1;controlplanev1";
+
+// ControlPlane is what a control plane serves to a node that joins it,
+// over TLS under the protocol name ProtocolJoin. The control plane
+// presents its certificate together with its CA's, so that the node can
+// find the CA that the join token names.
+service ControlPlane {
+  // Join issues the node its node identity, if the request carries a
+  // secret of a join token the control plane issued and no node has
+  // joined with yet. It refuses any other with PERMISSION_DENIED, and a
+  // certificate request it can't use with INVALID_ARGUMENT, issuing
+  // nothing. The node takes PERMISSION_DENIED, INVALID_ARGUMENT,
+  // UNAUTHENTICATED and UNIMPLEMENTED as nothing issued, so a control
+  // plane, or a proxy in front of it, answers them only when it issued
+  // nothing, and takes any other failure, once the control plane has sent
+  // it anything, as an identity that may have been issued, its token
+  // spent.
+  rpc Join(JoinRequest) returns (JoinResponse);
+}
+
+// JoinToken is what an operator gives node add to join a node to a
+// control plane, as EncodeToken writes it.
+message JoinToken {
+  // Address is where the node dials the control plane, as host:port. The
+  // control plane's certificate must be for the host.
+  string address = 1;
+  // CaFingerprint is the fingerprint of the control plane's CA
+  // certificate: the SHA-256 of its DER, hex, after "sha256:".
+  string ca_fingerprint = 2;
+  // Secret lets one node join.
+  string secret = 3;
+}
+
+message JoinRequest {
+  // Secret is the join token's.
+  string secret = 1;
+  // CertificateRequest is a PEM certificate request for the node's
+  // ed25519 key, which never leaves the node.
+  bytes certificate_request = 2;
+}
+
+message JoinResponse {
+  // Certificate is the node's identity: a PEM certificate for the key of
+  // the request, issued by the CA, valid for both server and client
+  // authentication, whose common name is the node's name, which is also
+  // among its DNS names, since peers check a node's name against those.
+  bytes certificate = 1;
+  // Ca is the CA's PEM certificate, whose fingerprint the token names.
+  bytes ca = 2;
+  // Cluster is the name of the node's cluster.
+  string cluster = 3;
+}

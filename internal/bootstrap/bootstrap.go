@@ -2,13 +2,16 @@
 // host, installs containerd, the updater and the agent from a release as
 // systemd units, issues the node its identity, seeds the release's
 // cluster services into containerd through the agent and starts them,
-// and removes it all again if anything fails.
+// and removes it all again if anything fails. Or it joins the host to a
+// control plane, which issues the node its identity and starts the
+// cluster services itself.
 package bootstrap
 
 import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -18,7 +21,9 @@ import (
 	"text/template"
 	"time"
 
+	controlplanev1 "github.com/moostackhq/moostack/api/controlplane/v1"
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
+	"github.com/moostackhq/moostack/internal/controlplane"
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/nodeclient"
@@ -218,7 +223,21 @@ func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 	if err != nil {
 		return "", err
 	}
-	fingerprint, err := install(ctx, c, h, rel, node, ca, removed, wait)
+	fingerprint, err := install(ctx, c, h, rel, wait, installPlan{
+		identify: func() (identified, error) {
+			request, err := output(ctx, c, hostlayout.Agent+" request-identity")
+			if err != nil {
+				return identified{}, fmt.Errorf("making the node's key: %w", err)
+			}
+			cert, err := ca.Issue([]byte(request), node.Node)
+			if err != nil {
+				return identified{}, fmt.Errorf("issuing the node's identity: %w", err)
+			}
+			return identified{node: node, cert: cert, ca: ca.CertPEM()}, nil
+		},
+		removed:  removed,
+		services: true,
+	})
 	if err != nil {
 		return "", Rollback(ctx, c, err)
 	}
@@ -239,7 +258,74 @@ func Rollback(ctx context.Context, c *sshclient.Client, err error) error {
 // when Uninstall can't: what to stop and what to remove.
 var CleanByHand = fmt.Sprintf("stop %s and remove %s by hand", strings.Join(units, ", "), strings.Join(installed(), ", "))
 
-func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig, ca *identity.CA, removed []string, wait time.Duration) (string, error) {
+// Join installs the components of rel for the host's architecture, has
+// the agent join the control plane of tok, and starts the components in
+// control plane mode, as a node of the control plane's cluster with
+// private as its private address. It waits until the agent and the
+// updater report the components healthy at rel's versions, and leaves
+// the cluster services to the control plane. The node's key is made on
+// the host, and never leaves it, and so does tok's secret, which goes to
+// the agent on its stdin. The host must have passed Check. If Join
+// fails, it rolls back. Join returns what the node got from the control
+// plane.
+func Join(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, private netip.Addr, tok *controlplanev1.JoinToken) (*controlplane.Joined, error) {
+	wait, err := healthWait()
+	if err != nil {
+		return nil, err
+	}
+	var joined *controlplane.Joined
+	_, err = install(ctx, c, h, rel, wait, installPlan{identify: func() (identified, error) {
+		token, err := controlplanev1.EncodeToken(tok)
+		if err != nil {
+			return identified{}, err
+		}
+		res, err := c.Run(ctx, hostlayout.Agent+" join", strings.NewReader(token+"\n"))
+		switch {
+		case err != nil:
+			// The session ended, as by an interrupt or a cut connection,
+			// but agent join may run on.
+			return identified{}, fmt.Errorf("joining the control plane at %s: %w; agent join may still finish on the host, spending the join token, so the control plane may hold a node that no host is", tok.Address, err)
+		case res.ExitCode != 0:
+			return identified{}, fmt.Errorf("agent join failed: %s", strings.TrimPrefix(string(bytes.TrimSpace(res.Stderr)), "agent: "))
+		}
+		var j controlplane.Joined
+		if err := json.Unmarshal(res.Stdout, &j); err != nil {
+			return identified{}, fmt.Errorf("agent join printed %q: %w; it may have joined the control plane, spending the join token", res.Stdout, err)
+		}
+		joined = &j
+		node := hostlayout.NodeConfig{Cluster: joined.Cluster, Node: joined.Node, Mode: hostlayout.ModeControlPlane, ControlPlane: tok.Address, PrivateAddress: private}
+		return identified{node: node, cert: joined.Certificate, ca: joined.CA}, nil
+	}})
+	if err != nil {
+		if joined != nil {
+			err = fmt.Errorf("%w\nThe control plane at %s issued the host its identity as node %s, so the join token is spent: ask the control plane for a new one, and to forget node %s", err, tok.Address, joined.Node, joined.Node)
+		}
+		return nil, Rollback(ctx, c, err)
+	}
+	return joined, nil
+}
+
+// identified is how a node is identified: its node file, its
+// certificate and the CA's, both PEM.
+type identified struct {
+	node     hostlayout.NodeConfig
+	cert, ca []byte
+}
+
+// installPlan is what tells one install from another: how the node gets
+// its identity, once its key is the only one there can be, the
+// identities it holds as removed, and whether it starts the release's
+// cluster services.
+type installPlan struct {
+	identify func() (identified, error)
+	removed  []string
+	services bool
+}
+
+// install installs the components of rel, identified as plan says, and
+// starts them, and the cluster services if plan says. It returns the
+// fingerprint of the node's identity.
+func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, wait time.Duration, plan installPlan) (string, error) {
 	if _, err := output(ctx, c, "mkdir -p "+hostlayout.BinDir+" "+hostlayout.ConfigDir); err != nil {
 		return "", err
 	}
@@ -266,35 +352,31 @@ func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 			return "", err
 		}
 	}
-	request, err := output(ctx, c, hostlayout.Agent+" request-identity")
-	if err != nil {
-		return "", fmt.Errorf("making the node's key: %w", err)
-	}
-	cert, err := ca.Issue([]byte(request), node.Node)
-	if err != nil {
-		return "", fmt.Errorf("issuing the node's identity: %w", err)
-	}
-	fingerprint, err := identity.Fingerprint(cert)
+	id, err := plan.identify()
 	if err != nil {
 		return "", err
 	}
-	nodeFile, err := node.Marshal()
+	fingerprint, err := identity.Fingerprint(id.cert)
+	if err != nil {
+		return "", err
+	}
+	nodeFile, err := id.node.Marshal()
 	if err != nil {
 		return "", err
 	}
 	files := append([]hostFile{
 		{hostlayout.NodeFile, string(nodeFile)},
 		{hostlayout.ContainerdConfigFile, hostlayout.ContainerdConfig},
-		{hostlayout.Identity.Cert, string(cert)},
-		{hostlayout.Identity.CA, string(ca.CertPEM())},
+		{hostlayout.Identity.Cert, string(id.cert)},
+		{hostlayout.Identity.CA, string(id.ca)},
 	}, unitFiles...)
 	for _, f := range files {
 		if err := c.Upload(ctx, f.path, strings.NewReader(f.content), 0o644, "root:root"); err != nil {
 			return "", err
 		}
 	}
-	// The state directory exists once request-identity has made the key.
-	if err := c.Upload(ctx, hostlayout.RemovedIdentitiesFile, bytes.NewReader(hostlayout.MarshalRemovedIdentities(removed)), 0o600, "root:root"); err != nil {
+	// The state directory exists once the node's key is made.
+	if err := c.Upload(ctx, hostlayout.RemovedIdentitiesFile, bytes.NewReader(hostlayout.MarshalRemovedIdentities(plan.removed)), 0o600, "root:root"); err != nil {
 		return "", err
 	}
 	if _, err := output(ctx, c, "systemctl daemon-reload && systemctl enable --now "+strings.Join(units, " ")); err != nil {
@@ -307,6 +389,9 @@ func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 	defer api.Close()
 	if err := waitHealthy(ctx, api, wait, func(s nodeclient.Status) error { return componentsHealthy(s, rel) }); err != nil {
 		return "", err
+	}
+	if !plan.services {
+		return fingerprint, nil
 	}
 	if err := startServices(ctx, api, h, rel); err != nil {
 		return "", err

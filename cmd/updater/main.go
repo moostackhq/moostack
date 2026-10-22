@@ -37,6 +37,7 @@ func run(args []string) error {
 		return updater.Serve(ctx, updater.Config{
 			Version:       buildinfo.Version,
 			Socket:        hostlayout.UpdaterSocket,
+			NodeFile:      hostlayout.NodeFile,
 			Identity:      hostlayout.Identity,
 			Agent:         hostlayout.Agent,
 			AgentSlots:    hostlayout.AgentSlots,

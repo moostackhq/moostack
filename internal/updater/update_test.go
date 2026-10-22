@@ -211,6 +211,25 @@ func TestAnUpdaterThatCrashesMidSwapSwitchesBackWhenItStarts(t *testing.T) {
 	wantAgent(t, n, nodetest.Version, hostlayout.AgentSlots[0])
 }
 
+// The updater switches the agent back before it reads the node file, so
+// that a node file it can't read doesn't leave the agent swapped.
+func TestAnUpdaterThatCrashesMidSwapSwitchesBackWithANodeFileItCantRead(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	done := make(chan error, 1)
+	go func() { done <- update(t, n, neverServes, nodetest.NextVersion, 5*time.Minute) }()
+	waitForLink(t, n, hostlayout.AgentSlots[1])
+	n.WriteConfig(t, hostlayout.NodeFile, []byte("not a node file\n"))
+	n.Crash(t, "updater")
+	<-done
+	// The agent, restarted on the node file it can't read either, doesn't
+	// serve, but runs from the slot it ran from before.
+	waitForNoSwapRecord(t, n)
+	if got := link(t, n); got != filepath.Base(hostlayout.AgentSlots[0]) {
+		t.Errorf("%s links to %s, want %s", hostlayout.Agent, got, filepath.Base(hostlayout.AgentSlots[0]))
+	}
+}
+
 func TestARollbackWhoseRestartFailsKeepsTheSwapAndRefusesUpdatesUntilTheNextStart(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)

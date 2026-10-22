@@ -9,6 +9,7 @@ package nodetest
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -30,6 +31,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
+	"github.com/moostackhq/moostack/internal/controlplane"
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/nodeclient"
@@ -154,6 +156,21 @@ func stopScript(name, signal string) string {
 // its request.
 func Start(t *testing.T) *Node {
 	t.Helper()
+	return start(t, nil)
+}
+
+// StartJoined starts a node joined to peer, as node add --join-token
+// joins it: agent join gets the node's identity from peer, and the node
+// starts in control plane mode. Agent and Updater call the node's local
+// sockets, and peer calls the node API over its tunnels.
+func StartJoined(t *testing.T, peer *TunnelPeer) *Node {
+	t.Helper()
+	return start(t, peer)
+}
+
+// start starts a node, joined to peer unless it is nil.
+func start(t *testing.T, peer *TunnelPeer) *Node {
+	t.Helper()
 	if exec.Command("docker", "info").Run() != nil {
 		t.Skip("docker doesn't work")
 	}
@@ -161,12 +178,21 @@ func Start(t *testing.T) *Node {
 	bin := binaries(t)
 	n := &Node{NodeName: "node-1", config: t.TempDir()}
 	// The state directory is a volume of its own, since containerd's
-	// snapshots can't be overlays on the container's overlay.
-	out, err := exec.Command("docker", "run", "-d", "--rm", "--privileged",
-		"-v", bin+":"+builtDir+":ro",
-		"-v", n.config+":"+hostlayout.ConfigDir+":ro",
-		"-v", hostlayout.StateDir,
-		"debian:13-slim", "sleep", "infinity").Output()
+	// snapshots can't be overlays on the container's overlay. The agent
+	// of a joined node rewrites the node file when it detaches, and
+	// reaches the peer by TunnelHost.
+	config := n.config + ":" + hostlayout.ConfigDir + ":ro"
+	if peer != nil {
+		config = n.config + ":" + hostlayout.ConfigDir
+	}
+	args := []string{"run", "-d", "--rm", "--privileged",
+		"-v", bin + ":" + builtDir + ":ro",
+		"-v", config,
+		"-v", hostlayout.StateDir}
+	if peer != nil {
+		args = append(args, "--add-host", TunnelHost+":host-gateway")
+	}
+	out, err := exec.Command("docker", append(args, "debian:13-slim", "sleep", "infinity")...).Output()
 	if err != nil {
 		t.Fatalf("starting the node: %v\n%s", err, stderr(err))
 	}
@@ -194,15 +220,7 @@ func Start(t *testing.T) *Node {
 	}
 	n.PeerAddress = netip.AddrPortFrom(private, hostlayout.PeerPort)
 
-	nodeFile, err := hostlayout.NodeConfig{Cluster: "test", Node: n.NodeName, Mode: hostlayout.ModeDirect, PrivateAddress: private}.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
-	n.WriteConfig(t, hostlayout.NodeFile, nodeFile)
 	n.WriteConfig(t, hostlayout.ContainerdConfigFile, []byte(hostlayout.ContainerdConfig))
-	if n.CA, err = identity.NewCA("test"); err != nil {
-		t.Fatal(err)
-	}
 	n.Exec(t, "root", "sh", "-c", "set -e\n"+
 		"mkdir -p "+hostlayout.BinDir+"\n"+
 		"find "+builtDir+" -maxdepth 1 -type f -exec cp {} "+hostlayout.BinDir+" \\;\n"+
@@ -212,13 +230,40 @@ func Start(t *testing.T) *Node {
 		"ln -s "+filepath.Base(hostlayout.UpdaterSlots[0])+" "+hostlayout.Updater+"\n"+
 		"cat >/usr/local/bin/systemctl <<'EOF'\n"+systemctl()+"EOF\n"+
 		"chmod 755 /usr/local/bin/systemctl\n")
-	request, err := exec.Command("docker", "exec", n.Name, hostlayout.Agent, "request-identity").Output()
-	if err != nil {
-		t.Fatalf("making the node's key: %v\n%s", err, stderr(err))
+	node := hostlayout.NodeConfig{Cluster: "test", Node: n.NodeName, Mode: hostlayout.ModeDirect, PrivateAddress: private}
+	if peer == nil {
+		if n.CA, err = identity.NewCA("test"); err != nil {
+			t.Fatal(err)
+		}
+		request, err := exec.Command("docker", "exec", n.Name, hostlayout.Agent, "request-identity").Output()
+		if err != nil {
+			t.Fatalf("making the node's key: %v\n%s", err, stderr(err))
+		}
+		n.request = request
+		n.WriteConfig(t, hostlayout.Identity.Cert, n.Issue(t, n.CA, request))
+		n.WriteConfig(t, hostlayout.Identity.CA, n.CA.CertPEM())
+	} else {
+		cmd := exec.Command("docker", "exec", "-i", n.Name, hostlayout.Agent, "join")
+		cmd.Stdin = strings.NewReader(peer.Token(t) + "\n")
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("joining the tunnel peer: %v\n%s", err, stderr(err))
+		}
+		var joined controlplane.Joined
+		if err := json.Unmarshal(out, &joined); err != nil {
+			t.Fatalf("agent join printed %q: %v", out, err)
+		}
+		n.CA, n.NodeName = peer.CA, joined.Node
+		node.Node, node.Cluster = joined.Node, joined.Cluster
+		node.Mode, node.ControlPlane = hostlayout.ModeControlPlane, peer.Address
+		n.WriteConfig(t, hostlayout.Identity.Cert, joined.Certificate)
+		n.WriteConfig(t, hostlayout.Identity.CA, joined.CA)
 	}
-	n.request = request
-	n.WriteConfig(t, hostlayout.Identity.Cert, n.Issue(t, n.CA, request))
-	n.WriteConfig(t, hostlayout.Identity.CA, n.CA.CertPEM())
+	nodeFile, err := node.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.WriteConfig(t, hostlayout.NodeFile, nodeFile)
 
 	var script strings.Builder
 	for _, p := range programs {
@@ -654,6 +699,13 @@ func Service(name string) *nodev1.Service {
 func (n *Node) AgentConn(t *testing.T) *grpc.ClientConn {
 	t.Helper()
 	return n.dial(t, hostlayout.AgentSocket)
+}
+
+// UpdaterConn is a connection to the updater's socket, through its
+// relay.
+func (n *Node) UpdaterConn(t *testing.T) *grpc.ClientConn {
+	t.Helper()
+	return n.dial(t, hostlayout.UpdaterSocket)
 }
 
 // Kill kills one of the node's programs: containerd, updater or agent.
