@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -198,6 +199,13 @@ func TestJoinRefusesAControlPlaneItCantTrust(t *testing.T) {
 	}{
 		{name: "another CA", edit: otherCert, want: "CA"},
 		{name: "no CA presented", edit: func(t *testing.T, cp *fakeControlPlane) { cp.cert = serverCert(t, cp.ca, "localhost", true) }, want: "CA"},
+		{name: "another CA's certificate with the token's CA after it", edit: func(t *testing.T, cp *fakeControlPlane) {
+			// The token's CA is public, so an impostor can present it
+			// too: only the certificate it issued is trusted.
+			otherCert(t, cp)
+			block, _ := pem.Decode(cp.ca.CertPEM())
+			cp.cert.Certificate = append(cp.cert.Certificate, block.Bytes)
+		}, want: "isn't the join token's CA's"},
 		{name: "a certificate for another host", edit: func(t *testing.T, cp *fakeControlPlane) { cp.cert = serverCert(t, cp.ca, "cp.example.com", false) }, want: "localhost"},
 		{name: "no protocol name", protos: []string{}, want: controlplanev1.ProtocolJoin},
 		{name: "an answer with another CA", answer: func(t *testing.T, cp *fakeControlPlane) func(*controlplanev1.JoinRequest) (*controlplanev1.JoinResponse, error) {

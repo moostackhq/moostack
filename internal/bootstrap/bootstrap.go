@@ -290,7 +290,7 @@ func Join(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release
 		}
 		var j controlplane.Joined
 		if err := json.Unmarshal(res.Stdout, &j); err != nil {
-			return identified{}, fmt.Errorf("agent join printed %q: %w; it may have joined the control plane, spending the join token", res.Stdout, err)
+			return identified{}, fmt.Errorf("agent join printed %q: %w; it may have joined the control plane at %s all the same, spending the join token: ask the control plane whether it issued the host an identity, and if so, for a new token, and to forget the node", res.Stdout, err, tok.Address)
 		}
 		joined = &j
 		node := hostlayout.NodeConfig{Cluster: joined.Cluster, Node: joined.Node, Mode: hostlayout.ModeControlPlane, ControlPlane: tok.Address, PrivateAddress: private}

@@ -56,6 +56,33 @@ func TestTheAgentGrantsTheLockToOneLeaseAtATime(t *testing.T) {
 	}
 }
 
+func TestARenewalHoldsTheLockForItsTTLFromTheCall(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	held := acquire(t, n, "a", time.Minute)
+	// Asked again, or renewed, for less than the lock has left, it ends
+	// sooner: the new ttl counts from the call, not from the old end,
+	// and replaces it.
+	for _, c := range []struct {
+		what string
+		call func() *nodev1.Lock
+		ttl  time.Duration
+	}{
+		{"acquired again", func() *nodev1.Lock { return acquire(t, n, "a", 10*time.Second) }, 10 * time.Second},
+		{"renewed", func() *nodev1.Lock { return renew(t, n, "a", 5*time.Second) }, 5 * time.Second},
+	} {
+		before := time.Now().Add(-time.Second)
+		got := c.call()
+		after := time.Now().Add(time.Second)
+		if until := got.GetUntil().AsTime(); until.Before(before.Add(c.ttl)) || until.After(after.Add(c.ttl)) {
+			t.Errorf("%s for %s, the lock is held until %s, want %s from the call, between %s and %s", c.what, c.ttl, until, c.ttl, before.Add(c.ttl), after.Add(c.ttl))
+		}
+		if !got.GetSince().AsTime().Equal(held.GetSince().AsTime()) {
+			t.Errorf("%s, the lock is held since %s, want %s", c.what, got.GetSince().AsTime(), held.GetSince().AsTime())
+		}
+	}
+}
+
 func TestALeaseThatIsntRenewedExpires(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
