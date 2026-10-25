@@ -58,10 +58,10 @@ type Node interface {
 	// ImportImage has the node's agent import the image in archive, an OCI
 	// image layout archive, and returns the names of the images imported.
 	ImportImage(ctx context.Context, archive []byte) ([]string, error)
-	// RunService has the node's agent run the cluster service svc, from
-	// its image, which the node must have imported, replacing the one of
-	// its name that runs.
-	RunService(ctx context.Context, svc *nodev1.Service) error
+	// Run has the node's agent run the container c, from its image, which
+	// the node must have imported, replacing the one of its name, for the
+	// operation whose lease holds the node's operation lock.
+	Run(ctx context.Context, c *nodev1.Container, lease string) error
 	// Close closes the connection.
 	Close() error
 }

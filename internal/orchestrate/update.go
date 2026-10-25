@@ -8,6 +8,7 @@ import (
 	"time"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
+	"github.com/moostackhq/moostack/internal/nodeclient"
 )
 
 // NodeComponents are the node components that an update installs on
@@ -180,7 +181,7 @@ func (c *Cluster) updateComponents(ctx context.Context, n *namedConn, rel NodeRe
 // the target already, healthy.
 func (c *Cluster) updateServices(ctx context.Context, n *namedConn, rel NodeRelease, told func(Step)) error {
 	statusCtx, cancel := context.WithTimeout(ctx, c.reachTimeout)
-	running := runningHealthy(n.conn.Status(statusCtx).Services)
+	running := runningHealthy(n.conn.Status(statusCtx).Services())
 	cancel()
 	for _, svc := range rel.Services {
 		step := Step{Node: n.name, Component: "the " + svc.Name + " service", Version: svc.Version}
@@ -216,7 +217,7 @@ func (c *Cluster) updateService(ctx context.Context, n *namedConn, svc Service) 
 	if err := c.CheckLock(); err != nil {
 		return err
 	}
-	err = n.conn.RunService(ctx, &nodev1.Service{Name: svc.Name, Version: svc.Version, Api: svc.API, Image: svc.Image})
+	err = n.conn.Run(ctx, nodeclient.ServiceContainer(svc.Name, svc.API, svc.Image), c.lease.Lease)
 	if err != nil {
 		return err
 	}
@@ -226,7 +227,7 @@ func (c *Cluster) updateService(ctx context.Context, n *namedConn, svc Service) 
 		statusCtx, cancelStatus := context.WithTimeout(ctx, c.reachTimeout)
 		status := n.conn.Status(statusCtx)
 		cancelStatus()
-		if atTarget(runningHealthy(status.Services)[svc.Name], svc.Version, svc.Build, svc.ManyBuilds) {
+		if atTarget(runningHealthy(status.Services())[svc.Name], svc.Version, svc.Build, svc.ManyBuilds) {
 			return nil
 		}
 		select {

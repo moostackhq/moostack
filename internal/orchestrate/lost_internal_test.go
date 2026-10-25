@@ -10,6 +10,7 @@ import (
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/nodeclient"
+	"github.com/moostackhq/moostack/internal/release"
 )
 
 // A machine that sleeps stops the monotonic clock but not the wall
@@ -225,7 +226,11 @@ type serviceRecorder struct {
 }
 
 func (r *serviceRecorder) Status(context.Context) nodeclient.Status {
-	return nodeclient.Status{Services: r.services}
+	var containers []*nodev1.ContainerStatus
+	for _, c := range r.services {
+		containers = append(containers, &nodev1.ContainerStatus{Name: c.Name, Image: release.ImageRef(c.Name, c.Version), Health: c.Health})
+	}
+	return nodeclient.Status{Containers: containers}
 }
 
 func (r *serviceRecorder) ImportImage(_ context.Context, archive []byte) ([]string, error) {
@@ -235,9 +240,10 @@ func (r *serviceRecorder) ImportImage(_ context.Context, archive []byte) ([]stri
 	return []string{string(archive)}, nil
 }
 
-func (r *serviceRecorder) RunService(_ context.Context, svc *nodev1.Service) error {
-	r.steps = append(r.steps, svc.Name)
-	r.services = append(r.services, &nodev1.Component{Name: svc.Name, Version: svc.Version, Health: nodev1.Health_HEALTH_HEALTHY})
+func (r *serviceRecorder) Run(_ context.Context, c *nodev1.Container, _ string) error {
+	r.steps = append(r.steps, c.Name)
+	version, _ := release.ServiceVersion(c.Name, c.Image)
+	r.services = append(r.services, &nodev1.Component{Name: c.Name, Version: version, Health: nodev1.Health_HEALTH_HEALTHY})
 	if r.onRun != nil {
 		r.onRun()
 	}
@@ -261,8 +267,8 @@ func TestUpdateRunsNoNextServiceOnceTheLeaseRanOutWhileTheMachineSlept(t *testin
 	}
 	releaseOf := func(string) (NodeRelease, error) {
 		return NodeRelease{Services: []Service{
-			{Name: "dns", Version: "2.0.0", Image: "dns", Archive: []byte("dns")},
-			{Name: "proxy", Version: "2.0.0", Image: "proxy", Archive: []byte("proxy")},
+			{Name: "dns", Version: "2.0.0", Image: "moostack.local/dns:2.0.0", Archive: []byte("moostack.local/dns:2.0.0")},
+			{Name: "proxy", Version: "2.0.0", Image: "moostack.local/proxy:2.0.0", Archive: []byte("moostack.local/proxy:2.0.0")},
 		}}, nil
 	}
 	err := c.updateServices(context.Background(), n, must(releaseOf("node1")), func(Step) {})
@@ -291,7 +297,7 @@ func TestUpdateRunsNoServiceOnceTheLeaseRanOutWhileItsImageImported(t *testing.T
 		c.mu.Unlock()
 	}
 	releaseOf := func(string) (NodeRelease, error) {
-		return NodeRelease{Services: []Service{{Name: "dns", Version: "2.0.0", Image: "dns", Archive: []byte("dns")}}}, nil
+		return NodeRelease{Services: []Service{{Name: "dns", Version: "2.0.0", Image: "moostack.local/dns:2.0.0", Archive: []byte("moostack.local/dns:2.0.0")}}}, nil
 	}
 	err := c.updateServices(context.Background(), n, must(releaseOf("node1")), func(Step) {})
 	if !errors.Is(err, ErrLockLost) {

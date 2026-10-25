@@ -72,6 +72,17 @@ func component(name, version string, health nodev1.Health, problem string) *node
 	return &nodev1.Component{Name: name, Version: version, Health: health, Problem: problem}
 }
 
+// asContainers are the cluster services as a node reports them: each a
+// container that runs the release's image of the service at its version.
+func asContainers(services []*nodev1.Component) []*nodev1.ContainerStatus {
+	var containers []*nodev1.ContainerStatus
+	for _, s := range services {
+		containers = append(containers, &nodev1.ContainerStatus{Name: s.Name, Image: release.ImageRef(s.Name, s.Version), Digest: s.Build,
+			State: nodev1.TaskState_TASK_STATE_RUNNING, Health: s.Health, Problem: s.Problem})
+	}
+	return containers
+}
+
 const (
 	healthy   = nodev1.Health_HEALTH_HEALTHY
 	unhealthy = nodev1.Health_HEALTH_UNHEALTHY

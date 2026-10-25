@@ -13,7 +13,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/buildid"
@@ -21,6 +25,7 @@ import (
 	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/ociimage"
 	"github.com/moostackhq/moostack/internal/orchestrate"
+	"github.com/moostackhq/moostack/internal/release"
 )
 
 // fakeNode answers for a node in place of its node API.
@@ -212,10 +217,18 @@ func (n *fakeNode) runsServices(version string, services ...string) *fakeNode {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, name := range services {
-		n.status.Services = slices.DeleteFunc(n.status.Services, func(c *nodev1.Component) bool { return c.Name == name })
-		n.status.Services = append(n.status.Services, &nodev1.Component{Name: name, Version: version, Health: nodev1.Health_HEALTH_HEALTHY})
+		n.setService(&nodev1.Component{Name: name, Version: version, Health: nodev1.Health_HEALTH_HEALTHY})
 	}
 	return n
+}
+
+// setService has the node report the cluster service c as an agent
+// does: as a container from the release's image of it, of the build c
+// says. n.mu is held.
+func (n *fakeNode) setService(c *nodev1.Component) {
+	n.status.Containers = slices.DeleteFunc(n.status.Containers, func(s *nodev1.ContainerStatus) bool { return s.Name == c.Name })
+	n.status.Containers = append(n.status.Containers, &nodev1.ContainerStatus{Name: c.Name, Image: release.ImageRef(c.Name, c.Version), Digest: c.Build,
+		State: nodev1.TaskState_TASK_STATE_RUNNING, Health: c.Health, Problem: c.Problem})
 }
 
 // generations are the generations recorded on the node so far.
@@ -229,7 +242,7 @@ func (n *fakeNode) Status(context.Context) nodeclient.Status {
 	n.mu.Lock()
 	s := n.status
 	s.Components = slices.Clone(s.Components)
-	s.Services = slices.Clone(s.Services)
+	s.Containers = slices.Clone(s.Containers)
 	n.mu.Unlock()
 	s.Lock = n.heldLock()
 	return s
@@ -350,21 +363,36 @@ func (n *fakeNode) ImportImage(_ context.Context, archive []byte) ([]string, err
 	}
 }
 
-// RunService records an update to the service, as "service", its name,
-// version and image, and has the node report it running at its version,
-// healthy, of the build of the image it imported under that name, unless
-// serviceErr is set. Successful updates of components show in the node's
-// status too, with the build of their binaries.
-func (n *fakeNode) RunService(_ context.Context, svc *nodev1.Service) error {
+// Run records an update to the service that c runs, as "service", its
+// name, version and image, and has the node report it running at its
+// version, healthy, of the build of the image it imported under that
+// name, unless serviceErr is set. As the agent does, it refuses c once
+// ctx ended, unless lease holds the node's operation lock, or from an
+// image the node wasn't sent; and it refuses c run other than locked
+// down. Successful updates of components show in the node's status too,
+// with the build of their binaries.
+func (n *fakeNode) Run(ctx context.Context, c *nodev1.Container, lease string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if l := n.heldLock(); l == nil || l.Lease != lease {
+		return status.Error(codes.FailedPrecondition, "the operation's lease doesn't hold the node's operation lock")
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.updates = append(n.updates, "service "+svc.Name+" "+svc.Version+" "+svc.Image)
+	version, _ := release.ServiceVersion(c.Name, c.Image)
+	n.updates = append(n.updates, "service "+c.Name+" "+version+" "+c.Image)
+	if c.GetUser() != "65534:65534" || !c.ReadOnlyRoot || c.Capabilities == nil || len(c.Capabilities.Names) != 0 || c.Api == "" {
+		return status.Errorf(codes.InvalidArgument, "%s doesn't run locked down: %v", c.Name, c)
+	}
 	if n.serviceErr != nil {
 		return n.serviceErr
 	}
-	n.status.Services = slices.DeleteFunc(n.status.Services, func(c *nodev1.Component) bool { return c.Name == svc.Name })
-	build, _ := ociimage.Digest(n.sent[svc.Image])
-	n.status.Services = append(n.status.Services, &nodev1.Component{Name: svc.Name, Version: svc.Version, Build: build, Health: nodev1.Health_HEALTH_HEALTHY})
+	if _, ok := n.sent[c.Image]; !ok {
+		return status.Errorf(codes.FailedPrecondition, "the node has no image %s", c.Image)
+	}
+	build, _ := ociimage.Digest(n.sent[c.Image])
+	n.setService(&nodev1.Component{Name: c.Name, Version: version, Build: build, Health: nodev1.Health_HEALTH_HEALTHY})
 	return nil
 }
 
@@ -412,5 +440,47 @@ func (o *operator) dialNode() func(context.Context, cluster.Node) (orchestrate.N
 			return nil, f.err
 		}
 		return f, nil
+	}
+}
+
+// The fake node refuses a run as the agent does, and one that isn't
+// locked down, so that the tests that use it fail when mooctl runs a
+// service as the agent would refuse or as no cluster service runs.
+func TestTheFakeNodeRefusesARunAsTheAgentDoes(t *testing.T) {
+	image := release.ImageRef("dns", "1.0.0")
+	locked := func() *nodev1.Container { return nodeclient.ServiceContainer("dns", "moostack.dns.v1.DNS", image) }
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+	for name, c := range map[string]struct {
+		ctx       context.Context
+		container func() *nodev1.Container
+		lease     string
+	}{
+		"as mooctl runs a service": {t.Context(), locked, "op"},
+		"without the lease":        {t.Context(), locked, "other"},
+		"once its call ended":      {ended, locked, "op"},
+		"from an image never sent": {t.Context(), func() *nodev1.Container {
+			c := locked()
+			c.Image = release.ImageRef("dns", "2.0.0")
+			return c
+		}, "op"},
+		"with a writable root": {t.Context(), func() *nodev1.Container { c := locked(); c.ReadOnlyRoot = false; return c }, "op"},
+		"as root":              {t.Context(), func() *nodev1.Container { c := locked(); c.User = nil; return c }, "op"},
+		"with capabilities": {t.Context(), func() *nodev1.Container {
+			c := locked()
+			c.Capabilities = &nodev1.Capabilities{Names: []string{"CAP_KILL"}}
+			return c
+		}, "op"},
+		"with the default capabilities": {t.Context(), func() *nodev1.Container { c := locked(); c.Capabilities = nil; return c }, "op"},
+	} {
+		n := healthyNode(1)
+		n.sent = map[string][]byte{image: []byte("archive")}
+		if _, err := n.AcquireLock(t.Context(), nodeclient.Lock{Lease: "op"}, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		err := n.Run(c.ctx, c.container(), c.lease)
+		if want := name == "as mooctl runs a service"; (err == nil) != want {
+			t.Errorf("%s: the fake node's run says %v, want it run: %v", name, err, want)
+		}
 	}
 }

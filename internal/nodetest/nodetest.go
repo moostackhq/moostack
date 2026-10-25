@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +30,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/controlplane"
@@ -143,11 +145,12 @@ func (n *Node) BreakRestarts(t *testing.T, r Restarts) {
 
 // stopScript is the shell lines that send the program name signal and
 // wait for it to exit. Nothing reaps a program once it exits, so it is
-// gone when it is a zombie.
+// gone when it is a zombie, and no thread of it runs on, holding what it
+// had open, such as the port the program listens on.
 func stopScript(name, signal string) string {
 	return "pid=$(cat /run/" + name + ".pid)\n" +
 		"kill -" + signal + " $pid 2>/dev/null\n" +
-		"while [ -e /proc/$pid ] && [ \"$(cut -d' ' -f3 /proc/$pid/stat)\" != Z ]; do sleep 0.1; done\n"
+		"while [ -e /proc/$pid ] && { [ \"$(cut -d' ' -f3 /proc/$pid/stat)\" != Z ] || [ \"$(ls /proc/$pid/task 2>/dev/null | wc -l)\" -gt 1 ]; }; do sleep 0.1; done\n"
 }
 
 // Start starts a node, and removes it when the test ends. It runs the
@@ -204,7 +207,7 @@ func start(t *testing.T, peer *TunnelPeer) *Node {
 				t.Logf("%s's log:\n%s", p.name, log)
 			}
 			for _, s := range release.ClusterServices {
-				log, _ := exec.Command("docker", "exec", n.Name, "cat", hostlayout.ServiceLogDir+"/"+s.Name+".log").CombinedOutput()
+				log, _ := exec.Command("docker", "exec", n.Name, "cat", hostlayout.ContainerLogDir+"/"+s.Name+".log").CombinedOutput()
 				t.Logf("%s's log:\n%s", s.Name, log)
 			}
 		}
@@ -443,7 +446,7 @@ func (n *Node) UpdaterStatus(t *testing.T) (*nodev1.UpdaterStatusResponse, error
 }
 
 // EventuallyHealthy waits for the agent to report every component
-// healthy, and returns that status.
+// healthy, and no container's API unhealthy, and returns that status.
 func (n *Node) EventuallyHealthy(t *testing.T) *nodev1.StatusResponse {
 	t.Helper()
 	var status *nodev1.StatusResponse
@@ -452,8 +455,13 @@ func (n *Node) EventuallyHealthy(t *testing.T) *nodev1.StatusResponse {
 		if status, err = n.Status(t); err != nil {
 			return err
 		}
-		for _, c := range append(slices.Clone(status.Components), status.Services...) {
+		for _, c := range status.Components {
 			if c.Health != nodev1.Health_HEALTH_HEALTHY {
+				return fmt.Errorf("%s is %s: %s", c.Name, c.Health, c.Problem)
+			}
+		}
+		for _, c := range status.Containers {
+			if c.Health == nodev1.Health_HEALTH_UNHEALTHY {
 				return fmt.Errorf("%s is %s: %s", c.Name, c.Health, c.Problem)
 			}
 		}
@@ -510,62 +518,82 @@ func (n *Node) ImportFixtures(t *testing.T) {
 	n.importImage(t, brokenImage, Broken().Image)
 }
 
-// ImportFixtureAs has the agent import an image of fixtureservice that
-// serves svc's API, named as svc's image.
-func (n *Node) ImportFixtureAs(t *testing.T, svc *nodev1.Service) {
-	t.Helper()
-	n.importFixture(t, svc, func(*ociimage.Image) {})
+// Image is an image of fixtureservice, the test program, as a cluster
+// service that serves an API, or as an app, which serves none.
+type Image struct {
+	// Name is the image's, such as docker.io/library/app:1.
+	Name string
+	// API is the API it serves, as the dns service: every caller kind may
+	// call each method, Ping too. An app's is empty.
+	API string
+	// User is the user the image runs as, root if empty.
+	User string
+	// Group is the image's /etc/group, none if empty.
+	Group string
+	// Exit has it exit at once with that code, unless it is nil.
+	Exit *int
+	// Rebuild tells builds of the image under the same name apart: each,
+	// from 1, has a file more.
+	Rebuild int
+	// Reconfigure tells builds of the image under the same name apart
+	// that differ in their config alone: each, from 1, runs the same
+	// program by another path, from the layer of the image without it.
+	Reconfigure int
+	// HealthDelay is how long its API takes to answer Health calls.
+	HealthDelay time.Duration
+	// Slow adds a large file, so that unpacking the image takes seconds.
+	Slow bool
 }
 
-// ImportFixtureRebuiltAs is ImportFixtureAs, but of another build of
-// that image, under the same name: one with a file more.
-func (n *Node) ImportFixtureRebuiltAs(t *testing.T, svc *nodev1.Service) {
-	t.Helper()
-	n.importFixture(t, svc, func(img *ociimage.Image) {
-		img.Files = append(img.Files, ociimage.File{Name: "rebuilt", Mode: 0o644, Data: []byte("another build\n")})
-	})
+// ImageOf is the image of fixtureservice that serves c's API, named as
+// c's image.
+func ImageOf(c *nodev1.Container) Image {
+	return Image{Name: c.Image, API: c.Api}
 }
 
-// ImportFixtureReconfiguredAs is ImportFixtureAs, but of another build
-// of that image, under the same name, that differs in its config alone:
-// its layer is the one ImportFixtureAs imports. Each build, from 1, is
-// another.
-func (n *Node) ImportFixtureReconfiguredAs(t *testing.T, svc *nodev1.Service, build int) {
+// Import has the agent import img.
+func (n *Node) Import(t *testing.T, img Image) {
 	t.Helper()
-	if build < 1 {
-		t.Fatalf("build %d of %s: builds count from 1", build, svc.Image)
-	}
-	n.importFixture(t, svc, func(img *ociimage.Image) {
-		// The same program, by another path.
-		img.Entrypoint[0] = "/" + strings.Repeat("./", build) + fixtureProgram
-	})
+	n.importArchive(t, img.Name, img.Archive(t), img.Name)
 }
 
-// ImportSlowFixtureAs is ImportFixtureAs, but of an image with a large
-// file more, so that running a service from it takes seconds, while
-// containerd unpacks it.
-func (n *Node) ImportSlowFixtureAs(t *testing.T, svc *nodev1.Service) {
-	t.Helper()
-	n.importFixture(t, svc, func(img *ociimage.Image) {
-		img.Files = append(img.Files, ociimage.File{Name: "large", Mode: 0o644, Data: make([]byte, 1<<30)})
-	})
-}
-
-// importFixture has the agent import an image of fixtureservice that
-// serves svc's API, named as svc's image, as edit changes it.
-func (n *Node) importFixture(t *testing.T, svc *nodev1.Service, edit func(*ociimage.Image)) {
+// Archive is img's OCI image layout archive, as Import imports it.
+func (img Image) Archive(t *testing.T) []byte {
 	t.Helper()
 	program, err := os.ReadFile(filepath.Join(binaries(t), imagesDir, fixtureProgram))
 	if err != nil {
 		t.Fatal(err)
 	}
-	img := fixtureImageOf(program, svc)
-	edit(&img)
 	var archive bytes.Buffer
-	if err := ociimage.Write(&archive, img); err != nil {
+	if err := ociimage.Write(&archive, img.of(program)); err != nil {
 		t.Fatal(err)
 	}
-	n.importArchive(t, svc.Image, archive.Bytes(), svc.Image)
+	return archive.Bytes()
+}
+
+// of is img, of fixtureservice's binary program.
+func (img Image) of(program []byte) ociimage.Image {
+	command := []string{"/" + strings.Repeat("./", img.Reconfigure) + fixtureProgram}
+	if img.Exit != nil {
+		command = append(command, "-exit", strconv.Itoa(*img.Exit))
+	}
+	if img.API != "" {
+		command = append(command, "-api", img.API)
+	}
+	if img.HealthDelay != 0 {
+		command = append(command, "-health-delay", img.HealthDelay.String())
+	}
+	files := []ociimage.File{{Name: fixtureProgram, Mode: 0o755, Data: program}}
+	if img.Rebuild != 0 {
+		files = append(files, ociimage.File{Name: "build", Mode: 0o644, Data: []byte(strconv.Itoa(img.Rebuild))})
+	}
+	if img.Slow {
+		files = append(files, ociimage.File{Name: "large", Mode: 0o644, Data: make([]byte, 1<<30)})
+	}
+	if img.Group != "" {
+		files = append(files, ociimage.File{Name: "etc/group", Mode: 0o644, Data: []byte(img.Group)})
+	}
+	return ociimage.Image{Name: img.Name, Architecture: runtime.GOARCH, Entrypoint: command, User: img.User, Files: files}
 }
 
 // Containerd is a client of the node's containerd.
@@ -657,38 +685,58 @@ func (n *Node) importArchive(t *testing.T, what string, data []byte, want string
 }
 
 // Fixture is the dns service as the test program fixtureservice serves
-// it: the same API, but every caller kind may call each method, Ping
-// too.
-func Fixture() *nodev1.Service {
-	s := Service("dns")
-	s.Version = "fixture"
-	s.Image = release.ImageRef(s.Name, s.Version)
-	return s
+// it, as Image says.
+func Fixture() *nodev1.Container {
+	return nodeclient.ServiceContainer("dns", Service("dns").Api, release.ImageRef("dns", "fixture"))
 }
 
 // Broken is a service whose image has no program, so that it never
 // starts.
-func Broken() *nodev1.Service {
-	return &nodev1.Service{Name: "broken", Version: Version, Api: "moostack.broken.v1.Broken", Image: release.ImageRef("broken", Version)}
+func Broken() *nodev1.Container {
+	return nodeclient.ServiceContainer("broken", "moostack.broken.v1.Broken", release.ImageRef("broken", Version))
+}
+
+// Lease is the lease that RunService runs a cluster service for.
+const Lease = "nodetest"
+
+// HoldLock has the node's operation lock held for Lease, for an hour.
+func (n *Node) HoldLock(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	res, err := n.Agent.AcquireLock(ctx, &nodev1.AcquireLockRequest{Lock: &nodev1.Lock{Lease: Lease, Holder: "nodetest"}, Ttl: durationpb.New(time.Hour)})
+	if err != nil {
+		t.Fatalf("taking the operation lock: %v", err)
+	}
+	if res.Lock.GetLease() != Lease {
+		t.Fatalf("the operation lock is held for %s", res.Lock.GetLease())
+	}
 }
 
 // RunService has the agent run the cluster service called name, as the
-// release pins it, within a minute.
+// release pins it, within a minute, holding the lock for Lease.
 func (n *Node) RunService(t *testing.T, name string) {
 	t.Helper()
+	n.HoldLock(t)
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: Service(name)}); err != nil {
+	if _, err := n.Agent.Run(ctx, &nodev1.RunRequest{Container: Service(name), Lease: Lease}); err != nil {
 		t.Fatalf("running %s: %v", name, err)
 	}
 }
 
-// Service is the cluster service called name, as the release under test
-// pins it.
-func Service(name string) *nodev1.Service {
+// Services are the cluster services among the containers that status
+// reports, as nodeclient says them.
+func Services(status *nodev1.StatusResponse) []*nodev1.Component {
+	return nodeclient.Status{Containers: status.Containers}.Services()
+}
+
+// Service is the container of the cluster service called name, as the
+// release under test pins it.
+func Service(name string) *nodev1.Container {
 	for _, s := range release.ClusterServices {
 		if s.Name == name {
-			return &nodev1.Service{Name: s.Name, Version: Version, Api: s.API, Image: release.ImageRef(s.Name, Version)}
+			return nodeclient.ServiceContainer(s.Name, s.API, release.ImageRef(s.Name, Version))
 		}
 	}
 	panic("nodetest: no cluster service " + name)
@@ -887,13 +935,6 @@ func binaries(t *testing.T) string {
 // fixtureProgram is fixtureservice's binary, in imagesDir.
 const fixtureProgram = "fixtureservice"
 
-// fixtureImageOf is an image of fixtureservice, program, that serves
-// svc's API, named as svc's image.
-func fixtureImageOf(program []byte, svc *nodev1.Service) ociimage.Image {
-	return ociimage.Image{Name: svc.Image, Architecture: runtime.GOARCH, Entrypoint: []string{"/fixtureservice", svc.Api},
-		Files: []ociimage.File{{Name: "fixtureservice", Mode: 0o755, Data: program}}}
-}
-
 // writeFixtureImages builds fixtureservice into dir, as fixtureProgram,
 // and writes Fixture's image of it there, and Broken's, which has no
 // program.
@@ -912,7 +953,7 @@ func writeFixtureImages(dir string) error {
 		file  string
 		image ociimage.Image
 	}{
-		{fixtureImage, fixtureImageOf(data, Fixture())},
+		{fixtureImage, ImageOf(Fixture()).of(data)},
 		{brokenImage, ociimage.Image{Name: Broken().Image, Architecture: runtime.GOARCH, Entrypoint: []string{"/missing"}}},
 	}
 	for _, img := range images {

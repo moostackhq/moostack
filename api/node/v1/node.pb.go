@@ -26,6 +26,64 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// TaskState is whether a container's process runs.
+type TaskState int32
+
+const (
+	// TASK_STATE_UNSPECIFIED is a container whose state the node can't
+	// tell.
+	TaskState_TASK_STATE_UNSPECIFIED TaskState = 0
+	TaskState_TASK_STATE_RUNNING     TaskState = 1
+	// TASK_STATE_EXITED is a process that ran and exited.
+	TaskState_TASK_STATE_EXITED TaskState = 2
+	// TASK_STATE_FAILED is a container whose process doesn't run for
+	// another reason, such as one that failed to start.
+	TaskState_TASK_STATE_FAILED TaskState = 3
+)
+
+// Enum value maps for TaskState.
+var (
+	TaskState_name = map[int32]string{
+		0: "TASK_STATE_UNSPECIFIED",
+		1: "TASK_STATE_RUNNING",
+		2: "TASK_STATE_EXITED",
+		3: "TASK_STATE_FAILED",
+	}
+	TaskState_value = map[string]int32{
+		"TASK_STATE_UNSPECIFIED": 0,
+		"TASK_STATE_RUNNING":     1,
+		"TASK_STATE_EXITED":      2,
+		"TASK_STATE_FAILED":      3,
+	}
+)
+
+func (x TaskState) Enum() *TaskState {
+	p := new(TaskState)
+	*p = x
+	return p
+}
+
+func (x TaskState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (TaskState) Descriptor() protoreflect.EnumDescriptor {
+	return file_api_node_v1_node_proto_enumTypes[0].Descriptor()
+}
+
+func (TaskState) Type() protoreflect.EnumType {
+	return &file_api_node_v1_node_proto_enumTypes[0]
+}
+
+func (x TaskState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use TaskState.Descriptor instead.
+func (TaskState) EnumDescriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{0}
+}
+
 // Mode is how the node is operated.
 type Mode int32
 
@@ -62,11 +120,11 @@ func (x Mode) String() string {
 }
 
 func (Mode) Descriptor() protoreflect.EnumDescriptor {
-	return file_api_node_v1_node_proto_enumTypes[0].Descriptor()
+	return file_api_node_v1_node_proto_enumTypes[1].Descriptor()
 }
 
 func (Mode) Type() protoreflect.EnumType {
-	return &file_api_node_v1_node_proto_enumTypes[0]
+	return &file_api_node_v1_node_proto_enumTypes[1]
 }
 
 func (x Mode) Number() protoreflect.EnumNumber {
@@ -75,7 +133,7 @@ func (x Mode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Mode.Descriptor instead.
 func (Mode) EnumDescriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{0}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{1}
 }
 
 type Health int32
@@ -111,11 +169,11 @@ func (x Health) String() string {
 }
 
 func (Health) Descriptor() protoreflect.EnumDescriptor {
-	return file_api_node_v1_node_proto_enumTypes[1].Descriptor()
+	return file_api_node_v1_node_proto_enumTypes[2].Descriptor()
 }
 
 func (Health) Type() protoreflect.EnumType {
-	return &file_api_node_v1_node_proto_enumTypes[1]
+	return &file_api_node_v1_node_proto_enumTypes[2]
 }
 
 func (x Health) Number() protoreflect.EnumNumber {
@@ -124,7 +182,7 @@ func (x Health) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Health.Descriptor instead.
 func (Health) EnumDescriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{1}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{2}
 }
 
 type StatusRequest struct {
@@ -181,10 +239,9 @@ type StatusResponse struct {
 	GenerationUnknown string `protobuf:"bytes,5,opt,name=generation_unknown,json=generationUnknown,proto3" json:"generation_unknown,omitempty"`
 	// Lock is the operation lock, unset if no lease holds it.
 	Lock *Lock `protobuf:"bytes,6,opt,name=lock,proto3" json:"lock,omitempty"`
-	// Services are the cluster services the node runs, each at the version
-	// it was run at, and healthy if it answers its health call without a
-	// problem.
-	Services      []*Component `protobuf:"bytes,7,rep,name=services,proto3" json:"services,omitempty"`
+	// Containers are the containers the node keeps, the cluster services
+	// among them, each as it runs.
+	Containers    []*ContainerStatus `protobuf:"bytes,7,rep,name=containers,proto3" json:"containers,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -261,11 +318,113 @@ func (x *StatusResponse) GetLock() *Lock {
 	return nil
 }
 
-func (x *StatusResponse) GetServices() []*Component {
+func (x *StatusResponse) GetContainers() []*ContainerStatus {
 	if x != nil {
-		return x.Services
+		return x.Containers
 	}
 	return nil
+}
+
+// ContainerStatus is a container as the node runs it.
+type ContainerStatus struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Image is the name of the image the container was made from, and
+	// digest the digest of that image's build, each empty if the node
+	// can't tell, as when it can't read the container or has none.
+	Image  string    `protobuf:"bytes,2,opt,name=image,proto3" json:"image,omitempty"`
+	Digest string    `protobuf:"bytes,3,opt,name=digest,proto3" json:"digest,omitempty"`
+	State  TaskState `protobuf:"varint,4,opt,name=state,proto3,enum=moostack.node.v1.TaskState" json:"state,omitempty"`
+	// ExitCode is the code the container exited with, in TASK_STATE_EXITED.
+	ExitCode uint32 `protobuf:"varint,5,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
+	// Health is unspecified for a container without an API, and otherwise
+	// says whether its API answers its health call without a problem.
+	Health Health `protobuf:"varint,6,opt,name=health,proto3,enum=moostack.node.v1.Health" json:"health,omitempty"`
+	// Problem says why the container's last start failed, if it did, as
+	// when the one that was to replace it couldn't be made; or else why it
+	// failed, in TASK_STATE_FAILED, or why its API is unhealthy.
+	Problem       string `protobuf:"bytes,7,opt,name=problem,proto3" json:"problem,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ContainerStatus) Reset() {
+	*x = ContainerStatus{}
+	mi := &file_api_node_v1_node_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ContainerStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ContainerStatus) ProtoMessage() {}
+
+func (x *ContainerStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ContainerStatus.ProtoReflect.Descriptor instead.
+func (*ContainerStatus) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *ContainerStatus) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *ContainerStatus) GetImage() string {
+	if x != nil {
+		return x.Image
+	}
+	return ""
+}
+
+func (x *ContainerStatus) GetDigest() string {
+	if x != nil {
+		return x.Digest
+	}
+	return ""
+}
+
+func (x *ContainerStatus) GetState() TaskState {
+	if x != nil {
+		return x.State
+	}
+	return TaskState_TASK_STATE_UNSPECIFIED
+}
+
+func (x *ContainerStatus) GetExitCode() uint32 {
+	if x != nil {
+		return x.ExitCode
+	}
+	return 0
+}
+
+func (x *ContainerStatus) GetHealth() Health {
+	if x != nil {
+		return x.Health
+	}
+	return Health_HEALTH_UNSPECIFIED
+}
+
+func (x *ContainerStatus) GetProblem() string {
+	if x != nil {
+		return x.Problem
+	}
+	return ""
 }
 
 // RecordGenerationRequest is a generation of the cluster directory that
@@ -285,7 +444,7 @@ type RecordGenerationRequest struct {
 
 func (x *RecordGenerationRequest) Reset() {
 	*x = RecordGenerationRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[2]
+	mi := &file_api_node_v1_node_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -297,7 +456,7 @@ func (x *RecordGenerationRequest) String() string {
 func (*RecordGenerationRequest) ProtoMessage() {}
 
 func (x *RecordGenerationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[2]
+	mi := &file_api_node_v1_node_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -310,7 +469,7 @@ func (x *RecordGenerationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecordGenerationRequest.ProtoReflect.Descriptor instead.
 func (*RecordGenerationRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{2}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *RecordGenerationRequest) GetGeneration() int64 {
@@ -342,7 +501,7 @@ type RecordGenerationResponse struct {
 
 func (x *RecordGenerationResponse) Reset() {
 	*x = RecordGenerationResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[3]
+	mi := &file_api_node_v1_node_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -354,7 +513,7 @@ func (x *RecordGenerationResponse) String() string {
 func (*RecordGenerationResponse) ProtoMessage() {}
 
 func (x *RecordGenerationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[3]
+	mi := &file_api_node_v1_node_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -367,7 +526,7 @@ func (x *RecordGenerationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecordGenerationResponse.ProtoReflect.Descriptor instead.
 func (*RecordGenerationResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{3}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{4}
 }
 
 // Lock is the operation lock, as one operation's lease holds it.
@@ -392,7 +551,7 @@ type Lock struct {
 
 func (x *Lock) Reset() {
 	*x = Lock{}
-	mi := &file_api_node_v1_node_proto_msgTypes[4]
+	mi := &file_api_node_v1_node_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -404,7 +563,7 @@ func (x *Lock) String() string {
 func (*Lock) ProtoMessage() {}
 
 func (x *Lock) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[4]
+	mi := &file_api_node_v1_node_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -417,7 +576,7 @@ func (x *Lock) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Lock.ProtoReflect.Descriptor instead.
 func (*Lock) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{4}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *Lock) GetLease() string {
@@ -473,7 +632,7 @@ type AcquireLockRequest struct {
 
 func (x *AcquireLockRequest) Reset() {
 	*x = AcquireLockRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[5]
+	mi := &file_api_node_v1_node_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -485,7 +644,7 @@ func (x *AcquireLockRequest) String() string {
 func (*AcquireLockRequest) ProtoMessage() {}
 
 func (x *AcquireLockRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[5]
+	mi := &file_api_node_v1_node_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -498,7 +657,7 @@ func (x *AcquireLockRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcquireLockRequest.ProtoReflect.Descriptor instead.
 func (*AcquireLockRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{5}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *AcquireLockRequest) GetLock() *Lock {
@@ -525,7 +684,7 @@ type AcquireLockResponse struct {
 
 func (x *AcquireLockResponse) Reset() {
 	*x = AcquireLockResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[6]
+	mi := &file_api_node_v1_node_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -537,7 +696,7 @@ func (x *AcquireLockResponse) String() string {
 func (*AcquireLockResponse) ProtoMessage() {}
 
 func (x *AcquireLockResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[6]
+	mi := &file_api_node_v1_node_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -550,7 +709,7 @@ func (x *AcquireLockResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcquireLockResponse.ProtoReflect.Descriptor instead.
 func (*AcquireLockResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{6}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *AcquireLockResponse) GetLock() *Lock {
@@ -570,7 +729,7 @@ type RenewLockRequest struct {
 
 func (x *RenewLockRequest) Reset() {
 	*x = RenewLockRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[7]
+	mi := &file_api_node_v1_node_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -582,7 +741,7 @@ func (x *RenewLockRequest) String() string {
 func (*RenewLockRequest) ProtoMessage() {}
 
 func (x *RenewLockRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[7]
+	mi := &file_api_node_v1_node_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -595,7 +754,7 @@ func (x *RenewLockRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RenewLockRequest.ProtoReflect.Descriptor instead.
 func (*RenewLockRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{7}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *RenewLockRequest) GetLease() string {
@@ -622,7 +781,7 @@ type RenewLockResponse struct {
 
 func (x *RenewLockResponse) Reset() {
 	*x = RenewLockResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[8]
+	mi := &file_api_node_v1_node_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -634,7 +793,7 @@ func (x *RenewLockResponse) String() string {
 func (*RenewLockResponse) ProtoMessage() {}
 
 func (x *RenewLockResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[8]
+	mi := &file_api_node_v1_node_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -647,7 +806,7 @@ func (x *RenewLockResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RenewLockResponse.ProtoReflect.Descriptor instead.
 func (*RenewLockResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{8}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *RenewLockResponse) GetLock() *Lock {
@@ -666,7 +825,7 @@ type ReleaseLockRequest struct {
 
 func (x *ReleaseLockRequest) Reset() {
 	*x = ReleaseLockRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[9]
+	mi := &file_api_node_v1_node_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -678,7 +837,7 @@ func (x *ReleaseLockRequest) String() string {
 func (*ReleaseLockRequest) ProtoMessage() {}
 
 func (x *ReleaseLockRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[9]
+	mi := &file_api_node_v1_node_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -691,7 +850,7 @@ func (x *ReleaseLockRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseLockRequest.ProtoReflect.Descriptor instead.
 func (*ReleaseLockRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{9}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ReleaseLockRequest) GetLease() string {
@@ -709,7 +868,7 @@ type ReleaseLockResponse struct {
 
 func (x *ReleaseLockResponse) Reset() {
 	*x = ReleaseLockResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[10]
+	mi := &file_api_node_v1_node_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -721,7 +880,7 @@ func (x *ReleaseLockResponse) String() string {
 func (*ReleaseLockResponse) ProtoMessage() {}
 
 func (x *ReleaseLockResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[10]
+	mi := &file_api_node_v1_node_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -734,7 +893,7 @@ func (x *ReleaseLockResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseLockResponse.ProtoReflect.Descriptor instead.
 func (*ReleaseLockResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{10}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{11}
 }
 
 type BreakLockRequest struct {
@@ -745,7 +904,7 @@ type BreakLockRequest struct {
 
 func (x *BreakLockRequest) Reset() {
 	*x = BreakLockRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[11]
+	mi := &file_api_node_v1_node_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -757,7 +916,7 @@ func (x *BreakLockRequest) String() string {
 func (*BreakLockRequest) ProtoMessage() {}
 
 func (x *BreakLockRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[11]
+	mi := &file_api_node_v1_node_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -770,7 +929,7 @@ func (x *BreakLockRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BreakLockRequest.ProtoReflect.Descriptor instead.
 func (*BreakLockRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{11}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{12}
 }
 
 type BreakLockResponse struct {
@@ -783,7 +942,7 @@ type BreakLockResponse struct {
 
 func (x *BreakLockResponse) Reset() {
 	*x = BreakLockResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[12]
+	mi := &file_api_node_v1_node_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -795,7 +954,7 @@ func (x *BreakLockResponse) String() string {
 func (*BreakLockResponse) ProtoMessage() {}
 
 func (x *BreakLockResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[12]
+	mi := &file_api_node_v1_node_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -808,7 +967,7 @@ func (x *BreakLockResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BreakLockResponse.ProtoReflect.Descriptor instead.
 func (*BreakLockResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{12}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *BreakLockResponse) GetBroken() *Lock {
@@ -828,7 +987,7 @@ type ImportImageRequest struct {
 
 func (x *ImportImageRequest) Reset() {
 	*x = ImportImageRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[13]
+	mi := &file_api_node_v1_node_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -840,7 +999,7 @@ func (x *ImportImageRequest) String() string {
 func (*ImportImageRequest) ProtoMessage() {}
 
 func (x *ImportImageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[13]
+	mi := &file_api_node_v1_node_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -853,7 +1012,7 @@ func (x *ImportImageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportImageRequest.ProtoReflect.Descriptor instead.
 func (*ImportImageRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{13}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ImportImageRequest) GetChunk() []byte {
@@ -873,7 +1032,7 @@ type ImportImageResponse struct {
 
 func (x *ImportImageResponse) Reset() {
 	*x = ImportImageResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[14]
+	mi := &file_api_node_v1_node_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -885,7 +1044,7 @@ func (x *ImportImageResponse) String() string {
 func (*ImportImageResponse) ProtoMessage() {}
 
 func (x *ImportImageResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[14]
+	mi := &file_api_node_v1_node_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -898,7 +1057,7 @@ func (x *ImportImageResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportImageResponse.ProtoReflect.Descriptor instead.
 func (*ImportImageResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{14}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ImportImageResponse) GetImages() []string {
@@ -908,36 +1067,48 @@ func (x *ImportImageResponse) GetImages() []string {
 	return nil
 }
 
-// Service is a cluster service as a node runs it.
-type Service struct {
+// Container is a container as Run runs it: its name, its image and its
+// properties.
+type Container struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Name is the service's, such as registry.
-	Name    string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
-	// Api is the gRPC service name of the service's API, which the agent
-	// routes calls to the service by.
-	Api string `protobuf:"bytes,3,opt,name=api,proto3" json:"api,omitempty"`
-	// Image is the name of the service's image in the node's containerd.
-	Image         string `protobuf:"bytes,4,opt,name=image,proto3" json:"image,omitempty"`
+	// Name is the container's, of lowercase letters, digits and hyphens,
+	// starting with a letter, at most 63. It names the container's log.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Image is the name of an image the node has.
+	Image string `protobuf:"bytes,2,opt,name=image,proto3" json:"image,omitempty"`
+	// User is the uid to run as, with a gid after a colon, each a number
+	// of at most 2147483647, never a name. The image's user if unset.
+	User         *string `protobuf:"bytes,3,opt,name=user,proto3,oneof" json:"user,omitempty"`
+	ReadOnlyRoot bool    `protobuf:"varint,4,opt,name=read_only_root,json=readOnlyRoot,proto3" json:"read_only_root,omitempty"`
+	// Capabilities are the capabilities to run with, a default set if
+	// unset, and none if set and empty.
+	Capabilities *Capabilities `protobuf:"bytes,5,opt,name=capabilities,proto3" json:"capabilities,omitempty"`
+	// Api is the gRPC service name of an API the container serves on the
+	// socket that api/service/v1 names, which the agent routes calls of
+	// the API to and asks for its health. Unset, it serves none.
+	//
+	// Temporary: the routed API is taken in Run beside the properties,
+	// which say how a container runs, until it gets a design of its own.
+	Api           string `protobuf:"bytes,6,opt,name=api,proto3" json:"api,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *Service) Reset() {
-	*x = Service{}
-	mi := &file_api_node_v1_node_proto_msgTypes[15]
+func (x *Container) Reset() {
+	*x = Container{}
+	mi := &file_api_node_v1_node_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *Service) String() string {
+func (x *Container) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*Service) ProtoMessage() {}
+func (*Container) ProtoMessage() {}
 
-func (x *Service) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[15]
+func (x *Container) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -948,103 +1119,76 @@ func (x *Service) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use Service.ProtoReflect.Descriptor instead.
-func (*Service) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{15}
+// Deprecated: Use Container.ProtoReflect.Descriptor instead.
+func (*Container) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{16}
 }
 
-func (x *Service) GetName() string {
+func (x *Container) GetName() string {
 	if x != nil {
 		return x.Name
 	}
 	return ""
 }
 
-func (x *Service) GetVersion() string {
-	if x != nil {
-		return x.Version
-	}
-	return ""
-}
-
-func (x *Service) GetApi() string {
-	if x != nil {
-		return x.Api
-	}
-	return ""
-}
-
-func (x *Service) GetImage() string {
+func (x *Container) GetImage() string {
 	if x != nil {
 		return x.Image
 	}
 	return ""
 }
 
-type RunServiceRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Service       *Service               `protobuf:"bytes,1,opt,name=service,proto3" json:"service,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *RunServiceRequest) Reset() {
-	*x = RunServiceRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[16]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *RunServiceRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*RunServiceRequest) ProtoMessage() {}
-
-func (x *RunServiceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[16]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
+func (x *Container) GetUser() string {
+	if x != nil && x.User != nil {
+		return *x.User
 	}
-	return mi.MessageOf(x)
+	return ""
 }
 
-// Deprecated: Use RunServiceRequest.ProtoReflect.Descriptor instead.
-func (*RunServiceRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{16}
-}
-
-func (x *RunServiceRequest) GetService() *Service {
+func (x *Container) GetReadOnlyRoot() bool {
 	if x != nil {
-		return x.Service
+		return x.ReadOnlyRoot
+	}
+	return false
+}
+
+func (x *Container) GetCapabilities() *Capabilities {
+	if x != nil {
+		return x.Capabilities
 	}
 	return nil
 }
 
-type RunServiceResponse struct {
+func (x *Container) GetApi() string {
+	if x != nil {
+		return x.Api
+	}
+	return ""
+}
+
+// Capabilities are Linux capabilities, as the kernel names them, such as
+// CAP_NET_BIND_SERVICE.
+type Capabilities struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	Names         []string               `protobuf:"bytes,1,rep,name=names,proto3" json:"names,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *RunServiceResponse) Reset() {
-	*x = RunServiceResponse{}
+func (x *Capabilities) Reset() {
+	*x = Capabilities{}
 	mi := &file_api_node_v1_node_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *RunServiceResponse) String() string {
+func (x *Capabilities) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*RunServiceResponse) ProtoMessage() {}
+func (*Capabilities) ProtoMessage() {}
 
-func (x *RunServiceResponse) ProtoReflect() protoreflect.Message {
+func (x *Capabilities) ProtoReflect() protoreflect.Message {
 	mi := &file_api_node_v1_node_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -1056,9 +1200,195 @@ func (x *RunServiceResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use RunServiceResponse.ProtoReflect.Descriptor instead.
-func (*RunServiceResponse) Descriptor() ([]byte, []int) {
+// Deprecated: Use Capabilities.ProtoReflect.Descriptor instead.
+func (*Capabilities) Descriptor() ([]byte, []int) {
 	return file_api_node_v1_node_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *Capabilities) GetNames() []string {
+	if x != nil {
+		return x.Names
+	}
+	return nil
+}
+
+type RunRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Container *Container             `protobuf:"bytes,1,opt,name=container,proto3" json:"container,omitempty"`
+	// Lease is the operation's lease, which must hold the operation lock.
+	Lease         string `protobuf:"bytes,2,opt,name=lease,proto3" json:"lease,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RunRequest) Reset() {
+	*x = RunRequest{}
+	mi := &file_api_node_v1_node_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RunRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RunRequest) ProtoMessage() {}
+
+func (x *RunRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RunRequest.ProtoReflect.Descriptor instead.
+func (*RunRequest) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *RunRequest) GetContainer() *Container {
+	if x != nil {
+		return x.Container
+	}
+	return nil
+}
+
+func (x *RunRequest) GetLease() string {
+	if x != nil {
+		return x.Lease
+	}
+	return ""
+}
+
+type RunResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RunResponse) Reset() {
+	*x = RunResponse{}
+	mi := &file_api_node_v1_node_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RunResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RunResponse) ProtoMessage() {}
+
+func (x *RunResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RunResponse.ProtoReflect.Descriptor instead.
+func (*RunResponse) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{19}
+}
+
+type RemoveRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Name is the container's.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Lease is the operation's lease, which must hold the operation lock.
+	Lease         string `protobuf:"bytes,2,opt,name=lease,proto3" json:"lease,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveRequest) Reset() {
+	*x = RemoveRequest{}
+	mi := &file_api_node_v1_node_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveRequest) ProtoMessage() {}
+
+func (x *RemoveRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveRequest.ProtoReflect.Descriptor instead.
+func (*RemoveRequest) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *RemoveRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *RemoveRequest) GetLease() string {
+	if x != nil {
+		return x.Lease
+	}
+	return ""
+}
+
+type RemoveResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveResponse) Reset() {
+	*x = RemoveResponse{}
+	mi := &file_api_node_v1_node_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveResponse) ProtoMessage() {}
+
+func (x *RemoveResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_node_v1_node_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveResponse.ProtoReflect.Descriptor instead.
+func (*RemoveResponse) Descriptor() ([]byte, []int) {
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{21}
 }
 
 type RemoveIdentitiesRequest struct {
@@ -1074,7 +1404,7 @@ type RemoveIdentitiesRequest struct {
 
 func (x *RemoveIdentitiesRequest) Reset() {
 	*x = RemoveIdentitiesRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[18]
+	mi := &file_api_node_v1_node_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1086,7 +1416,7 @@ func (x *RemoveIdentitiesRequest) String() string {
 func (*RemoveIdentitiesRequest) ProtoMessage() {}
 
 func (x *RemoveIdentitiesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[18]
+	mi := &file_api_node_v1_node_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1099,7 +1429,7 @@ func (x *RemoveIdentitiesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveIdentitiesRequest.ProtoReflect.Descriptor instead.
 func (*RemoveIdentitiesRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{18}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *RemoveIdentitiesRequest) GetIdentities() []string {
@@ -1124,7 +1454,7 @@ type RemoveIdentitiesResponse struct {
 
 func (x *RemoveIdentitiesResponse) Reset() {
 	*x = RemoveIdentitiesResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[19]
+	mi := &file_api_node_v1_node_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1136,7 +1466,7 @@ func (x *RemoveIdentitiesResponse) String() string {
 func (*RemoveIdentitiesResponse) ProtoMessage() {}
 
 func (x *RemoveIdentitiesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[19]
+	mi := &file_api_node_v1_node_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1149,7 +1479,7 @@ func (x *RemoveIdentitiesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveIdentitiesResponse.ProtoReflect.Descriptor instead.
 func (*RemoveIdentitiesResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{19}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{23}
 }
 
 type UpdaterStatusRequest struct {
@@ -1160,7 +1490,7 @@ type UpdaterStatusRequest struct {
 
 func (x *UpdaterStatusRequest) Reset() {
 	*x = UpdaterStatusRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[20]
+	mi := &file_api_node_v1_node_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1172,7 +1502,7 @@ func (x *UpdaterStatusRequest) String() string {
 func (*UpdaterStatusRequest) ProtoMessage() {}
 
 func (x *UpdaterStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[20]
+	mi := &file_api_node_v1_node_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1185,7 +1515,7 @@ func (x *UpdaterStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdaterStatusRequest.ProtoReflect.Descriptor instead.
 func (*UpdaterStatusRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{20}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{24}
 }
 
 type UpdaterStatusResponse struct {
@@ -1201,7 +1531,7 @@ type UpdaterStatusResponse struct {
 
 func (x *UpdaterStatusResponse) Reset() {
 	*x = UpdaterStatusResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[21]
+	mi := &file_api_node_v1_node_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1213,7 +1543,7 @@ func (x *UpdaterStatusResponse) String() string {
 func (*UpdaterStatusResponse) ProtoMessage() {}
 
 func (x *UpdaterStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[21]
+	mi := &file_api_node_v1_node_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1226,7 +1556,7 @@ func (x *UpdaterStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdaterStatusResponse.ProtoReflect.Descriptor instead.
 func (*UpdaterStatusResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{21}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *UpdaterStatusResponse) GetUpdater() *Component {
@@ -1256,7 +1586,7 @@ type UpdateAgentRequest struct {
 
 func (x *UpdateAgentRequest) Reset() {
 	*x = UpdateAgentRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[22]
+	mi := &file_api_node_v1_node_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1268,7 +1598,7 @@ func (x *UpdateAgentRequest) String() string {
 func (*UpdateAgentRequest) ProtoMessage() {}
 
 func (x *UpdateAgentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[22]
+	mi := &file_api_node_v1_node_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1281,7 +1611,7 @@ func (x *UpdateAgentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateAgentRequest.ProtoReflect.Descriptor instead.
 func (*UpdateAgentRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{22}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *UpdateAgentRequest) GetUpdate() *AgentUpdate {
@@ -1313,7 +1643,7 @@ type AgentUpdate struct {
 
 func (x *AgentUpdate) Reset() {
 	*x = AgentUpdate{}
-	mi := &file_api_node_v1_node_proto_msgTypes[23]
+	mi := &file_api_node_v1_node_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1325,7 +1655,7 @@ func (x *AgentUpdate) String() string {
 func (*AgentUpdate) ProtoMessage() {}
 
 func (x *AgentUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[23]
+	mi := &file_api_node_v1_node_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1338,7 +1668,7 @@ func (x *AgentUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentUpdate.ProtoReflect.Descriptor instead.
 func (*AgentUpdate) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{23}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *AgentUpdate) GetVersion() string {
@@ -1370,7 +1700,7 @@ type UpdateAgentResponse struct {
 
 func (x *UpdateAgentResponse) Reset() {
 	*x = UpdateAgentResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[24]
+	mi := &file_api_node_v1_node_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1382,7 +1712,7 @@ func (x *UpdateAgentResponse) String() string {
 func (*UpdateAgentResponse) ProtoMessage() {}
 
 func (x *UpdateAgentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[24]
+	mi := &file_api_node_v1_node_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1395,7 +1725,7 @@ func (x *UpdateAgentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateAgentResponse.ProtoReflect.Descriptor instead.
 func (*UpdateAgentResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{24}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{28}
 }
 
 type UpdateUpdaterRequest struct {
@@ -1411,7 +1741,7 @@ type UpdateUpdaterRequest struct {
 
 func (x *UpdateUpdaterRequest) Reset() {
 	*x = UpdateUpdaterRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[25]
+	mi := &file_api_node_v1_node_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1423,7 +1753,7 @@ func (x *UpdateUpdaterRequest) String() string {
 func (*UpdateUpdaterRequest) ProtoMessage() {}
 
 func (x *UpdateUpdaterRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[25]
+	mi := &file_api_node_v1_node_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1436,7 +1766,7 @@ func (x *UpdateUpdaterRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateUpdaterRequest.ProtoReflect.Descriptor instead.
 func (*UpdateUpdaterRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{25}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *UpdateUpdaterRequest) GetUpdate() *UpdaterUpdate {
@@ -1468,7 +1798,7 @@ type UpdaterUpdate struct {
 
 func (x *UpdaterUpdate) Reset() {
 	*x = UpdaterUpdate{}
-	mi := &file_api_node_v1_node_proto_msgTypes[26]
+	mi := &file_api_node_v1_node_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1480,7 +1810,7 @@ func (x *UpdaterUpdate) String() string {
 func (*UpdaterUpdate) ProtoMessage() {}
 
 func (x *UpdaterUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[26]
+	mi := &file_api_node_v1_node_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1493,7 +1823,7 @@ func (x *UpdaterUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdaterUpdate.ProtoReflect.Descriptor instead.
 func (*UpdaterUpdate) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{26}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *UpdaterUpdate) GetVersion() string {
@@ -1525,7 +1855,7 @@ type UpdateUpdaterResponse struct {
 
 func (x *UpdateUpdaterResponse) Reset() {
 	*x = UpdateUpdaterResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[27]
+	mi := &file_api_node_v1_node_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1537,7 +1867,7 @@ func (x *UpdateUpdaterResponse) String() string {
 func (*UpdateUpdaterResponse) ProtoMessage() {}
 
 func (x *UpdateUpdaterResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[27]
+	mi := &file_api_node_v1_node_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1550,7 +1880,7 @@ func (x *UpdateUpdaterResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateUpdaterResponse.ProtoReflect.Descriptor instead.
 func (*UpdateUpdaterResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{27}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{31}
 }
 
 type UpdateContainerdRequest struct {
@@ -1568,7 +1898,7 @@ type UpdateContainerdRequest struct {
 
 func (x *UpdateContainerdRequest) Reset() {
 	*x = UpdateContainerdRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[28]
+	mi := &file_api_node_v1_node_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1580,7 +1910,7 @@ func (x *UpdateContainerdRequest) String() string {
 func (*UpdateContainerdRequest) ProtoMessage() {}
 
 func (x *UpdateContainerdRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[28]
+	mi := &file_api_node_v1_node_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1593,7 +1923,7 @@ func (x *UpdateContainerdRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateContainerdRequest.ProtoReflect.Descriptor instead.
 func (*UpdateContainerdRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{28}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *UpdateContainerdRequest) GetUpdate() *ContainerdUpdate {
@@ -1634,7 +1964,7 @@ type ContainerdUpdate struct {
 
 func (x *ContainerdUpdate) Reset() {
 	*x = ContainerdUpdate{}
-	mi := &file_api_node_v1_node_proto_msgTypes[29]
+	mi := &file_api_node_v1_node_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1646,7 +1976,7 @@ func (x *ContainerdUpdate) String() string {
 func (*ContainerdUpdate) ProtoMessage() {}
 
 func (x *ContainerdUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[29]
+	mi := &file_api_node_v1_node_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1659,7 +1989,7 @@ func (x *ContainerdUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContainerdUpdate.ProtoReflect.Descriptor instead.
 func (*ContainerdUpdate) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{29}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ContainerdUpdate) GetVersion() string {
@@ -1696,7 +2026,7 @@ type ContainerdFile struct {
 
 func (x *ContainerdFile) Reset() {
 	*x = ContainerdFile{}
-	mi := &file_api_node_v1_node_proto_msgTypes[30]
+	mi := &file_api_node_v1_node_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1708,7 +2038,7 @@ func (x *ContainerdFile) String() string {
 func (*ContainerdFile) ProtoMessage() {}
 
 func (x *ContainerdFile) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[30]
+	mi := &file_api_node_v1_node_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1721,7 +2051,7 @@ func (x *ContainerdFile) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContainerdFile.ProtoReflect.Descriptor instead.
 func (*ContainerdFile) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{30}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ContainerdFile) GetName() string {
@@ -1746,7 +2076,7 @@ type UpdateContainerdResponse struct {
 
 func (x *UpdateContainerdResponse) Reset() {
 	*x = UpdateContainerdResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[31]
+	mi := &file_api_node_v1_node_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1758,7 +2088,7 @@ func (x *UpdateContainerdResponse) String() string {
 func (*UpdateContainerdResponse) ProtoMessage() {}
 
 func (x *UpdateContainerdResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[31]
+	mi := &file_api_node_v1_node_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1771,7 +2101,7 @@ func (x *UpdateContainerdResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateContainerdResponse.ProtoReflect.Descriptor instead.
 func (*UpdateContainerdResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{31}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{35}
 }
 
 type DetachRequest struct {
@@ -1782,7 +2112,7 @@ type DetachRequest struct {
 
 func (x *DetachRequest) Reset() {
 	*x = DetachRequest{}
-	mi := &file_api_node_v1_node_proto_msgTypes[32]
+	mi := &file_api_node_v1_node_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1794,7 +2124,7 @@ func (x *DetachRequest) String() string {
 func (*DetachRequest) ProtoMessage() {}
 
 func (x *DetachRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[32]
+	mi := &file_api_node_v1_node_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1807,7 +2137,7 @@ func (x *DetachRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DetachRequest.ProtoReflect.Descriptor instead.
 func (*DetachRequest) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{32}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{36}
 }
 
 type DetachResponse struct {
@@ -1818,7 +2148,7 @@ type DetachResponse struct {
 
 func (x *DetachResponse) Reset() {
 	*x = DetachResponse{}
-	mi := &file_api_node_v1_node_proto_msgTypes[33]
+	mi := &file_api_node_v1_node_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1830,7 +2160,7 @@ func (x *DetachResponse) String() string {
 func (*DetachResponse) ProtoMessage() {}
 
 func (x *DetachResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[33]
+	mi := &file_api_node_v1_node_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1843,7 +2173,7 @@ func (x *DetachResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DetachResponse.ProtoReflect.Descriptor instead.
 func (*DetachResponse) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{33}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{37}
 }
 
 // Component is a node component or a cluster service as the agent or the
@@ -1869,7 +2199,7 @@ type Component struct {
 
 func (x *Component) Reset() {
 	*x = Component{}
-	mi := &file_api_node_v1_node_proto_msgTypes[34]
+	mi := &file_api_node_v1_node_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1881,7 +2211,7 @@ func (x *Component) String() string {
 func (*Component) ProtoMessage() {}
 
 func (x *Component) ProtoReflect() protoreflect.Message {
-	mi := &file_api_node_v1_node_proto_msgTypes[34]
+	mi := &file_api_node_v1_node_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1894,7 +2224,7 @@ func (x *Component) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Component.ProtoReflect.Descriptor instead.
 func (*Component) Descriptor() ([]byte, []int) {
-	return file_api_node_v1_node_proto_rawDescGZIP(), []int{34}
+	return file_api_node_v1_node_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *Component) GetName() string {
@@ -1937,7 +2267,7 @@ var File_api_node_v1_node_proto protoreflect.FileDescriptor
 const file_api_node_v1_node_proto_rawDesc = "" +
 	"\n" +
 	"\x16api/node/v1/node.proto\x12\x10moostack.node.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x0f\n" +
-	"\rStatusRequest\"\xc3\x02\n" +
+	"\rStatusRequest\"\xcd\x02\n" +
 	"\x0eStatusResponse\x12*\n" +
 	"\x04mode\x18\x01 \x01(\x0e2\x16.moostack.node.v1.ModeR\x04mode\x12;\n" +
 	"\n" +
@@ -1948,8 +2278,18 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"generation\x12\x14\n" +
 	"\x05nodes\x18\x04 \x03(\tR\x05nodes\x12-\n" +
 	"\x12generation_unknown\x18\x05 \x01(\tR\x11generationUnknown\x12*\n" +
-	"\x04lock\x18\x06 \x01(\v2\x16.moostack.node.v1.LockR\x04lock\x127\n" +
-	"\bservices\x18\a \x03(\v2\x1b.moostack.node.v1.ComponentR\bservices\"e\n" +
+	"\x04lock\x18\x06 \x01(\v2\x16.moostack.node.v1.LockR\x04lock\x12A\n" +
+	"\n" +
+	"containers\x18\a \x03(\v2!.moostack.node.v1.ContainerStatusR\n" +
+	"containers\"\xef\x01\n" +
+	"\x0fContainerStatus\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
+	"\x05image\x18\x02 \x01(\tR\x05image\x12\x16\n" +
+	"\x06digest\x18\x03 \x01(\tR\x06digest\x121\n" +
+	"\x05state\x18\x04 \x01(\x0e2\x1b.moostack.node.v1.TaskStateR\x05state\x12\x1b\n" +
+	"\texit_code\x18\x05 \x01(\rR\bexitCode\x120\n" +
+	"\x06health\x18\x06 \x01(\x0e2\x18.moostack.node.v1.HealthR\x06health\x12\x18\n" +
+	"\aproblem\x18\a \x01(\tR\aproblem\"e\n" +
 	"\x17RecordGenerationRequest\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\x03R\n" +
@@ -1983,15 +2323,26 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"\x12ImportImageRequest\x12\x14\n" +
 	"\x05chunk\x18\x01 \x01(\fR\x05chunk\"-\n" +
 	"\x13ImportImageResponse\x12\x16\n" +
-	"\x06images\x18\x01 \x03(\tR\x06images\"_\n" +
-	"\aService\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\tR\aversion\x12\x10\n" +
-	"\x03api\x18\x03 \x01(\tR\x03api\x12\x14\n" +
-	"\x05image\x18\x04 \x01(\tR\x05image\"H\n" +
-	"\x11RunServiceRequest\x123\n" +
-	"\aservice\x18\x01 \x01(\v2\x19.moostack.node.v1.ServiceR\aservice\"\x14\n" +
-	"\x12RunServiceResponse\"O\n" +
+	"\x06images\x18\x01 \x03(\tR\x06images\"\xd3\x01\n" +
+	"\tContainer\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
+	"\x05image\x18\x02 \x01(\tR\x05image\x12\x17\n" +
+	"\x04user\x18\x03 \x01(\tH\x00R\x04user\x88\x01\x01\x12$\n" +
+	"\x0eread_only_root\x18\x04 \x01(\bR\freadOnlyRoot\x12B\n" +
+	"\fcapabilities\x18\x05 \x01(\v2\x1e.moostack.node.v1.CapabilitiesR\fcapabilities\x12\x10\n" +
+	"\x03api\x18\x06 \x01(\tR\x03apiB\a\n" +
+	"\x05_user\"$\n" +
+	"\fCapabilities\x12\x14\n" +
+	"\x05names\x18\x01 \x03(\tR\x05names\"]\n" +
+	"\n" +
+	"RunRequest\x129\n" +
+	"\tcontainer\x18\x01 \x01(\v2\x1b.moostack.node.v1.ContainerR\tcontainer\x12\x14\n" +
+	"\x05lease\x18\x02 \x01(\tR\x05lease\"\r\n" +
+	"\vRunResponse\"9\n" +
+	"\rRemoveRequest\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
+	"\x05lease\x18\x02 \x01(\tR\x05lease\"\x10\n" +
+	"\x0eRemoveResponse\"O\n" +
 	"\x17RemoveIdentitiesRequest\x12\x1e\n" +
 	"\n" +
 	"identities\x18\x01 \x03(\tR\n" +
@@ -2037,7 +2388,12 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x120\n" +
 	"\x06health\x18\x03 \x01(\x0e2\x18.moostack.node.v1.HealthR\x06health\x12\x18\n" +
 	"\aproblem\x18\x04 \x01(\tR\aproblem\x12\x14\n" +
-	"\x05build\x18\x05 \x01(\tR\x05build*E\n" +
+	"\x05build\x18\x05 \x01(\tR\x05build*m\n" +
+	"\tTaskState\x12\x1a\n" +
+	"\x16TASK_STATE_UNSPECIFIED\x10\x00\x12\x16\n" +
+	"\x12TASK_STATE_RUNNING\x10\x01\x12\x15\n" +
+	"\x11TASK_STATE_EXITED\x10\x02\x12\x15\n" +
+	"\x11TASK_STATE_FAILED\x10\x03*E\n" +
 	"\x04Mode\x12\x14\n" +
 	"\x10MODE_UNSPECIFIED\x10\x00\x12\x0f\n" +
 	"\vMODE_DIRECT\x10\x01\x12\x16\n" +
@@ -2045,7 +2401,7 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"\x06Health\x12\x16\n" +
 	"\x12HEALTH_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eHEALTH_HEALTHY\x10\x01\x12\x14\n" +
-	"\x10HEALTH_UNHEALTHY\x10\x022\xe3\b\n" +
+	"\x10HEALTH_UNHEALTHY\x10\x022\x9b\t\n" +
 	"\x05Agent\x12K\n" +
 	"\x06Status\x12\x1f.moostack.node.v1.StatusRequest\x1a .moostack.node.v1.StatusResponse\x12i\n" +
 	"\x10RecordGeneration\x12).moostack.node.v1.RecordGenerationRequest\x1a*.moostack.node.v1.RecordGenerationResponse\x12Z\n" +
@@ -2053,9 +2409,9 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"\tRenewLock\x12\".moostack.node.v1.RenewLockRequest\x1a#.moostack.node.v1.RenewLockResponse\x12Z\n" +
 	"\vReleaseLock\x12$.moostack.node.v1.ReleaseLockRequest\x1a%.moostack.node.v1.ReleaseLockResponse\x12T\n" +
 	"\tBreakLock\x12\".moostack.node.v1.BreakLockRequest\x1a#.moostack.node.v1.BreakLockResponse\x12\\\n" +
-	"\vImportImage\x12$.moostack.node.v1.ImportImageRequest\x1a%.moostack.node.v1.ImportImageResponse(\x01\x12W\n" +
-	"\n" +
-	"RunService\x12#.moostack.node.v1.RunServiceRequest\x1a$.moostack.node.v1.RunServiceResponse\x12i\n" +
+	"\vImportImage\x12$.moostack.node.v1.ImportImageRequest\x1a%.moostack.node.v1.ImportImageResponse(\x01\x12B\n" +
+	"\x03Run\x12\x1c.moostack.node.v1.RunRequest\x1a\x1d.moostack.node.v1.RunResponse\x12K\n" +
+	"\x06Remove\x12\x1f.moostack.node.v1.RemoveRequest\x1a .moostack.node.v1.RemoveResponse\x12i\n" +
 	"\x10RemoveIdentities\x12).moostack.node.v1.RemoveIdentitiesRequest\x1a*.moostack.node.v1.RemoveIdentitiesResponse\x12b\n" +
 	"\rUpdateUpdater\x12&.moostack.node.v1.UpdateUpdaterRequest\x1a'.moostack.node.v1.UpdateUpdaterResponse(\x01\x12k\n" +
 	"\x10UpdateContainerd\x12).moostack.node.v1.UpdateContainerdRequest\x1a*.moostack.node.v1.UpdateContainerdResponse(\x01\x12K\n" +
@@ -2076,106 +2432,116 @@ func file_api_node_v1_node_proto_rawDescGZIP() []byte {
 	return file_api_node_v1_node_proto_rawDescData
 }
 
-var file_api_node_v1_node_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_api_node_v1_node_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
+var file_api_node_v1_node_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_api_node_v1_node_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
 var file_api_node_v1_node_proto_goTypes = []any{
-	(Mode)(0),                        // 0: moostack.node.v1.Mode
-	(Health)(0),                      // 1: moostack.node.v1.Health
-	(*StatusRequest)(nil),            // 2: moostack.node.v1.StatusRequest
-	(*StatusResponse)(nil),           // 3: moostack.node.v1.StatusResponse
-	(*RecordGenerationRequest)(nil),  // 4: moostack.node.v1.RecordGenerationRequest
-	(*RecordGenerationResponse)(nil), // 5: moostack.node.v1.RecordGenerationResponse
-	(*Lock)(nil),                     // 6: moostack.node.v1.Lock
-	(*AcquireLockRequest)(nil),       // 7: moostack.node.v1.AcquireLockRequest
-	(*AcquireLockResponse)(nil),      // 8: moostack.node.v1.AcquireLockResponse
-	(*RenewLockRequest)(nil),         // 9: moostack.node.v1.RenewLockRequest
-	(*RenewLockResponse)(nil),        // 10: moostack.node.v1.RenewLockResponse
-	(*ReleaseLockRequest)(nil),       // 11: moostack.node.v1.ReleaseLockRequest
-	(*ReleaseLockResponse)(nil),      // 12: moostack.node.v1.ReleaseLockResponse
-	(*BreakLockRequest)(nil),         // 13: moostack.node.v1.BreakLockRequest
-	(*BreakLockResponse)(nil),        // 14: moostack.node.v1.BreakLockResponse
-	(*ImportImageRequest)(nil),       // 15: moostack.node.v1.ImportImageRequest
-	(*ImportImageResponse)(nil),      // 16: moostack.node.v1.ImportImageResponse
-	(*Service)(nil),                  // 17: moostack.node.v1.Service
-	(*RunServiceRequest)(nil),        // 18: moostack.node.v1.RunServiceRequest
-	(*RunServiceResponse)(nil),       // 19: moostack.node.v1.RunServiceResponse
-	(*RemoveIdentitiesRequest)(nil),  // 20: moostack.node.v1.RemoveIdentitiesRequest
-	(*RemoveIdentitiesResponse)(nil), // 21: moostack.node.v1.RemoveIdentitiesResponse
-	(*UpdaterStatusRequest)(nil),     // 22: moostack.node.v1.UpdaterStatusRequest
-	(*UpdaterStatusResponse)(nil),    // 23: moostack.node.v1.UpdaterStatusResponse
-	(*UpdateAgentRequest)(nil),       // 24: moostack.node.v1.UpdateAgentRequest
-	(*AgentUpdate)(nil),              // 25: moostack.node.v1.AgentUpdate
-	(*UpdateAgentResponse)(nil),      // 26: moostack.node.v1.UpdateAgentResponse
-	(*UpdateUpdaterRequest)(nil),     // 27: moostack.node.v1.UpdateUpdaterRequest
-	(*UpdaterUpdate)(nil),            // 28: moostack.node.v1.UpdaterUpdate
-	(*UpdateUpdaterResponse)(nil),    // 29: moostack.node.v1.UpdateUpdaterResponse
-	(*UpdateContainerdRequest)(nil),  // 30: moostack.node.v1.UpdateContainerdRequest
-	(*ContainerdUpdate)(nil),         // 31: moostack.node.v1.ContainerdUpdate
-	(*ContainerdFile)(nil),           // 32: moostack.node.v1.ContainerdFile
-	(*UpdateContainerdResponse)(nil), // 33: moostack.node.v1.UpdateContainerdResponse
-	(*DetachRequest)(nil),            // 34: moostack.node.v1.DetachRequest
-	(*DetachResponse)(nil),           // 35: moostack.node.v1.DetachResponse
-	(*Component)(nil),                // 36: moostack.node.v1.Component
-	(*timestamppb.Timestamp)(nil),    // 37: google.protobuf.Timestamp
-	(*durationpb.Duration)(nil),      // 38: google.protobuf.Duration
+	(TaskState)(0),                   // 0: moostack.node.v1.TaskState
+	(Mode)(0),                        // 1: moostack.node.v1.Mode
+	(Health)(0),                      // 2: moostack.node.v1.Health
+	(*StatusRequest)(nil),            // 3: moostack.node.v1.StatusRequest
+	(*StatusResponse)(nil),           // 4: moostack.node.v1.StatusResponse
+	(*ContainerStatus)(nil),          // 5: moostack.node.v1.ContainerStatus
+	(*RecordGenerationRequest)(nil),  // 6: moostack.node.v1.RecordGenerationRequest
+	(*RecordGenerationResponse)(nil), // 7: moostack.node.v1.RecordGenerationResponse
+	(*Lock)(nil),                     // 8: moostack.node.v1.Lock
+	(*AcquireLockRequest)(nil),       // 9: moostack.node.v1.AcquireLockRequest
+	(*AcquireLockResponse)(nil),      // 10: moostack.node.v1.AcquireLockResponse
+	(*RenewLockRequest)(nil),         // 11: moostack.node.v1.RenewLockRequest
+	(*RenewLockResponse)(nil),        // 12: moostack.node.v1.RenewLockResponse
+	(*ReleaseLockRequest)(nil),       // 13: moostack.node.v1.ReleaseLockRequest
+	(*ReleaseLockResponse)(nil),      // 14: moostack.node.v1.ReleaseLockResponse
+	(*BreakLockRequest)(nil),         // 15: moostack.node.v1.BreakLockRequest
+	(*BreakLockResponse)(nil),        // 16: moostack.node.v1.BreakLockResponse
+	(*ImportImageRequest)(nil),       // 17: moostack.node.v1.ImportImageRequest
+	(*ImportImageResponse)(nil),      // 18: moostack.node.v1.ImportImageResponse
+	(*Container)(nil),                // 19: moostack.node.v1.Container
+	(*Capabilities)(nil),             // 20: moostack.node.v1.Capabilities
+	(*RunRequest)(nil),               // 21: moostack.node.v1.RunRequest
+	(*RunResponse)(nil),              // 22: moostack.node.v1.RunResponse
+	(*RemoveRequest)(nil),            // 23: moostack.node.v1.RemoveRequest
+	(*RemoveResponse)(nil),           // 24: moostack.node.v1.RemoveResponse
+	(*RemoveIdentitiesRequest)(nil),  // 25: moostack.node.v1.RemoveIdentitiesRequest
+	(*RemoveIdentitiesResponse)(nil), // 26: moostack.node.v1.RemoveIdentitiesResponse
+	(*UpdaterStatusRequest)(nil),     // 27: moostack.node.v1.UpdaterStatusRequest
+	(*UpdaterStatusResponse)(nil),    // 28: moostack.node.v1.UpdaterStatusResponse
+	(*UpdateAgentRequest)(nil),       // 29: moostack.node.v1.UpdateAgentRequest
+	(*AgentUpdate)(nil),              // 30: moostack.node.v1.AgentUpdate
+	(*UpdateAgentResponse)(nil),      // 31: moostack.node.v1.UpdateAgentResponse
+	(*UpdateUpdaterRequest)(nil),     // 32: moostack.node.v1.UpdateUpdaterRequest
+	(*UpdaterUpdate)(nil),            // 33: moostack.node.v1.UpdaterUpdate
+	(*UpdateUpdaterResponse)(nil),    // 34: moostack.node.v1.UpdateUpdaterResponse
+	(*UpdateContainerdRequest)(nil),  // 35: moostack.node.v1.UpdateContainerdRequest
+	(*ContainerdUpdate)(nil),         // 36: moostack.node.v1.ContainerdUpdate
+	(*ContainerdFile)(nil),           // 37: moostack.node.v1.ContainerdFile
+	(*UpdateContainerdResponse)(nil), // 38: moostack.node.v1.UpdateContainerdResponse
+	(*DetachRequest)(nil),            // 39: moostack.node.v1.DetachRequest
+	(*DetachResponse)(nil),           // 40: moostack.node.v1.DetachResponse
+	(*Component)(nil),                // 41: moostack.node.v1.Component
+	(*timestamppb.Timestamp)(nil),    // 42: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),      // 43: google.protobuf.Duration
 }
 var file_api_node_v1_node_proto_depIdxs = []int32{
-	0,  // 0: moostack.node.v1.StatusResponse.mode:type_name -> moostack.node.v1.Mode
-	36, // 1: moostack.node.v1.StatusResponse.components:type_name -> moostack.node.v1.Component
-	6,  // 2: moostack.node.v1.StatusResponse.lock:type_name -> moostack.node.v1.Lock
-	36, // 3: moostack.node.v1.StatusResponse.services:type_name -> moostack.node.v1.Component
-	37, // 4: moostack.node.v1.Lock.since:type_name -> google.protobuf.Timestamp
-	37, // 5: moostack.node.v1.Lock.until:type_name -> google.protobuf.Timestamp
-	6,  // 6: moostack.node.v1.AcquireLockRequest.lock:type_name -> moostack.node.v1.Lock
-	38, // 7: moostack.node.v1.AcquireLockRequest.ttl:type_name -> google.protobuf.Duration
-	6,  // 8: moostack.node.v1.AcquireLockResponse.lock:type_name -> moostack.node.v1.Lock
-	38, // 9: moostack.node.v1.RenewLockRequest.ttl:type_name -> google.protobuf.Duration
-	6,  // 10: moostack.node.v1.RenewLockResponse.lock:type_name -> moostack.node.v1.Lock
-	6,  // 11: moostack.node.v1.BreakLockResponse.broken:type_name -> moostack.node.v1.Lock
-	17, // 12: moostack.node.v1.RunServiceRequest.service:type_name -> moostack.node.v1.Service
-	36, // 13: moostack.node.v1.UpdaterStatusResponse.updater:type_name -> moostack.node.v1.Component
-	0,  // 14: moostack.node.v1.UpdaterStatusResponse.mode:type_name -> moostack.node.v1.Mode
-	25, // 15: moostack.node.v1.UpdateAgentRequest.update:type_name -> moostack.node.v1.AgentUpdate
-	38, // 16: moostack.node.v1.AgentUpdate.health_timeout:type_name -> google.protobuf.Duration
-	28, // 17: moostack.node.v1.UpdateUpdaterRequest.update:type_name -> moostack.node.v1.UpdaterUpdate
-	38, // 18: moostack.node.v1.UpdaterUpdate.health_timeout:type_name -> google.protobuf.Duration
-	31, // 19: moostack.node.v1.UpdateContainerdRequest.update:type_name -> moostack.node.v1.ContainerdUpdate
-	32, // 20: moostack.node.v1.ContainerdUpdate.files:type_name -> moostack.node.v1.ContainerdFile
-	38, // 21: moostack.node.v1.ContainerdUpdate.health_timeout:type_name -> google.protobuf.Duration
-	1,  // 22: moostack.node.v1.Component.health:type_name -> moostack.node.v1.Health
-	2,  // 23: moostack.node.v1.Agent.Status:input_type -> moostack.node.v1.StatusRequest
-	4,  // 24: moostack.node.v1.Agent.RecordGeneration:input_type -> moostack.node.v1.RecordGenerationRequest
-	7,  // 25: moostack.node.v1.Agent.AcquireLock:input_type -> moostack.node.v1.AcquireLockRequest
-	9,  // 26: moostack.node.v1.Agent.RenewLock:input_type -> moostack.node.v1.RenewLockRequest
-	11, // 27: moostack.node.v1.Agent.ReleaseLock:input_type -> moostack.node.v1.ReleaseLockRequest
-	13, // 28: moostack.node.v1.Agent.BreakLock:input_type -> moostack.node.v1.BreakLockRequest
-	15, // 29: moostack.node.v1.Agent.ImportImage:input_type -> moostack.node.v1.ImportImageRequest
-	18, // 30: moostack.node.v1.Agent.RunService:input_type -> moostack.node.v1.RunServiceRequest
-	20, // 31: moostack.node.v1.Agent.RemoveIdentities:input_type -> moostack.node.v1.RemoveIdentitiesRequest
-	27, // 32: moostack.node.v1.Agent.UpdateUpdater:input_type -> moostack.node.v1.UpdateUpdaterRequest
-	30, // 33: moostack.node.v1.Agent.UpdateContainerd:input_type -> moostack.node.v1.UpdateContainerdRequest
-	34, // 34: moostack.node.v1.Agent.Detach:input_type -> moostack.node.v1.DetachRequest
-	22, // 35: moostack.node.v1.Updater.Status:input_type -> moostack.node.v1.UpdaterStatusRequest
-	24, // 36: moostack.node.v1.Updater.UpdateAgent:input_type -> moostack.node.v1.UpdateAgentRequest
-	3,  // 37: moostack.node.v1.Agent.Status:output_type -> moostack.node.v1.StatusResponse
-	5,  // 38: moostack.node.v1.Agent.RecordGeneration:output_type -> moostack.node.v1.RecordGenerationResponse
-	8,  // 39: moostack.node.v1.Agent.AcquireLock:output_type -> moostack.node.v1.AcquireLockResponse
-	10, // 40: moostack.node.v1.Agent.RenewLock:output_type -> moostack.node.v1.RenewLockResponse
-	12, // 41: moostack.node.v1.Agent.ReleaseLock:output_type -> moostack.node.v1.ReleaseLockResponse
-	14, // 42: moostack.node.v1.Agent.BreakLock:output_type -> moostack.node.v1.BreakLockResponse
-	16, // 43: moostack.node.v1.Agent.ImportImage:output_type -> moostack.node.v1.ImportImageResponse
-	19, // 44: moostack.node.v1.Agent.RunService:output_type -> moostack.node.v1.RunServiceResponse
-	21, // 45: moostack.node.v1.Agent.RemoveIdentities:output_type -> moostack.node.v1.RemoveIdentitiesResponse
-	29, // 46: moostack.node.v1.Agent.UpdateUpdater:output_type -> moostack.node.v1.UpdateUpdaterResponse
-	33, // 47: moostack.node.v1.Agent.UpdateContainerd:output_type -> moostack.node.v1.UpdateContainerdResponse
-	35, // 48: moostack.node.v1.Agent.Detach:output_type -> moostack.node.v1.DetachResponse
-	23, // 49: moostack.node.v1.Updater.Status:output_type -> moostack.node.v1.UpdaterStatusResponse
-	26, // 50: moostack.node.v1.Updater.UpdateAgent:output_type -> moostack.node.v1.UpdateAgentResponse
-	37, // [37:51] is the sub-list for method output_type
-	23, // [23:37] is the sub-list for method input_type
-	23, // [23:23] is the sub-list for extension type_name
-	23, // [23:23] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	1,  // 0: moostack.node.v1.StatusResponse.mode:type_name -> moostack.node.v1.Mode
+	41, // 1: moostack.node.v1.StatusResponse.components:type_name -> moostack.node.v1.Component
+	8,  // 2: moostack.node.v1.StatusResponse.lock:type_name -> moostack.node.v1.Lock
+	5,  // 3: moostack.node.v1.StatusResponse.containers:type_name -> moostack.node.v1.ContainerStatus
+	0,  // 4: moostack.node.v1.ContainerStatus.state:type_name -> moostack.node.v1.TaskState
+	2,  // 5: moostack.node.v1.ContainerStatus.health:type_name -> moostack.node.v1.Health
+	42, // 6: moostack.node.v1.Lock.since:type_name -> google.protobuf.Timestamp
+	42, // 7: moostack.node.v1.Lock.until:type_name -> google.protobuf.Timestamp
+	8,  // 8: moostack.node.v1.AcquireLockRequest.lock:type_name -> moostack.node.v1.Lock
+	43, // 9: moostack.node.v1.AcquireLockRequest.ttl:type_name -> google.protobuf.Duration
+	8,  // 10: moostack.node.v1.AcquireLockResponse.lock:type_name -> moostack.node.v1.Lock
+	43, // 11: moostack.node.v1.RenewLockRequest.ttl:type_name -> google.protobuf.Duration
+	8,  // 12: moostack.node.v1.RenewLockResponse.lock:type_name -> moostack.node.v1.Lock
+	8,  // 13: moostack.node.v1.BreakLockResponse.broken:type_name -> moostack.node.v1.Lock
+	20, // 14: moostack.node.v1.Container.capabilities:type_name -> moostack.node.v1.Capabilities
+	19, // 15: moostack.node.v1.RunRequest.container:type_name -> moostack.node.v1.Container
+	41, // 16: moostack.node.v1.UpdaterStatusResponse.updater:type_name -> moostack.node.v1.Component
+	1,  // 17: moostack.node.v1.UpdaterStatusResponse.mode:type_name -> moostack.node.v1.Mode
+	30, // 18: moostack.node.v1.UpdateAgentRequest.update:type_name -> moostack.node.v1.AgentUpdate
+	43, // 19: moostack.node.v1.AgentUpdate.health_timeout:type_name -> google.protobuf.Duration
+	33, // 20: moostack.node.v1.UpdateUpdaterRequest.update:type_name -> moostack.node.v1.UpdaterUpdate
+	43, // 21: moostack.node.v1.UpdaterUpdate.health_timeout:type_name -> google.protobuf.Duration
+	36, // 22: moostack.node.v1.UpdateContainerdRequest.update:type_name -> moostack.node.v1.ContainerdUpdate
+	37, // 23: moostack.node.v1.ContainerdUpdate.files:type_name -> moostack.node.v1.ContainerdFile
+	43, // 24: moostack.node.v1.ContainerdUpdate.health_timeout:type_name -> google.protobuf.Duration
+	2,  // 25: moostack.node.v1.Component.health:type_name -> moostack.node.v1.Health
+	3,  // 26: moostack.node.v1.Agent.Status:input_type -> moostack.node.v1.StatusRequest
+	6,  // 27: moostack.node.v1.Agent.RecordGeneration:input_type -> moostack.node.v1.RecordGenerationRequest
+	9,  // 28: moostack.node.v1.Agent.AcquireLock:input_type -> moostack.node.v1.AcquireLockRequest
+	11, // 29: moostack.node.v1.Agent.RenewLock:input_type -> moostack.node.v1.RenewLockRequest
+	13, // 30: moostack.node.v1.Agent.ReleaseLock:input_type -> moostack.node.v1.ReleaseLockRequest
+	15, // 31: moostack.node.v1.Agent.BreakLock:input_type -> moostack.node.v1.BreakLockRequest
+	17, // 32: moostack.node.v1.Agent.ImportImage:input_type -> moostack.node.v1.ImportImageRequest
+	21, // 33: moostack.node.v1.Agent.Run:input_type -> moostack.node.v1.RunRequest
+	23, // 34: moostack.node.v1.Agent.Remove:input_type -> moostack.node.v1.RemoveRequest
+	25, // 35: moostack.node.v1.Agent.RemoveIdentities:input_type -> moostack.node.v1.RemoveIdentitiesRequest
+	32, // 36: moostack.node.v1.Agent.UpdateUpdater:input_type -> moostack.node.v1.UpdateUpdaterRequest
+	35, // 37: moostack.node.v1.Agent.UpdateContainerd:input_type -> moostack.node.v1.UpdateContainerdRequest
+	39, // 38: moostack.node.v1.Agent.Detach:input_type -> moostack.node.v1.DetachRequest
+	27, // 39: moostack.node.v1.Updater.Status:input_type -> moostack.node.v1.UpdaterStatusRequest
+	29, // 40: moostack.node.v1.Updater.UpdateAgent:input_type -> moostack.node.v1.UpdateAgentRequest
+	4,  // 41: moostack.node.v1.Agent.Status:output_type -> moostack.node.v1.StatusResponse
+	7,  // 42: moostack.node.v1.Agent.RecordGeneration:output_type -> moostack.node.v1.RecordGenerationResponse
+	10, // 43: moostack.node.v1.Agent.AcquireLock:output_type -> moostack.node.v1.AcquireLockResponse
+	12, // 44: moostack.node.v1.Agent.RenewLock:output_type -> moostack.node.v1.RenewLockResponse
+	14, // 45: moostack.node.v1.Agent.ReleaseLock:output_type -> moostack.node.v1.ReleaseLockResponse
+	16, // 46: moostack.node.v1.Agent.BreakLock:output_type -> moostack.node.v1.BreakLockResponse
+	18, // 47: moostack.node.v1.Agent.ImportImage:output_type -> moostack.node.v1.ImportImageResponse
+	22, // 48: moostack.node.v1.Agent.Run:output_type -> moostack.node.v1.RunResponse
+	24, // 49: moostack.node.v1.Agent.Remove:output_type -> moostack.node.v1.RemoveResponse
+	26, // 50: moostack.node.v1.Agent.RemoveIdentities:output_type -> moostack.node.v1.RemoveIdentitiesResponse
+	34, // 51: moostack.node.v1.Agent.UpdateUpdater:output_type -> moostack.node.v1.UpdateUpdaterResponse
+	38, // 52: moostack.node.v1.Agent.UpdateContainerd:output_type -> moostack.node.v1.UpdateContainerdResponse
+	40, // 53: moostack.node.v1.Agent.Detach:output_type -> moostack.node.v1.DetachResponse
+	28, // 54: moostack.node.v1.Updater.Status:output_type -> moostack.node.v1.UpdaterStatusResponse
+	31, // 55: moostack.node.v1.Updater.UpdateAgent:output_type -> moostack.node.v1.UpdateAgentResponse
+	41, // [41:56] is the sub-list for method output_type
+	26, // [26:41] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_api_node_v1_node_proto_init() }
@@ -2183,13 +2549,14 @@ func file_api_node_v1_node_proto_init() {
 	if File_api_node_v1_node_proto != nil {
 		return
 	}
+	file_api_node_v1_node_proto_msgTypes[16].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_node_v1_node_proto_rawDesc), len(file_api_node_v1_node_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   35,
+			NumEnums:      3,
+			NumMessages:   39,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

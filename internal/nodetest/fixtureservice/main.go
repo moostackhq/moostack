@@ -1,13 +1,16 @@
 // Command fixtureservice is a cluster service for nodetest's tests only:
-// it serves the API whose gRPC service name is its argument, as another
+// it serves the API whose gRPC service name -api gives, as another
 // service does, but lets every caller kind call each of its methods,
 // Ping too, so that a test can tell which of the two the agent asked
 // what each method allows. Its Echo and Ping answer with an empty
 // message, and its Stream answers each message of the call with an
-// empty one. It prints "serving <API>" once it listens.
+// empty one. It prints "serving <API>" once it listens. -health-delay
+// has Health take that long to answer. Without -api, it is an app,
+// which serves nothing, and with -exit <code> it exits at once.
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -27,11 +31,24 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: fixtureservice <API>")
-		os.Exit(2)
+	api := flag.String("api", "", "the gRPC service name of the API to serve, none for an app")
+	exit := flag.Int("exit", -1, "the code to exit with at once, if any")
+	flag.DurationVar(&healthDelay, "health-delay", 0, "how long Health takes to answer")
+	flag.Parse()
+	switch {
+	case *exit >= 0:
+		fmt.Println("exiting with", *exit)
+		os.Exit(*exit)
+	case *api == "":
+		// As an app, it serves nothing: it says who it runs as and waits
+		// for SIGTERM.
+		fmt.Printf("running as %d:%d\n", os.Getuid(), os.Getgid())
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+		<-signals
+		return
 	}
-	if err := serve(os.Args[1]); err != nil {
+	if err := serve(*api); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -58,6 +75,9 @@ func serve(api string) error {
 	return server.Serve(l)
 }
 
+// healthDelay is how long Health takes to answer.
+var healthDelay time.Duration
+
 // handle answers a call of one of api's methods.
 func handle(api string, stream grpc.ServerStream) error {
 	full, _ := grpc.MethodFromServerStream(stream)
@@ -68,6 +88,7 @@ func handle(api string, stream grpc.ServerStream) error {
 	var res proto.Message
 	switch method {
 	case "Health":
+		time.Sleep(healthDelay)
 		res = &servicev1.HealthResponse{}
 	case "Describe":
 		every := []servicev1.CallerKind{

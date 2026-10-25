@@ -52,8 +52,11 @@ const (
 	NodeFile = ConfigDir + "/node.yml"
 	// ContainerdConfigFile is containerd's config, ContainerdConfig.
 	ContainerdConfigFile = ConfigDir + "/containerd.toml"
+	// ContainerdState is containerd's state directory, which holds the
+	// bundle of each task, as ContainerdConfig says.
+	ContainerdState = RunDir + "/containerd"
 	// ContainerdSocket is where containerd serves its API.
-	ContainerdSocket = RunDir + "/containerd/containerd.sock"
+	ContainerdSocket = ContainerdState + "/containerd.sock"
 	// GenerationFile holds the generation of the cluster directory that
 	// the node last applied, with the directory's nodes, as JSON.
 	GenerationFile = StateDir + "/generation"
@@ -67,23 +70,23 @@ const (
 	// PeerPort is the port the agent listens for peers on, at the node's
 	// private address.
 	PeerPort = 7443
-	// ServicesFile holds the cluster services the node runs, as JSON,
-	// which are the agent's routes.
-	ServicesFile = StateDir + "/services"
-	// ServicesDir holds a directory for each cluster service, named for
-	// it, which the agent mounts in the service's container, where the
-	// service serves its API. It is root's alone, so that no other user
-	// of the host reaches a service around the agent.
-	ServicesDir = RunDir + "/services"
-	// ServiceLogDir holds each cluster service's output, as <name>.log.
-	ServiceLogDir = StateDir + "/logs"
+	// ContainersFile holds the containers the node runs, the cluster
+	// services among them, as JSON, whose APIs are the agent's routes.
+	ContainersFile = StateDir + "/containers"
+	// ContainersDir holds a directory for each container that serves an
+	// API, named for it, which the agent mounts in the container, where
+	// the container serves its API. It is root's alone, so that no other
+	// user of the host reaches a container's API around the agent.
+	ContainersDir = RunDir + "/containers"
+	// ContainerLogDir holds each container's output, as <name>.log.
+	ContainerLogDir = StateDir + "/logs"
 	// ContainerdNamespace is the containerd namespace of Moostack's
 	// containers and images.
 	ContainerdNamespace = "moostack"
 	// RuncRoot is where runc keeps the state of Moostack's containers.
 	RuncRoot = RunDir + "/runc"
 	// CgroupParent is the cgroup, under the host's cgroup root, of the
-	// cluster services' containers, each in one of its own.
+	// containers, each in one of its own.
 	CgroupParent = "/moostack"
 	// CgroupDir is CgroupParent in the host's cgroup filesystem.
 	CgroupDir = "/sys/fs/cgroup" + CgroupParent
@@ -165,7 +168,7 @@ func Server(socket string) (string, bool) {
 // and NRI are off.
 const ContainerdConfig = `version = 4
 root = "` + StateDir + `/containerd"
-state = "` + RunDir + `/containerd"
+state = "` + ContainerdState + `"
 imports = []
 disabled_plugins = [
   "io.containerd.grpc.v1.cri",

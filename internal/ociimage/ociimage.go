@@ -26,6 +26,8 @@ type Image struct {
 	Architecture string
 	// Entrypoint is the command the image's container runs.
 	Entrypoint []string
+	// User is the user the image's container runs as, root if empty.
+	User string
 	// Files are the layer's files, at the root of the image.
 	Files []File
 }
@@ -85,10 +87,14 @@ func Write(w io.Writer, img Image) error {
 	if err := gz.Close(); err != nil {
 		return err
 	}
+	runConfig := map[string]any{"Entrypoint": img.Entrypoint}
+	if img.User != "" {
+		runConfig["User"] = img.User
+	}
 	config, err := json.Marshal(map[string]any{
 		"architecture": img.Architecture,
 		"os":           "linux",
-		"config":       map[string]any{"Entrypoint": img.Entrypoint},
+		"config":       runConfig,
 		"rootfs":       map[string]any{"type": "layers", "diff_ids": []string{digest(layer.Bytes())}},
 	})
 	if err != nil {

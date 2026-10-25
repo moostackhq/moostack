@@ -2,12 +2,14 @@ package nodeclient_test
 
 import (
 	"context"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/nodeclient"
@@ -92,25 +94,27 @@ func TestStatusQuotesWhatTheNodeReportsThatIsntPrintable(t *testing.T) {
 				GenerationUnknown: bad,
 				Lock:              &nodev1.Lock{Lease: "l", Holder: bad, Machine: bad, Operation: bad},
 				Components:        []*nodev1.Component{{Name: "agent", Version: bad, Build: bad, Problem: bad}},
-				Services:          []*nodev1.Component{{Name: bad, Version: "1.0.0", Problem: "it is stuck"}},
+				Containers:        []*nodev1.ContainerStatus{{Name: bad, Image: bad, Digest: bad, Problem: bad}},
 			}},
 			Updater: updaterStatusOf{res: &nodev1.UpdaterStatusResponse{Updater: &nodev1.Component{Name: "updater", Version: bad}}},
 		}
 		s := n.Status(t.Context())
-		agent, updater, service := s.Components[0], s.Components[1], s.Services[0]
+		agent, updater, container := s.Components[0], s.Components[1], s.Containers[0]
 		for what, got := range map[string]string{
 			"the node's name": s.Nodes[1], "why the generation is unknown": s.GenerationUnknown,
 			"the lock's holder": s.Lock.Holder, "the lock's machine": s.Lock.Machine, "the lock's operation": s.Lock.Operation,
 			"the agent's version": agent.Version, "the agent's build": agent.Build, "the agent's problem": agent.Problem,
-			"the updater's version": updater.Version, "the service's name": service.Name,
+			"the updater's version": updater.Version,
+			"the container's name":  container.Name, "the container's image": container.Image,
+			"the container's digest": container.Digest, "the container's problem": container.Problem,
 		} {
 			if got != quoted {
 				t.Errorf("%q as %s: Status says %q, want %q", bad, what, got, quoted)
 			}
 		}
 		// What is printable is left as it is.
-		if s.Nodes[0] != "node1" || service.Version != "1.0.0" || service.Problem != "it is stuck" || s.Lock.Lease != "l" {
-			t.Errorf("Status changed printable text: %q, %q, %q, %q", s.Nodes[0], service.Version, service.Problem, s.Lock.Lease)
+		if s.Nodes[0] != "node1" || s.Lock.Lease != "l" {
+			t.Errorf("Status changed printable text: %q, %q", s.Nodes[0], s.Lock.Lease)
 		}
 	}
 }
@@ -141,4 +145,24 @@ func FuzzPrintable(f *testing.F) {
 			t.Fatalf("Printable(%q) = %q, which unquotes to %q, %v", s, got, back, err)
 		}
 	})
+}
+
+// The cluster services are the containers that run the release's image
+// of the service of their name, at the version of that image, as healthy
+// as the container's API; no other container is one.
+func TestStatusTellsTheClusterServicesAmongTheContainers(t *testing.T) {
+	n := &nodeclient.Node{
+		Agent: statusOf{agent: &nodev1.StatusResponse{Containers: []*nodev1.ContainerStatus{
+			{Name: "dns", Image: "moostack.local/dns:1.2.0", Digest: "sha256:dns", Health: nodev1.Health_HEALTH_UNHEALTHY, Problem: "it is stuck"},
+			{Name: "proxy", Image: "moostack.local/dns:1.2.0"},
+			{Name: "registry", Image: "moostack.local/registry:"},
+			{Name: "app-web", Image: "docker.io/library/nginx:1.27"},
+		}}},
+		Updater: updaterStatusOf{res: &nodev1.UpdaterStatusResponse{Updater: &nodev1.Component{Name: "updater"}}},
+	}
+	got := n.Status(t.Context()).Services()
+	want := []*nodev1.Component{{Name: "dns", Version: "1.2.0", Build: "sha256:dns", Health: nodev1.Health_HEALTH_UNHEALTHY, Problem: "it is stuck"}}
+	if !slices.EqualFunc(got, want, func(a, b *nodev1.Component) bool { return proto.Equal(a, b) }) {
+		t.Errorf("Status says the services are %v, want %v", got, want)
+	}
 }

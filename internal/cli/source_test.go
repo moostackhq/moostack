@@ -391,8 +391,11 @@ func TestASourceBuildIsUpdatedOnANodeThatDoesntSayItsBuildYet(t *testing.T) {
 			o.mustRun("cluster", "update", "--source", checkout, "agent", "dns")
 			for _, n := range o.nodes {
 				n.mu.Lock()
-				for _, c := range append(n.status.Components, n.status.Services...) {
+				for _, c := range n.status.Components {
 					c.Build = ""
+				}
+				for _, c := range n.status.Containers {
+					c.Digest = ""
 				}
 				n.mu.Unlock()
 			}
@@ -489,8 +492,8 @@ func TestClusterStatusMarksDevelopmentBuilds(t *testing.T) {
 	}
 	var view struct {
 		Nodes []struct {
-			Name                 string
-			Components, Services []struct {
+			Name                   string
+			Components, Containers []struct {
 				Name, Running string
 				Development   bool
 			}
@@ -502,7 +505,7 @@ func TestClusterStatusMarksDevelopmentBuilds(t *testing.T) {
 	}
 	var marked []string
 	for _, n := range view.Nodes {
-		for _, c := range append(n.Components, n.Services...) {
+		for _, c := range append(n.Components, n.Containers...) {
 			if c.Development {
 				marked = append(marked, n.Name+" "+c.Name+" "+c.Running)
 			}

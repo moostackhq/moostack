@@ -27,6 +27,7 @@ import (
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/nodeclient"
+	"github.com/moostackhq/moostack/internal/orchestrate"
 	"github.com/moostackhq/moostack/internal/release"
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
@@ -213,9 +214,10 @@ const healthTimeout = time.Minute
 // leaves it. The host must have passed Check. Install refuses a release
 // without the cluster services before it changes the host. If Install
 // fails after that, it rolls back. The node holds the identities removed
-// lists as removed from before its agent starts. Install returns the
-// fingerprint of the node's identity.
-func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig, ca *identity.CA, removed []string) (string, error) {
+// lists as removed from before its agent starts. It runs the services
+// for the lease that lock takes the node's operation lock for. Install
+// returns the fingerprint of the node's identity.
+func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig, ca *identity.CA, removed []string, lock TakeLock) (string, error) {
 	if err := rel.CheckClusterServices(); err != nil {
 		return "", err
 	}
@@ -235,8 +237,8 @@ func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 			}
 			return identified{node: node, cert: cert, ca: ca.CertPEM()}, nil
 		},
-		removed:  removed,
-		services: true,
+		removed: removed,
+		lock:    lock,
 	})
 	if err != nil {
 		return "", Rollback(ctx, c, err)
@@ -312,14 +314,19 @@ type identified struct {
 	cert, ca []byte
 }
 
+// TakeLock takes the operation lock of node, a node being installed,
+// and keeps it until release is called, and returns the lease that holds
+// it, as orchestrate's Cluster.Lock does.
+type TakeLock func(ctx context.Context, node orchestrate.Node) (lease string, release func(), err error)
+
 // installPlan is what tells one install from another: how the node gets
 // its identity, once its key is the only one there can be, the
-// identities it holds as removed, and whether it starts the release's
-// cluster services.
+// identities it holds as removed, and how it takes the operation lock to
+// start the release's cluster services, nil if it doesn't start them.
 type installPlan struct {
 	identify func() (identified, error)
 	removed  []string
-	services bool
+	lock     TakeLock
 }
 
 // install installs the components of rel, identified as plan says, and
@@ -390,10 +397,15 @@ func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 	if err := waitHealthy(ctx, api, wait, func(s nodeclient.Status) error { return componentsHealthy(s, rel) }); err != nil {
 		return "", err
 	}
-	if !plan.services {
+	if plan.lock == nil {
 		return fingerprint, nil
 	}
-	if err := startServices(ctx, api, h, rel); err != nil {
+	lease, release, err := plan.lock(ctx, api)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	if err := startServices(ctx, api, h, rel, lease); err != nil {
 		return "", err
 	}
 	if err := waitHealthy(ctx, api, wait, func(s nodeclient.Status) error { return servicesHealthy(s, rel) }); err != nil {
@@ -404,8 +416,8 @@ func install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 
 // startServices has the agent import the image of each of rel's cluster
 // services for the host's architecture, checked against rel's checksums,
-// and run the service.
-func startServices(ctx context.Context, node *nodeclient.Node, h Host, rel *release.Release) error {
+// and run the service, for lease.
+func startServices(ctx context.Context, node *nodeclient.Node, h Host, rel *release.Release, lease string) error {
 	for _, s := range rel.Services {
 		data, err := rel.ReadFile(h.Architecture, s.Image)
 		if err != nil {
@@ -419,8 +431,7 @@ func startServices(ctx context.Context, node *nodeclient.Node, h Host, rel *rele
 		if !slices.Contains(images, ref) {
 			return fmt.Errorf("seeding %s's image imported %s, not %s", s.Name, strings.Join(images, ", "), ref)
 		}
-		_, err = node.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: &nodev1.Service{Name: s.Name, Version: s.Version, Api: s.API, Image: ref}})
-		if err != nil {
+		if err := node.Run(ctx, nodeclient.ServiceContainer(s.Name, s.API, ref), lease); err != nil {
 			return fmt.Errorf("starting %s: %w", s.Name, err)
 		}
 	}
@@ -462,7 +473,7 @@ func servicesHealthy(status nodeclient.Status, rel *release.Release) error {
 	if status.AgentErr != nil {
 		return fmt.Errorf("the agent doesn't answer: %w", status.AgentErr)
 	}
-	return reportedHealthy(status.Services, rel.PinnedServices())
+	return reportedHealthy(status.Services(), rel.PinnedServices())
 }
 
 // reportedHealthy fails unless reported has each of pinned, healthy at

@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/orchestrate"
 )
@@ -557,5 +559,29 @@ func TestUpdateGetsEveryNodesReleaseBeforeAnyStep(t *testing.T) {
 	}
 	if u := f["node1"].componentUpdates(""); len(u) > 0 {
 		t.Errorf("node1 was updated to %v, before the update found node2 has nothing to install", u)
+	}
+}
+
+// An update runs each cluster service as nobody, with a read-only root
+// and no capabilities, serving its API, for the operation's lease, which
+// the node refuses any other.
+func TestUpdateRunsEachServiceLockedDownForTheOperationsLease(t *testing.T) {
+	f := fakes{"node1": &node{generation: 1}}
+	cl, err := orchestrate.Preflight(t.Context(), inOrder(f, "node1"), 1, false, holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	if err := update(cl); err != nil {
+		t.Fatal(err)
+	}
+	nobody := "65534:65534"
+	want := []*nodev1.Container{
+		{Name: "dns", Image: "moostack.local/dns:2.0.0", User: &nobody, ReadOnlyRoot: true, Capabilities: &nodev1.Capabilities{}, Api: "moostack.dns.v1.DNS"},
+		{Name: "proxy", Image: "moostack.local/proxy:2.0.0", User: &nobody, ReadOnlyRoot: true, Capabilities: &nodev1.Capabilities{}, Api: "moostack.proxy.v1.Proxy"},
+	}
+	got := f["node1"].containersRun()
+	if !slices.EqualFunc(got, want, func(a, b *nodev1.Container) bool { return proto.Equal(a, b) }) {
+		t.Errorf("the update ran %v, want %v", got, want)
 	}
 }

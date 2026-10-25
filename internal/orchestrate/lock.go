@@ -138,6 +138,48 @@ func (c *Cluster) take(ctx context.Context, conn Node, timeout time.Duration) (t
 	return sent, nil
 }
 
+// Lock takes the operation lock on node, which the operation has no
+// connection to yet, as one being installed, and renews it every third
+// of a lease time, as keepLease does the others', until the returned
+// stop is called, which waits for a renewal under way. It returns the
+// lease that holds it. A renewal the node refuses ends the renewals, and
+// the node then refuses what the lease fences, so that the install fails.
+func (c *Cluster) Lock(ctx context.Context, node Node) (string, func(), error) {
+	if _, err := c.take(ctx, node, c.reachTimeout); err != nil {
+		return "", nil, err
+	}
+	// Renewed as the nodes the operation holds are, but apart from them,
+	// so that the node being installed takes no part in whether the
+	// operation holds its lock.
+	installed := &namedConn{conn: node}
+	ctx, cancel := context.WithCancel(c.held)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		renew := time.NewTicker(c.ttl / 3)
+		defer renew.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-renew.C:
+			}
+			renewCtx, cancelRenew := context.WithTimeout(ctx, c.ttl/3)
+			// A renewal the node doesn't answer is tried again on the next
+			// tick; one it refuses sets lost.
+			_ = c.renew(renewCtx, installed)
+			cancelRenew()
+			c.mu.Lock()
+			lost := installed.lease.lost != ""
+			c.mu.Unlock()
+			if lost {
+				return
+			}
+		}
+	}()
+	return c.lease.Lease, func() { cancel(); <-done }, nil
+}
+
 // keepLease renews the lease on every node that granted it, every third
 // of a lease time, until stop is closed. It cancels the operation as
 // soon as a node answers that it no longer holds it, or once the lease

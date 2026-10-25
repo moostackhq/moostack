@@ -62,7 +62,7 @@ func TestStatusSaysWhichBuildOfEachComponentAndServiceRuns(t *testing.T) {
 		}
 		return nil
 	})
-	for _, s := range status.Services {
+	for _, s := range nodetest.Services(status) {
 		digest, err := ociimage.Digest(nodetest.ImageArchive(t, s.Name))
 		if err != nil {
 			t.Fatal(err)

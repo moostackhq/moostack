@@ -101,15 +101,15 @@ func TestTheAgentStartsWithContainerdStoppedAndSaysSo(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for _, c := range append(slices.Clone(st.Components), st.Services...) {
+		for _, c := range append(slices.Clone(st.Components), nodetest.Services(st)...) {
 			if c.Name == "containerd" || slices.ContainsFunc(release.ClusterServices, func(s release.ClusterService) bool { return s.Name == c.Name }) {
 				if c.Health != nodev1.Health_HEALTH_UNHEALTHY || c.Problem == "" {
 					return fmt.Errorf("%s is %s: %q, want unhealthy saying why", c.Name, c.Health, c.Problem)
 				}
 			}
 		}
-		if len(st.Services) != len(release.ClusterServices) {
-			return fmt.Errorf("the agent reports the services %v", st.Services)
+		if len(nodetest.Services(st)) != len(release.ClusterServices) {
+			return fmt.Errorf("the agent reports the services %v", nodetest.Services(st))
 		}
 		return nil
 	})
@@ -118,7 +118,7 @@ func TestTheAgentStartsWithContainerdStoppedAndSaysSo(t *testing.T) {
 	if status.Code(err) != codes.Unavailable {
 		t.Errorf("a call of dns while containerd is down: %v, want unavailable", err)
 	}
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Service("dns")}); status.Code(err) != codes.Unavailable {
+	if _, err := runService(t.Context(), t, n, nodetest.Service("dns")); status.Code(err) != codes.Unavailable {
 		t.Errorf("running dns while containerd is down: %v, want unavailable", err)
 	}
 	// Once containerd is back, the agent starts the services and routes

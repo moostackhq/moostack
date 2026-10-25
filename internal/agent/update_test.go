@@ -231,7 +231,7 @@ func TestUpdateContainerdSwapsItsBinariesWhileContainersKeepRunning(t *testing.T
 	before := servicePID(t, n, "dns")
 	moved := nodetest.Service("dns")
 	moved.Api = otherAPI
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: moved}); err != nil {
+	if _, err := runService(t.Context(), t, n, moved); err != nil {
 		t.Fatalf("replacing dns after containerd's update: %v", err)
 	}
 	if after := servicePID(t, n, "dns"); after == before {

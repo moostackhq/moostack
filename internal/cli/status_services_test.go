@@ -54,11 +54,11 @@ func TestClusterStatusShowsEachPinnedServiceOfEachNode(t *testing.T) {
 	o.nodes = map[string]*fakeNode{
 		// DNS is behind, on a release that 1.0.0 doesn't update, and
 		// stopped, and a service the release doesn't pin runs too.
-		"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: upToDate(), Services: []*nodev1.Component{
+		"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: upToDate(), Containers: asContainers([]*nodev1.Component{
 			component("dns", "0.9.0", unhealthy, "the service doesn't answer: connection refused"),
 			component("registry", "1.0.0", healthy, ""),
 			component("extra", "0.1.0", healthy, ""),
-		}}},
+		})}},
 		// Only the updater answers, so the services aren't known.
 		"node2": {status: nodeclient.Status{AgentErr: errors.New("connection refused"), Components: []*nodev1.Component{
 			component("agent", "", unhealthy, "the agent doesn't answer: connection refused"),
@@ -98,19 +98,20 @@ node3: dial tcp: no route to host
 	}
 }
 
-func TestClusterStatusJSONListsTheServicesApart(t *testing.T) {
+func TestClusterStatusJSONListsTheContainersApart(t *testing.T) {
 	o := newOperator(t, "op")
 	source := statusCluster(t, o, "node1")
 	pinServices(t, source)
-	o.nodes = map[string]*fakeNode{"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: upToDate(), Services: []*nodev1.Component{
+	o.nodes = map[string]*fakeNode{"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: upToDate(), Containers: asContainers([]*nodev1.Component{
 		component("registry", "1.0.0", healthy, ""),
-	}}}}
+	})}}}
 	r := o.mustRun("--release-source", source, "cluster", "status", "--json")
-	wantContains(t, "cluster status --json", r.stdout, `      "services": [
+	wantContains(t, "cluster status --json", r.stdout, `      "containers": [
         {
           "name": "registry",
           "running": "1.0.0",
           "pinned": "1.0.0",
+          "image": "moostack.local/registry:1.0.0",
           "health": "healthy"
         },
         {
@@ -132,16 +133,16 @@ func TestClusterStatusTreeKeepsItsShapeWhateverTheNodesReport(t *testing.T) {
 			component("agent", "1.0.0", healthy, ""),
 			component("updater", "1.0.0", unhealthy, "it is stuck"),
 			component("containerd", "2.0.0", healthy, ""),
-		}, Services: []*nodev1.Component{
+		}, Containers: asContainers([]*nodev1.Component{
 			component("registry", "1.0.0", healthy, ""),
 			component("dns", "1.0.0", unhealthy, "the service doesn't answer"),
-		}}},
+		})}},
 		// The widest version, wider in bytes than in characters, and one
 		// that would add a line of its own.
-		"node2": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: upToDate(), Services: []*nodev1.Component{
+		"node2": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: upToDate(), Containers: asContainers([]*nodev1.Component{
 			component("registry", "1.0.0-ünïcödé-ünïcödé-ünïcödé", healthy, ""),
 			component("dns", "1.0.0\nnode9  unreachable", healthy, ""),
-		}}},
+		})}},
 	}
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	_, tree, _ := strings.Cut(r.stdout, "\nNODE")
@@ -172,9 +173,9 @@ func TestClusterStatusPutsServicesWithoutAnAgentAtTheComponentsLevel(t *testing.
 	statusCluster(t, o, "node1")
 	o.nodes = map[string]*fakeNode{"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: []*nodev1.Component{
 		component("updater", "1.0.0", healthy, ""),
-	}, Services: []*nodev1.Component{
+	}, Containers: asContainers([]*nodev1.Component{
 		component("registry", "1.0.0", healthy, ""),
-	}}}}
+	})}}}
 	// A release source that is down, so that nothing pins the agent.
 	s := serveSource(t, t.TempDir())
 	o.client = s.Client()
@@ -193,11 +194,11 @@ func TestClusterStatusQuotesWhatNodesReportInItsProblems(t *testing.T) {
 	source := statusCluster(t, o, "node1", "node2", "node3")
 	pinServices(t, source)
 	o.nodes = map[string]*fakeNode{
-		"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: upToDate(), Services: []*nodev1.Component{
+		"node1": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: upToDate(), Containers: asContainers([]*nodev1.Component{
 			component("registry", "1.0.0", healthy, ""),
 			component("dns", "1.0.0", healthy, ""),
 			component("extra\nnode9  unreachable", "0.1.0", unhealthy, "stuck\x1b[2A"),
-		}}},
+		})}},
 		"node2": generationUnknown("the file is bad\nnode9: connecting to root@node9.invalid: connection refused"),
 		"node3": {err: errors.New("dial tcp: banner\r\nnode9: forged")},
 	}

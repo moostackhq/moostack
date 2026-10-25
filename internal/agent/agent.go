@@ -1,10 +1,11 @@
 //go:build linux
 
 // Package agent is the node component that serves the node API, runs
-// the cluster services and carries calls to them, and listens for the
-// node's peers with mTLS. On a node that has joined a control plane, it
-// serves the node API to the control plane over a tunnel it dials, and
-// its local socket serves only status and break-glass detach.
+// containers, the cluster services among them, carries calls to their
+// APIs, and listens for the node's peers with mTLS. On a node that has
+// joined a control plane, it serves the node API to the control plane
+// over a tunnel it dials, and its local socket serves only status and
+// break-glass detach.
 package agent
 
 import (
@@ -64,12 +65,12 @@ type Config struct {
 	// Runc is runc's binary, whose version the agent reports. containerd
 	// finds it on the PATH its unit gives it.
 	Runc string
-	// ServicesFile keeps the cluster services the node runs. Its
-	// directory must exist.
-	ServicesFile string
-	// ServicesDir holds each cluster service's socket directory, and
-	// ServiceLogDir their output.
-	ServicesDir, ServiceLogDir string
+	// ContainersFile keeps the containers the node runs, the cluster
+	// services among them. Its directory must exist.
+	ContainersFile string
+	// ContainersDir holds the socket directory of each container that
+	// serves an API, and ContainerLogDir the containers' output.
+	ContainersDir, ContainerLogDir string
 	// Identity is the node's identity, which it proves to its peers.
 	Identity identity.Files
 	// RemovedIdentitiesFile keeps the identities removed from the
@@ -142,7 +143,7 @@ func Serve(ctx context.Context, cfg Config) error {
 	defer client.Close()
 	gw := gateway.New()
 	defer gw.Close()
-	services, err := loadServices(ctx, client, gw, cfg.ServicesFile, cfg.ServicesDir, cfg.ServiceLogDir)
+	containers, err := loadContainers(ctx, client, gw, cfg)
 	if err != nil {
 		return err
 	}
@@ -169,7 +170,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		Restart:  cfg.RestartUpdater,
 		Healthy:  healthy,
 	}
-	agent := &agentServer{node: node, nodeFile: cfg.NodeFile, containerd: client, shim: filepath.Join(cfg.ContainerdBinDir, hostlayout.ContainerdShim), runc: cfg.Runc, services: services, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile), removed: removed, updater: updater, version: cfg.Version}
+	agent := &agentServer{node: node, nodeFile: cfg.NodeFile, containerd: client, shim: filepath.Join(cfg.ContainerdBinDir, hostlayout.ContainerdShim), runc: cfg.Runc, containers: containers, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile), removed: removed, updater: updater, version: cfg.Version}
 	agent.controlPlane.Store(node.Mode == hostlayout.ModeControlPlane)
 	agent.containerdBinaries = &containerdBinaries{dir: cfg.ContainerdBinDir, files: cfg.ContainerdFiles, restart: cfg.RestartContainerd, wait: agent.waitContainerd}
 	// The builds are hashed from the start, in the background, so that
@@ -190,7 +191,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		nodev1.RegisterAgentServer(tunnel, agent)
 		servers[tunnel] = agent.tunnel
 	}
-	go services.StartAll(ctx)
+	go containers.StartAll(ctx)
 	go recoverUpdater(ctx, updater)
 	return serveAll(ctx, servers)
 }
@@ -248,7 +249,7 @@ type agentServer struct {
 	// shim is containerd's shim, which must be at containerd's version.
 	shim               string
 	runc               string
-	services           *services
+	containers         *containers
 	generationFile     string
 	lock               *operationLock
 	removed            *removedIdentities
@@ -266,8 +267,8 @@ func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nod
 			s.containerdStatus(ctx),
 			s.runcStatus(ctx),
 		},
-		Lock:     s.lockStatus(),
-		Services: s.services.Status(ctx),
+		Lock:       s.lockStatus(),
+		Containers: s.containers.Report(ctx),
 	}
 	if applied, err := s.applied(); err != nil {
 		res.GenerationUnknown = err.Error()
@@ -480,7 +481,7 @@ func (s *agentServer) ImportImage(stream nodev1.Agent_ImportImageServer) error {
 			}
 		}
 	}()
-	images, err := s.services.Import(stream.Context(), r)
+	images, err := s.containers.Import(stream.Context(), r)
 	// An import that stopped early leaves the rest of the stream unread.
 	r.CloseWithError(errors.New("the import ended"))
 	if err != nil {
@@ -489,23 +490,40 @@ func (s *agentServer) ImportImage(stream nodev1.Agent_ImportImageServer) error {
 	return stream.SendAndClose(&nodev1.ImportImageResponse{Images: images})
 }
 
-// serviceRunTimeout bounds running a cluster service, which goes on once
-// its call ends: unpacking its image and starting its container.
-const serviceRunTimeout = 5 * time.Minute
-
-func (s *agentServer) RunService(ctx context.Context, req *nodev1.RunServiceRequest) (*nodev1.RunServiceResponse, error) {
-	if req.Service == nil {
-		return nil, status.Error(codes.InvalidArgument, "no service")
+func (s *agentServer) Run(ctx context.Context, req *nodev1.RunRequest) (*nodev1.RunResponse, error) {
+	if req.Container == nil {
+		return nil, status.Error(codes.InvalidArgument, "no container")
 	}
+	c := containerOf(req.Container)
 	// The run goes on if the call ends, as when mooctl is stopped, since
-	// it may have removed the service's old container already.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serviceRunTimeout)
-	defer cancel()
-	if err := s.services.Run(ctx, req.Service); err != nil {
-		if _, ok := status.FromError(err); ok {
-			return nil, err
-		}
-		return nil, status.Errorf(codes.Internal, "running %s: %v", req.Service.Name, err)
+	// it may have removed the container's old one already.
+	ctx = context.WithoutCancel(ctx)
+	if err := s.containers.Run(ctx, c, s.fence(req.Lease)); err != nil {
+		return nil, asStatus(err, "running "+c.Name)
 	}
-	return &nodev1.RunServiceResponse{}, nil
+	return &nodev1.RunResponse{}, nil
+}
+
+func (s *agentServer) Remove(ctx context.Context, req *nodev1.RemoveRequest) (*nodev1.RemoveResponse, error) {
+	// The removal goes on if the call ends, as a run does.
+	ctx = context.WithoutCancel(ctx)
+	if err := s.containers.Remove(ctx, req.Name, s.fence(req.Lease)); err != nil {
+		return nil, asStatus(err, "removing "+req.Name)
+	}
+	return &nodev1.RemoveResponse{}, nil
+}
+
+// asStatus is err as a call answers it: as it is if it has a code, and
+// as INTERNAL, saying what failed, if it has none.
+func asStatus(err error, what string) error {
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	return status.Errorf(codes.Internal, "%s: %v", what, err)
+}
+
+// fence fails with FAILED_PRECONDITION unless lease holds the operation
+// lock when it is called.
+func (s *agentServer) fence(lease string) func() error {
+	return func() error { return s.lock.holds(lease) }
 }

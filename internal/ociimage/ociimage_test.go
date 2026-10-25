@@ -221,3 +221,24 @@ func TestTheDigestOfAnArchiveIsItsImagesAndNamesItsBuild(t *testing.T) {
 		t.Error("Digest of something that isn't an archive succeeded")
 	}
 }
+
+// An image's config names its user only if the image has one, so that an
+// image without one is as it was before images had users.
+func TestAnImagesConfigNamesItsUserIfItHasOne(t *testing.T) {
+	for user, want := range map[string]string{"": `{"Entrypoint":["/registry"]}`, "1000:1001": `{"Entrypoint":["/registry"],"User":"1000:1001"}`} {
+		img := image
+		img.User = user
+		blobs, index := read(t, write(t, img))
+		var manifest struct {
+			Config descriptor `json:"config"`
+		}
+		unmarshal(t, blob(t, blobs, index.Manifests[0]), &manifest)
+		var config struct {
+			Config json.RawMessage `json:"config"`
+		}
+		unmarshal(t, blob(t, blobs, manifest.Config), &config)
+		if string(config.Config) != want {
+			t.Errorf("an image of the user %q has the config %s, want %s", user, config.Config, want)
+		}
+	}
+}

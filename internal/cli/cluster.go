@@ -381,21 +381,21 @@ func printStatus(env Env, view statusView) error {
 			mode = "mode unknown"
 		}
 		t.node(n.Name, mode)
-		// The cluster services sit under the agent that runs them. A node
-		// whose agent isn't listed has them after its node components, at
-		// their level, so that they read as no other component's.
-		services := n.Services
+		// The containers sit under the agent that runs them. A node whose
+		// agent isn't listed has them after its node components, at their
+		// level, so that they read as no other component's.
+		containers := n.Containers
 		for _, c := range n.Components {
 			t.component(n.Name, 1, c)
 			if c.Name == "agent" {
-				for _, s := range services {
-					t.component(n.Name, 2, s)
+				for _, container := range containers {
+					t.component(n.Name, 2, container)
 				}
-				services = nil
+				containers = nil
 			}
 		}
-		for _, s := range services {
-			t.component(n.Name, 1, s)
+		for _, c := range containers {
+			t.component(n.Name, 1, c)
 		}
 		if n.GenerationProblem != "" {
 			t.problem(n.Name + ": " + nodeclient.Printable(n.GenerationProblem))
@@ -850,20 +850,23 @@ type nodeStatusView struct {
 	// cluster directory's, or why the node can't tell it.
 	GenerationProblem string                `json:"generation_problem,omitempty"`
 	Components        []componentStatusView `json:"components,omitempty"`
-	// Services are the cluster services, as Components are the node
-	// components.
-	Services []componentStatusView `json:"services,omitempty"`
+	// Containers are the containers the node keeps, the cluster services
+	// among them, each by its full name.
+	Containers []componentStatusView `json:"containers,omitempty"`
 }
 
-// componentStatusView is a component or a cluster service in cluster
-// status: one for each that the release pins, in its order, then one for
-// each it doesn't. Running is empty if the node didn't report a version, and
+// componentStatusView is a component or a container in cluster status:
+// one for each that the release pins, in its order, then one for each
+// it doesn't. Running is empty if the node didn't report a version, and
 // Pinned if the release doesn't pin the component. A pinned component
 // the node didn't report is of unknown health.
 type componentStatusView struct {
 	Name    string `json:"name"`
 	Running string `json:"running,omitempty"`
 	Pinned  string `json:"pinned,omitempty"`
+	// Image is the name of the image a container runs, empty for a node
+	// component.
+	Image string `json:"image,omitempty"`
 	// Build is the build that runs, and PinnedBuild the build the
 	// release pins for the node's architecture, each empty if unknown.
 	Build       string `json:"build,omitempty"`
@@ -905,7 +908,7 @@ func statusOf(d *cluster.Dir, rel *release.Release, nodes []cluster.Node, reache
 		}
 		builds := pinnedBuilds(rel, archOf(nodes, r.Name))
 		n.Components = componentsOf(pinnedComponents, builds, r.Status.Components)
-		n.Services = componentsOf(pinnedServices, builds, r.Status.Services)
+		n.Containers = containersOf(pinnedServices, builds, r.Status)
 		view.Nodes = append(view.Nodes, n)
 	}
 	view.Update = "unknown"
@@ -981,7 +984,7 @@ func updateOf(view statusView) string {
 		if !n.Reachable {
 			upToDate = false
 		}
-		for _, c := range append(slices.Clone(n.Components), n.Services...) {
+		for _, c := range append(slices.Clone(n.Components), n.Containers...) {
 			if c.Pinned != "" && (c.Running != c.Pinned || otherBuild(c) || c.Health != nodeclient.HealthName(nodev1.Health_HEALTH_HEALTHY)) {
 				upToDate = false
 			}
@@ -1015,8 +1018,8 @@ func dash(s string) string {
 	return s
 }
 
-// componentsOf are the components or cluster services that a node
-// reported, pinned as pinned.
+// componentsOf are the components that a node reported, pinned as
+// pinned.
 func componentsOf(pinned []release.Pin, builds map[string]string, reported []*nodev1.Component) []componentStatusView {
 	byName := map[string]*nodev1.Component{}
 	for _, c := range reported {
@@ -1037,6 +1040,71 @@ func componentsOf(pinned []release.Pin, builds map[string]string, reported []*no
 		}
 	}
 	return views
+}
+
+// containersOf are the containers that a node whose status is s keeps,
+// with the cluster services pinned as pinned. A container is pinned if
+// the release pins a cluster service of its name: it runs the version of
+// its image, and is as healthy as its API. Another runs its image, or
+// the version of a cluster service's image, and is as healthy as its
+// API, if it has one, or else its process: running, exited with its
+// code, or failed.
+func containersOf(pinned []release.Pin, builds map[string]string, s nodeclient.Status) []componentStatusView {
+	byName := map[string]*nodev1.ContainerStatus{}
+	for _, c := range s.Containers {
+		byName[c.Name] = c
+	}
+	var views []componentStatusView
+	for _, p := range pinned {
+		c, ok := byName[p.Name]
+		if !ok {
+			views = append(views, componentStatusView{Name: p.Name, Pinned: p.Version, PinnedBuild: builds[p.Name], Health: nodeclient.HealthName(nodev1.Health_HEALTH_UNSPECIFIED)})
+			continue
+		}
+		// A container under a service's name that runs another image
+		// runs no version of the service.
+		version, _ := release.ServiceVersion(c.Name, c.Image)
+		v := reportedComponent(&nodev1.Component{Name: c.Name, Version: version, Build: c.Digest, Problem: c.Problem}, p.Version, builds[p.Name])
+		v.Image, v.Health = c.Image, containerHealth(c)
+		views = append(views, v)
+	}
+	for _, c := range s.Containers {
+		if slices.ContainsFunc(pinned, func(p release.Pin) bool { return p.Name == c.Name }) {
+			continue
+		}
+		v := componentStatusView{Name: c.Name, Running: c.Image, Image: c.Image, Build: c.Digest, Health: containerHealth(c), Problem: c.Problem}
+		version, ok := release.ServiceVersion(c.Name, c.Image)
+		if ok {
+			v.Running = version
+		}
+		// A development build of a cluster service runs on, as
+		// reportedComponent says.
+		if ok && release.IsDevVersion(version) {
+			v.Development = true
+			if v.Problem == "" {
+				v.Problem = "it is a development build of a service the pinned release doesn't have, which cluster update leaves running"
+			}
+		}
+		views = append(views, v)
+	}
+	return views
+}
+
+// containerHealth is c's health as status shows it: its API's, if it has
+// one, or else its process's, unknown if the node can't tell.
+func containerHealth(c *nodev1.ContainerStatus) string {
+	if c.Health != nodev1.Health_HEALTH_UNSPECIFIED {
+		return nodeclient.HealthName(c.Health)
+	}
+	switch c.State {
+	case nodev1.TaskState_TASK_STATE_RUNNING:
+		return "running"
+	case nodev1.TaskState_TASK_STATE_EXITED:
+		return fmt.Sprintf("exited %d", c.ExitCode)
+	case nodev1.TaskState_TASK_STATE_FAILED:
+		return "failed"
+	}
+	return nodeclient.HealthName(nodev1.Health_HEALTH_UNSPECIFIED)
 }
 
 // reportedComponent is the reported component c, pinned at pinned.

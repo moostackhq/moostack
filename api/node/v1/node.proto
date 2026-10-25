@@ -45,19 +45,25 @@ service Agent {
   // answers with the names of the images it imported. Importing an image
   // the node has changes nothing.
   rpc ImportImage(stream ImportImageRequest) returns (ImportImageResponse);
-  // RunService runs a cluster service from its image, which the node must
-  // have imported, and routes calls of its API to it from then on, across
-  // restarts of the agent and the node. Running a service that already
-  // runs as asked changes nothing; running a service of a name the node
-  // runs already, at another version, from another image or another
-  // build of its image, or of another API, replaces it, and the API it
-  // served before is routed no more. It
-  // refuses a service whose API a service of another name serves, with
-  // FAILED_PRECONDITION. Once the agent has the call, it goes on running
-  // the service even if the call ends. Once the service runs, the agent
-  // deletes the image of the one it replaced, unless another service
-  // runs from it.
-  rpc RunService(RunServiceRequest) returns (RunServiceResponse);
+  // Run runs a container from its image, which the node must have, and
+  // keeps it running across restarts of the agent, of containerd and of
+  // the node. The container gets no-new-privileges, a cgroup of its
+  // own, and a network namespace of its own with loopback alone. Its
+  // output goes to the node's log as <name>.log. Running a container as
+  // it runs already, from the same build of the same image with the same
+  // properties, changes nothing; otherwise the container of that name is
+  // replaced, and if the new one can't be made, the old one runs on.
+  // Once the agent has the call, it goes on even if the call ends. It is
+  // refused with FAILED_PRECONDITION, changing nothing, unless the
+  // request's lease holds the operation lock, if the node lacks the
+  // image, or if a container of another name serves its API.
+  rpc Run(RunRequest) returns (RunResponse);
+  // Remove stops and deletes the container of the request's name, and
+  // empties its log; removing one the node doesn't keep succeeds. Once
+  // the agent has the call, it goes on even if the call ends. It is
+  // refused with FAILED_PRECONDITION, changing nothing, unless the
+  // request's lease holds the operation lock.
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
   // RemoveIdentities adds node identities, by their fingerprints, to
   // those the node holds as removed from the cluster, and refuses peers
   // that prove one from then on, cutting off their open connections. The
@@ -66,37 +72,31 @@ service Agent {
   // lease holds the operation lock.
   rpc RemoveIdentities(RemoveIdentitiesRequest) returns (RemoveIdentitiesResponse);
   // UpdateUpdater replaces the updater with the binary that the requests
-  // carry, through the updater's A/B slots, as the updater's UpdateAgent
-  // replaces the agent, and with the same answers: the new updater must
-  // serve its status at the update's version, healthy. An agent that
-  // crashes before the new updater is healthy, or whose switch back
-  // failed, switches back when it starts again, and refuses another
-  // update of the updater until it has. Both move a binary that a
-  // release before the A/B slots installed into the first of them.
+  // carry, as the updater's UpdateAgent replaces the agent, and with the
+  // same answers: the new updater must serve its status at the update's
+  // version, healthy, or the old one is put back. An update cut off by a
+  // crash of the agent is rolled back when the agent starts again, and
+  // another update of the updater is refused until it is.
   rpc UpdateUpdater(stream UpdateUpdaterRequest) returns (UpdateUpdaterResponse);
   // UpdateContainerd replaces containerd's binaries with those that the
   // requests carry: the first says which containerd they are, and every
   // request carries the next bytes of one of them, each file's in order.
-  // Once it has them all, the agent puts them in place of the old ones,
-  // which it keeps, restarts containerd, and answers once containerd
-  // serves at the update's version with its shim at the same version. If
-  // it doesn't within the update's health timeout, the agent puts the old
-  // binaries back, restarts containerd and fails the call with ABORTED,
-  // or with INTERNAL if containerd doesn't restart or answer within the
-  // health timeout either. Running containers keep running, through
-  // their shims. It refuses, with INVALID_ARGUMENT, binaries that don't
-  // match their checksums, a file that isn't one of containerd's, and an
-  // update without each of them, and, with FAILED_PRECONDITION, an update
-  // while another runs, changing nothing. Once the agent has the
-  // binaries, the update goes on even if the call ends.
+  // It answers once containerd serves at the update's version with its
+  // shim at the same version. If it doesn't within the update's health
+  // timeout, the old containerd is put back and the call fails with
+  // ABORTED, or with INTERNAL if the old one doesn't serve within the
+  // health timeout either. Running containers keep running. It refuses,
+  // with INVALID_ARGUMENT, binaries that don't match their checksums, a
+  // file that isn't one of containerd's, and an update without each of
+  // them, and, with FAILED_PRECONDITION, an update while another runs,
+  // changing nothing. Once the agent has the binaries, the update goes on
+  // even if the call ends.
   rpc UpdateContainerd(stream UpdateContainerdRequest) returns (UpdateContainerdResponse);
   // Detach is the break-glass detach: it returns a node in control plane
   // mode to direct mode, for good, once the control plane is lost. The
-  // agent logs it at warning level, records direct mode in the node
-  // file, closes its tunnel to the control plane and lifts the local
-  // socket's lockout. The updater, which reads the node file every
-  // second, then does the same, and reports direct mode in its status.
-  // It is refused over the control plane's tunnel with
+  // agent leaves the control plane and lifts the local socket's lockout,
+  // and the updater follows within seconds, reporting direct mode in its
+  // status. It is refused over the control plane's tunnel with
   // PERMISSION_DENIED, since only root on the node may detach it, and on
   // a node in direct mode with FAILED_PRECONDITION.
   rpc Detach(DetachRequest) returns (DetachResponse);
@@ -111,23 +111,20 @@ service Updater {
   rpc Status(UpdaterStatusRequest) returns (UpdaterStatusResponse);
   // UpdateAgent replaces the agent with the binary that the requests
   // carry: the first says which agent it is, and every request carries
-  // the binary's next bytes, in order. The updater writes it into the
-  // agent's inactive A/B slot, switches to that A/B slot and restarts the
-  // agent, and answers once the new agent serves its status at the
-  // update's version with every component it reports healthy. If it
-  // doesn't within the update's health timeout, the updater switches
-  // back, restarts the agent it replaced, and fails the call with
-  // ABORTED, or with INTERNAL if the agent it replaced doesn't restart or
-  // become healthy within the health timeout either. The call fails with
-  // INTERNAL too if the new agent becomes healthy but the updater can't
-  // remove the swap's record, since it then switches back when it next
-  // starts. It refuses a binary that doesn't match the update's checksum
-  // with INVALID_ARGUMENT, and, with FAILED_PRECONDITION, an update while
-  // another runs or while a swap that didn't finish is recorded, changing
-  // nothing. Once it has the whole binary, the update goes on even if the
-  // call ends, and an updater told to stop finishes it first. One that
-  // crashes before the new agent is healthy, or whose switch back failed,
-  // switches back when it starts again.
+  // the binary's next bytes, in order. It answers once the new agent
+  // serves its status at the update's version with every component it
+  // reports healthy. If it doesn't within the update's health timeout,
+  // the old agent is put back and the call fails with ABORTED, or with
+  // INTERNAL if the old one doesn't become healthy within the health
+  // timeout either, or if the update can't be recorded as finished, in
+  // which case it is rolled back when the updater next starts. It
+  // refuses a binary that doesn't match the update's checksum with
+  // INVALID_ARGUMENT, and, with FAILED_PRECONDITION, an update while
+  // another runs or while one cut off is still to be rolled back,
+  // changing nothing. Once it has the whole binary, the update goes on
+  // even if the call ends, and an updater told to stop finishes it
+  // first. An update cut off by a crash of the updater is rolled back
+  // when it starts again.
   rpc UpdateAgent(stream UpdateAgentRequest) returns (UpdateAgentResponse);
 }
 
@@ -150,10 +147,42 @@ message StatusResponse {
   string generation_unknown = 5;
   // Lock is the operation lock, unset if no lease holds it.
   Lock lock = 6;
-  // Services are the cluster services the node runs, each at the version
-  // it was run at, and healthy if it answers its health call without a
-  // problem.
-  repeated Component services = 7;
+  // Containers are the containers the node keeps, the cluster services
+  // among them, each as it runs.
+  repeated ContainerStatus containers = 7;
+}
+
+// ContainerStatus is a container as the node runs it.
+message ContainerStatus {
+  string name = 1;
+  // Image is the name of the image the container was made from, and
+  // digest the digest of that image's build, each empty if the node
+  // can't tell, as when it can't read the container or has none.
+  string image = 2;
+  string digest = 3;
+  TaskState state = 4;
+  // ExitCode is the code the container exited with, in TASK_STATE_EXITED.
+  uint32 exit_code = 5;
+  // Health is unspecified for a container without an API, and otherwise
+  // says whether its API answers its health call without a problem.
+  Health health = 6;
+  // Problem says why the container's last start failed, if it did, as
+  // when the one that was to replace it couldn't be made; or else why it
+  // failed, in TASK_STATE_FAILED, or why its API is unhealthy.
+  string problem = 7;
+}
+
+// TaskState is whether a container's process runs.
+enum TaskState {
+  // TASK_STATE_UNSPECIFIED is a container whose state the node can't
+  // tell.
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_RUNNING = 1;
+  // TASK_STATE_EXITED is a process that ran and exited.
+  TASK_STATE_EXITED = 2;
+  // TASK_STATE_FAILED is a container whose process doesn't run for
+  // another reason, such as one that failed to start.
+  TASK_STATE_FAILED = 3;
 }
 
 // RecordGenerationRequest is a generation of the cluster directory that
@@ -231,23 +260,52 @@ message ImportImageResponse {
   repeated string images = 1;
 }
 
-// Service is a cluster service as a node runs it.
-message Service {
-  // Name is the service's, such as registry.
+// Container is a container as Run runs it: its name, its image and its
+// properties.
+message Container {
+  // Name is the container's, of lowercase letters, digits and hyphens,
+  // starting with a letter, at most 63. It names the container's log.
   string name = 1;
-  string version = 2;
-  // Api is the gRPC service name of the service's API, which the agent
-  // routes calls to the service by.
-  string api = 3;
-  // Image is the name of the service's image in the node's containerd.
-  string image = 4;
+  // Image is the name of an image the node has.
+  string image = 2;
+  // User is the uid to run as, with a gid after a colon, each a number
+  // of at most 2147483647, never a name. The image's user if unset.
+  optional string user = 3;
+  bool read_only_root = 4;
+  // Capabilities are the capabilities to run with, a default set if
+  // unset, and none if set and empty.
+  Capabilities capabilities = 5;
+  // Api is the gRPC service name of an API the container serves on the
+  // socket that api/service/v1 names, which the agent routes calls of
+  // the API to and asks for its health. Unset, it serves none.
+  //
+  // Temporary: the routed API is taken in Run beside the properties,
+  // which say how a container runs, until it gets a design of its own.
+  string api = 6;
 }
 
-message RunServiceRequest {
-  Service service = 1;
+// Capabilities are Linux capabilities, as the kernel names them, such as
+// CAP_NET_BIND_SERVICE.
+message Capabilities {
+  repeated string names = 1;
 }
 
-message RunServiceResponse {}
+message RunRequest {
+  Container container = 1;
+  // Lease is the operation's lease, which must hold the operation lock.
+  string lease = 2;
+}
+
+message RunResponse {}
+
+message RemoveRequest {
+  // Name is the container's.
+  string name = 1;
+  // Lease is the operation's lease, which must hold the operation lock.
+  string lease = 2;
+}
+
+message RemoveResponse {}
 
 message RemoveIdentitiesRequest {
   // Identities are the fingerprints of the removed identities: each the

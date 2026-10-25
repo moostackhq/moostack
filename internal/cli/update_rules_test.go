@@ -198,9 +198,10 @@ func TestClusterUpdateRefusesAPinThatSkipsAReleaseForAnyComponent(t *testing.T) 
 func unknownService(n *fakeNode, name string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	for _, c := range n.status.Services {
+	for _, c := range n.status.Containers {
 		if c.Name == name {
-			c.Version, c.Health, c.Problem = "", nodev1.Health_HEALTH_UNHEALTHY, "reading its container: connection refused"
+			c.Image, c.Digest, c.State = "", "", nodev1.TaskState_TASK_STATE_UNSPECIFIED
+			c.Health, c.Problem = nodev1.Health_HEALTH_UNHEALTHY, "reading its container: connection refused"
 		}
 	}
 }
@@ -646,5 +647,23 @@ func TestAnotherBuildOfThePinnedReleaseIsReplacedAndStatusSaysSo(t *testing.T) {
 	wantContains(t, "cluster update's output", r.stdout, "Updating the agent on node3 to 1.1.0\n", "node1 runs the agent at 1.1.0 already\n", "node2 runs the agent at 1.1.0 already\n")
 	if u := o.nodes["node3"].agentUpdates(); len(u) != 1 {
 		t.Errorf("node3's agent was updated to %v, want once, to 1.1.0's build", u)
+	}
+}
+
+// A node may run another build of a pinned cluster service, as of a
+// release built again: status says so, and cluster update replaces it.
+func TestAnotherBuildOfAPinnedServiceIsReplacedAndStatusSaysSo(t *testing.T) {
+	o := newOperator(t, "op")
+	source := updateCluster(t, o)
+	updatedTo110(o)
+	n := o.nodes["node3"]
+	n.mu.Lock()
+	n.setService(&nodev1.Component{Name: "dns", Version: "1.1.0", Build: "sha256:another", Health: nodev1.Health_HEALTH_HEALTHY})
+	n.mu.Unlock()
+	r := o.mustRun("--release-source", source, "cluster", "status")
+	wantContains(t, "cluster status", r.stdout, "Update: stopped partway", "node3: dns: it runs another build of 1.1.0 than the release pins")
+	o.mustRun("--release-source", source, "cluster", "update")
+	if got := updatedTo(n); !slices.Contains(got, "service dns 1.1.0") {
+		t.Errorf("node3 was updated to %q, want dns run again at 1.1.0's build", got)
 	}
 }

@@ -150,3 +150,54 @@ func TestCheckClusterServicesRefusesAReleaseWithoutOneOfTheFour(t *testing.T) {
 		t.Errorf("a release whose dns serves another API: %v", err)
 	}
 }
+
+// ServiceVersion reads back the version of each image ImageRef names for
+// the service, and no version of another image: another service's, one
+// without a version, or one of another repository, its name the version
+// it would have.
+func TestServiceVersionReadsTheVersionOfTheServicesImageAlone(t *testing.T) {
+	for _, version := range []string{"1.0.0", "20261024T153000Z", "0123456789ab-dirty"} {
+		if got, ok := release.ServiceVersion("dns", release.ImageRef("dns", version)); !ok || got != version {
+			t.Errorf("ServiceVersion of dns's image at %s is %q, %v", version, got, ok)
+		}
+	}
+	for _, image := range []string{release.ImageRef("proxy", "1.0.0"), release.ImageRef("dns", ""), "1.0.0", "docker.io/library/dns:1.0.0", release.ImageRef("dnsx", "1.0.0"), ""} {
+		if got, ok := release.ServiceVersion("dns", image); ok || got != "" {
+			t.Errorf("ServiceVersion of dns from %q is %q, %v, want none", image, got, ok)
+		}
+	}
+}
+
+// Whatever the service's name and version, ServiceVersion reads back the
+// version of the image ImageRef names, and nothing of another service's.
+func FuzzServiceVersionReadsBackImageRef(f *testing.F) {
+	f.Add("dns", "1.0.0", "proxy")
+	f.Add("dns", "", "dns")
+	f.Fuzz(func(t *testing.T, name, version, other string) {
+		got, ok := release.ServiceVersion(name, release.ImageRef(name, version))
+		if ok != (version != "") || got != version {
+			t.Errorf("ServiceVersion(%q, ImageRef(%q, %q)) = %q, %v", name, name, version, got, ok)
+		}
+		if other != name && !strings.HasPrefix(release.ImageRef(other, version), release.ImageRef(name, "")) {
+			if got, ok := release.ServiceVersion(name, release.ImageRef(other, version)); ok || got != "" {
+				t.Errorf("ServiceVersion(%q, ImageRef(%q, %q)) = %q, %v, want none", name, other, version, got, ok)
+			}
+		}
+	})
+}
+
+// A container may be a cluster service if it runs its service's image,
+// or if the node can't tell its image; never with another image.
+func TestMayBeServiceTakesTheServicesImageOrNoneKnown(t *testing.T) {
+	for image, want := range map[string]bool{
+		release.ImageRef("dns", "1.0.0"):   true,
+		"":                                 true,
+		release.ImageRef("proxy", "1.0.0"): false,
+		release.ImageRef("dns", ""):        false,
+		"docker.io/library/nginx:1.27":     false,
+	} {
+		if got := release.MayBeService("dns", image); got != want {
+			t.Errorf("MayBeService(dns, %q) = %v, want %v", image, got, want)
+		}
+	}
+}

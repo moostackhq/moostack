@@ -41,7 +41,7 @@ func eventuallyHealthy(t *testing.T, agent nodev1.AgentClient) *nodev1.StatusRes
 		if res, err = agent.Status(ctx, &nodev1.StatusRequest{}); err != nil {
 			return err
 		}
-		for _, c := range append(slices.Clone(res.Components), res.Services...) {
+		for _, c := range append(slices.Clone(res.Components), nodetest.Services(res)...) {
 			if c.Health != nodev1.Health_HEALTH_HEALTHY {
 				return status.Errorf(codes.Unavailable, "%s is %s: %s", c.Name, c.Health, c.Problem)
 			}
@@ -55,7 +55,7 @@ func eventuallyHealthy(t *testing.T, agent nodev1.AgentClient) *nodev1.StatusRes
 // cluster services included.
 func components(res *nodev1.StatusResponse) []string {
 	var got []string
-	for _, c := range append(slices.Clone(res.Components), res.Services...) {
+	for _, c := range append(slices.Clone(res.Components), nodetest.Services(res)...) {
 		got = append(got, c.Name+" "+c.Version+" "+c.Health.String())
 	}
 	slices.Sort(got)
@@ -118,7 +118,7 @@ func TestAJoinedNodeServesTheNodeAPIOverItsTunnels(t *testing.T) {
 	if !slices.Contains(images, nodetest.Service("dns").Image) {
 		t.Fatalf("importing dns's image over the tunnel imported %v", images)
 	}
-	if _, err := agent.RunService(ctx, &nodev1.RunServiceRequest{Service: nodetest.Service("dns")}); err != nil {
+	if _, err := runOver(ctx, agent, nodetest.Service("dns")); err != nil {
 		t.Fatalf("running dns over the tunnel: %v", err)
 	}
 	eventuallyHealthy(t, agent)
@@ -176,7 +176,7 @@ func TestAJoinedNodesLocalSocketsAnswerStatusAlone(t *testing.T) {
 	if _, err := nodeclient.ImportImage(ctx, agent, nodetest.ImageArchive(t, "dns")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := agent.RunService(ctx, &nodev1.RunServiceRequest{Service: nodetest.Service("dns")}); err != nil {
+	if _, err := runOver(ctx, agent, nodetest.Service("dns")); err != nil {
 		t.Fatal(err)
 	}
 	eventuallyHealthy(t, agent)
@@ -538,4 +538,60 @@ func TestADetachDuringAnUpdateOfTheAgentEndsInDirectMode(t *testing.T) {
 		t.Errorf("agent detach during an update of the agent: %v after %s\n%s", r.err, r.took, r.out)
 	}
 	checkDirect(t, n, peer, last, "detached during an update")
+}
+
+// The control plane runs and removes containers over its tunnel, under
+// the operation lock, as mooctl does on the local socket.
+func TestTheControlPlaneRunsAndRemovesContainersOverTheTunnel(t *testing.T) {
+	peer := nodetest.NewTunnelPeer(t)
+	nodetest.StartJoined(t, peer)
+	agent := peer.Agent(t)
+	eventuallyHealthy(t, agent)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	if _, err := agent.AcquireLock(ctx, &nodev1.AcquireLockRequest{Lock: &nodev1.Lock{Lease: "cp", Holder: "control plane"}, Ttl: durationpb.New(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nodeclient.ImportImage(ctx, agent, nodetest.ImageArchive(t, "dns")); err != nil {
+		t.Fatal(err)
+	}
+	dns := nodetest.Service("dns")
+	nobody := "65534:65534"
+	c := &nodev1.Container{Name: "service-dns", Image: dns.Image, User: &nobody, ReadOnlyRoot: true, Capabilities: &nodev1.Capabilities{}, Api: dns.Api}
+	if _, err := agent.Run(ctx, &nodev1.RunRequest{Container: c, Lease: "other"}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("running a container over the tunnel without the lock: %v, want failed precondition", err)
+	}
+	if _, err := agent.Run(ctx, &nodev1.RunRequest{Container: c, Lease: "cp"}); err != nil {
+		t.Fatalf("running a container over the tunnel: %v", err)
+	}
+	conn := peer.Tunnel(t, controlplanev1.ProtocolAgent, time.Minute).Conn
+	nodetest.Eventually(t, 30*time.Second, func() error {
+		_, err := call(ctx, conn, dns.Api, "Echo", nil)
+		return err
+	})
+	if _, err := agent.Remove(ctx, &nodev1.RemoveRequest{Name: "service-dns", Lease: "other"}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("removing a container over the tunnel without the lock: %v, want failed precondition", err)
+	}
+	if _, err := agent.Remove(ctx, &nodev1.RemoveRequest{Name: "service-dns", Lease: "cp"}); err != nil {
+		t.Fatalf("removing a container over the tunnel: %v", err)
+	}
+	res, err := agent.Status(ctx, &nodev1.StatusRequest{})
+	if err != nil || len(res.Containers) != 0 {
+		t.Errorf("status over the tunnel after the removal: %v, %v, want no containers", res.GetContainers(), err)
+	}
+}
+
+// runOver has the agent run c over the tunnel agent, holding the
+// operation lock for a lease of the control plane's while it does, as the
+// control plane does.
+func runOver(ctx context.Context, agent nodev1.AgentClient, c *nodev1.Container) (*nodev1.RunResponse, error) {
+	if _, err := agent.AcquireLock(ctx, &nodev1.AcquireLockRequest{Lock: &nodev1.Lock{Lease: "cp", Holder: "control plane"}, Ttl: durationpb.New(time.Minute)}); err != nil {
+		return nil, err
+	}
+	res, err := agent.Run(ctx, &nodev1.RunRequest{Container: c, Lease: "cp"})
+	if err != nil {
+		return nil, err
+	}
+	_, err = agent.ReleaseLock(ctx, &nodev1.ReleaseLockRequest{Lease: "cp"})
+	return res, err
 }

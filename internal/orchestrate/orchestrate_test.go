@@ -14,6 +14,7 @@ import (
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/orchestrate"
+	"github.com/moostackhq/moostack/internal/release"
 )
 
 // node is a fake node in direct mode.
@@ -67,8 +68,10 @@ type node struct {
 	// components are the node components the node reports, and services
 	// the cluster services. An update of a service runs it at its version,
 	// healthy unless it is sickService.
-	components  []*nodev1.Component
-	services    []*nodev1.Component
+	components []*nodev1.Component
+	services   []*nodev1.Component
+	// ran are the containers that Run ran, in order.
+	ran         []*nodev1.Container
 	sickService string
 
 	mu sync.Mutex
@@ -145,7 +148,7 @@ func (n *node) Status(ctx context.Context) nodeclient.Status {
 		generation = n.laterGeneration
 	}
 	n.mu.Unlock()
-	return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock(), Components: n.components, Services: n.reportedServices()}
+	return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock(), Components: n.components, Containers: asContainers(n.reportedServices())}
 }
 
 func (n *node) RecordGeneration(ctx context.Context, g int64, nodes []string, lease string) error {
@@ -317,22 +320,49 @@ func (n *node) ImportImage(ctx context.Context, archive []byte) ([]string, error
 	return []string{image}, nil
 }
 
-// RunService records an update of the service, as update records one of
-// a component, as "service <name>", with its image as the binary.
-func (n *node) RunService(ctx context.Context, svc *nodev1.Service) error {
-	err := n.update(ctx, "service "+svc.Name, svc.Version, svc.Image, 0)
+// Run records an update of the service that c runs, as update records
+// one of a component, as "service <name>", with its image as the binary,
+// and keeps c. It refuses c unless lease holds the node's operation lock.
+func (n *node) Run(ctx context.Context, c *nodev1.Container, lease string) error {
+	n.mu.Lock()
+	l := n.held()
+	n.mu.Unlock()
+	if l == nil || l.Lease != lease {
+		return errors.New("the operation's lease doesn't hold the node's operation lock")
+	}
+	version, _ := release.ServiceVersion(c.Name, c.Image)
+	err := n.update(ctx, "service "+c.Name, version, c.Image, 0)
 	if err != nil {
 		return err
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	health := nodev1.Health_HEALTH_HEALTHY
-	if svc.Name == n.sickService {
+	if c.Name == n.sickService {
 		health = nodev1.Health_HEALTH_UNHEALTHY
 	}
-	n.services = slices.DeleteFunc(n.services, func(c *nodev1.Component) bool { return c.Name == svc.Name })
-	n.services = append(n.services, &nodev1.Component{Name: svc.Name, Version: svc.Version, Health: health})
+	n.ran = append(n.ran, c)
+	n.services = slices.DeleteFunc(n.services, func(s *nodev1.Component) bool { return s.Name == c.Name })
+	n.services = append(n.services, &nodev1.Component{Name: c.Name, Version: version, Health: health})
 	return nil
+}
+
+// containersRun are the containers the node ran, in order.
+func (n *node) containersRun() []*nodev1.Container {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.ran)
+}
+
+// asContainers are services as a node reports them: each a container
+// that runs the release's image of the service at its version.
+func asContainers(services []*nodev1.Component) []*nodev1.ContainerStatus {
+	var containers []*nodev1.ContainerStatus
+	for _, s := range services {
+		containers = append(containers, &nodev1.ContainerStatus{Name: s.Name, Image: release.ImageRef(s.Name, s.Version), Digest: s.Build,
+			State: nodev1.TaskState_TASK_STATE_RUNNING, Health: s.Health, Problem: s.Problem})
+	}
+	return containers
 }
 
 // reportedServices are the services the node reports.

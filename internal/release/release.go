@@ -75,6 +75,26 @@ func ImageRef(name, version string) string {
 	return "moostack.local/" + name + ":" + version
 }
 
+// MayBeService reports whether the container called name, running
+// image, may be one of the cluster services: one that runs the
+// release's image of the service of its name, or one whose image the
+// node can't tell, as one it can't read.
+func MayBeService(name, image string) bool {
+	_, ok := ServiceVersion(name, image)
+	return ok || image == ""
+}
+
+// ServiceVersion is the version of the cluster service called name whose
+// image is image, as ImageRef names it, and whether image is one: if it
+// isn't, the version is empty.
+func ServiceVersion(name, image string) (string, bool) {
+	version, ok := strings.CutPrefix(image, ImageRef(name, ""))
+	if !ok || version == "" {
+		return "", false
+	}
+	return version, true
+}
+
 // Service returns the service called name.
 func (m Manifest) Service(name string) (Service, bool) {
 	i := slices.IndexFunc(m.Services, func(s Service) bool { return s.Name == name })

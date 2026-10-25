@@ -300,7 +300,7 @@ func addNode(ctx context.Context, env Env, cl *orchestrate.Cluster, d *cluster.D
 	}
 	fmt.Fprintf(env.Stdout, "Installing release %s on %s, as node %s (%s)\n", rel.Version, h.target, name, n.Architecture)
 	var err error
-	n.Identity, err = bootstrap.Install(ctx, h.c, h.host, rel, hostlayout.NodeConfig{Cluster: d.Cluster.Name, Node: name, Mode: hostlayout.ModeDirect, PrivateAddress: n.PrivateAddress}, ca, removed)
+	n.Identity, err = bootstrap.Install(ctx, h.c, h.host, rel, hostlayout.NodeConfig{Cluster: d.Cluster.Name, Node: name, Mode: hostlayout.ModeDirect, PrivateAddress: n.PrivateAddress}, ca, removed, cl.Lock)
 	if err != nil {
 		return stopped(ctx, adding, err)
 	}
@@ -841,7 +841,7 @@ func (n unreachedNode) UpdateContainerd(context.Context, string, map[string][]by
 
 func (n unreachedNode) ImportImage(context.Context, []byte) ([]string, error) { return nil, n.err }
 
-func (n unreachedNode) RunService(context.Context, *nodev1.Service) error { return n.err }
+func (n unreachedNode) Run(context.Context, *nodev1.Container, string) error { return n.err }
 
 func (n unreachedNode) Close() error { return nil }
 

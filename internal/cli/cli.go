@@ -495,7 +495,7 @@ func releasesOf(s nodeclient.Status) []ofRelease {
 			rs = append(rs, ofRelease{what: "its updater", release: c.Version})
 		}
 	}
-	for _, c := range s.Services {
+	for _, c := range s.Services() {
 		rs = append(rs, ofRelease{what: "its " + c.Name + " service", service: c.Name, release: c.Version})
 	}
 	return rs

@@ -81,10 +81,29 @@ func loadLock(file string) *operationLock {
 func (l *operationLock) fenced(lease string, f func() error) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if err := l.heldBy(lease); err != nil {
+		return err
+	}
+	return f()
+}
+
+// holds fails as fenced does unless lease holds the lock now. Unlike
+// fenced, it lets go of the lock's mutex once it returns, so that a
+// change that may take minutes, as running a container, checks the
+// lease as it starts without holding up every other call of the lock.
+func (l *operationLock) holds(lease string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.heldBy(lease)
+}
+
+// heldBy fails with FAILED_PRECONDITION unless lease holds the lock. l.mu
+// must be held.
+func (l *operationLock) heldBy(lease string) error {
 	if h := l.current(); h == nil || lease == "" || h.Lease != lease {
 		return status.Error(codes.FailedPrecondition, "the operation's lease doesn't hold the node's operation lock")
 	}
-	return f()
+	return nil
 }
 
 // current is the lease that holds the lock now, nil if none. l.mu must

@@ -24,6 +24,7 @@ import (
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/hostlayout"
+	"github.com/moostackhq/moostack/internal/release"
 	"github.com/moostackhq/moostack/internal/rootsocket"
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
@@ -149,9 +150,9 @@ type Status struct {
 	// or the updater that didn't answer is unhealthy, with why as its
 	// problem, and the components only the agent reports are missing.
 	Components []*nodev1.Component
-	// Services are the cluster services the node runs, none if the agent
-	// didn't answer.
-	Services []*nodev1.Component
+	// Containers are the containers the node keeps, the cluster services
+	// among them, none if the agent didn't answer.
+	Containers []*nodev1.ContainerStatus
 }
 
 // Status asks the agent and the updater for their status, both at once,
@@ -178,7 +179,7 @@ func (n *Node) Status(ctx context.Context) Status {
 		s.Generation, s.Nodes, s.GenerationUnknown = agent.Generation, agent.Nodes, agent.GenerationUnknown
 		s.Lock = lockOf(agent.Lock)
 		s.Components = append(s.Components, agent.Components...)
-		s.Services = agent.Services
+		s.Containers = agent.Containers
 	}
 	if updaterErr != nil {
 		s.UpdaterErr = updaterErr
@@ -191,10 +192,37 @@ func (n *Node) Status(ctx context.Context) Status {
 	for i, name := range s.Nodes {
 		s.Nodes[i] = Printable(name)
 	}
-	for _, c := range append(slices.Clone(s.Components), s.Services...) {
+	for _, c := range s.Components {
 		c.Name, c.Version, c.Build, c.Problem = Printable(c.Name), Printable(c.Version), Printable(c.Build), Printable(c.Problem)
 	}
+	for _, c := range s.Containers {
+		c.Name, c.Image, c.Digest, c.Problem = Printable(c.Name), Printable(c.Image), Printable(c.Digest), Printable(c.Problem)
+	}
 	return s
+}
+
+// ServiceContainer is the container that the cluster service called
+// name runs as, from image, serving api: as nobody, with a read-only
+// root and no capabilities.
+func ServiceContainer(name, api, image string) *nodev1.Container {
+	user := strconv.Itoa(hostlayout.ServiceUser) + ":" + strconv.Itoa(hostlayout.ServiceUser)
+	return &nodev1.Container{Name: name, Image: image, User: &user, ReadOnlyRoot: true, Capabilities: &nodev1.Capabilities{}, Api: api}
+}
+
+// Services are the cluster services among the node's containers, as
+// release.MayBeService tells them, each as a component at the version of
+// its image, as healthy as its API: one whose image the node can't tell
+// at a version unknown.
+func (s Status) Services() []*nodev1.Component {
+	var services []*nodev1.Component
+	for _, c := range s.Containers {
+		if release.MayBeService(c.Name, c.Image) {
+			// One whose image the node can't tell has no version.
+			version, _ := release.ServiceVersion(c.Name, c.Image)
+			services = append(services, &nodev1.Component{Name: c.Name, Version: version, Build: c.Digest, Health: c.Health, Problem: c.Problem})
+		}
+	}
+	return services
 }
 
 // Printable is s, a text that a node reported, quoted if it holds a rune
@@ -360,10 +388,10 @@ func (n *Node) ImportImage(ctx context.Context, archive []byte) ([]string, error
 	return ImportImage(ctx, n.Agent, archive)
 }
 
-// RunService has the agent run the cluster service svc from its image,
-// replacing the one of its name that runs.
-func (n *Node) RunService(ctx context.Context, svc *nodev1.Service) error {
-	_, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: svc})
+// Run has the agent run c from its image, replacing the container of its
+// name, for the operation whose lease holds the node's operation lock.
+func (n *Node) Run(ctx context.Context, c *nodev1.Container, lease string) error {
+	_, err := n.Agent.Run(ctx, &nodev1.RunRequest{Container: c, Lease: lease})
 	return err
 }
 

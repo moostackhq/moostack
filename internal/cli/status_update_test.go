@@ -28,7 +28,7 @@ func TestClusterStatusSaysWhetherAnUpdateIsNeededInProgressOrStoppedPartway(t *t
 			updatedTo110(o)
 			n := o.nodes["node3"]
 			n.mu.Lock()
-			n.status.Services[1] = &nodev1.Component{Name: "proxy", Version: "1.1.0", Health: nodev1.Health_HEALTH_UNHEALTHY}
+			n.setService(&nodev1.Component{Name: "proxy", Version: "1.1.0", Health: nodev1.Health_HEALTH_UNHEALTHY})
 			n.mu.Unlock()
 		}, "Update: stopped partway; run mooctl cluster update again to finish it\n", "stopped_partway"},
 		{"up to date but for a node status can't reach", func(o *operator) {

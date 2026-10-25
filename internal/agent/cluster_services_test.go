@@ -26,6 +26,7 @@ import (
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	servicev1 "github.com/moostackhq/moostack/api/service/v1"
 	"github.com/moostackhq/moostack/internal/hostlayout"
+	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/nodetest"
 	"github.com/moostackhq/moostack/internal/release"
 )
@@ -39,7 +40,7 @@ func TestTheClusterServicesRunAndReportHealthy(t *testing.T) {
 	n.EventuallyHealthy(t)
 	status := n.StartServices(t)
 	got := map[string]string{}
-	for _, s := range status.Services {
+	for _, s := range nodetest.Services(status) {
 		got[s.Name] = s.Version + " " + s.Health.String()
 	}
 	want := map[string]string{}
@@ -113,7 +114,7 @@ func TestAStoppedServiceAnswersUnavailableAtOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range s.Services {
+	for _, c := range nodetest.Services(s) {
 		switch {
 		case c.Name == "dns" && (c.Health != nodev1.Health_HEALTH_UNHEALTHY || c.Problem == ""):
 			t.Errorf("the stopped dns is %s with problem %q", c.Health, c.Problem)
@@ -160,8 +161,8 @@ func TestTheAgentStartsTheServicesThatArentRunningWhenItStarts(t *testing.T) {
 	}
 	n.Restart(t, "agent")
 	status := n.EventuallyHealthy(t)
-	if len(status.Services) != len(release.ClusterServices) {
-		t.Errorf("the agent reports %d services after it started again", len(status.Services))
+	if len(nodetest.Services(status)) != len(release.ClusterServices) {
+		t.Errorf("the agent reports %d services after it started again", len(nodetest.Services(status)))
 	}
 	for _, s := range release.ClusterServices {
 		if res, err := call(t.Context(), n.AgentConn(t), s.API, "Echo", nil); err != nil || res.Calls != 1 {
@@ -185,11 +186,11 @@ func TestTheAgentStartsAServiceWhoseImageIsGoneFromItsContainer(t *testing.T) {
 	nodetest.Eventually(t, 30*time.Second, func() error {
 		if _, err := call(t.Context(), n.AgentConn(t), api, "Echo", nil); err != nil {
 			s, _ := n.Status(t)
-			return fmt.Errorf("dns doesn't answer: %v; status: %v", err, s.GetServices())
+			return fmt.Errorf("dns doesn't answer: %v; status: %v", err, s.GetContainers())
 		}
 		return nil
 	})
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Service("dns")}); status.Code(err) != codes.FailedPrecondition {
+	if _, err := runService(t.Context(), t, n, nodetest.Service("dns")); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("running dns again: %v, want it refused, its image gone", err)
 	}
 }
@@ -210,12 +211,12 @@ func TestTheAgentKeepsAServiceAsStoredWhenItStartsAnsweringOrNot(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for _, c := range s.Services {
+		for _, c := range nodetest.Services(s) {
 			if c.Name == "dns" && c.Health == nodev1.Health_HEALTH_UNHEALTHY {
 				return nil
 			}
 		}
-		return fmt.Errorf("dns isn't unhealthy yet: %v", s.Services)
+		return fmt.Errorf("dns isn't unhealthy yet: %v", nodetest.Services(s))
 	})
 	// The agent has started every service once by the time it answers,
 	// and tries again for one that fails every 2 s.
@@ -237,7 +238,7 @@ func TestAStartRetryDoesntUndoARunInBetween(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range status.Services {
+	for _, c := range nodetest.Services(status) {
 		if c.Name == "proxy" && (c.Health != nodev1.Health_HEALTH_HEALTHY || c.Version != nodetest.Version) {
 			t.Errorf("proxy is %s at %s after it was run again: %s", c.Health, c.Version, c.Problem)
 		}
@@ -281,7 +282,7 @@ func TestAServiceThatCantBeReplacedUnderAnotherAPIServesTheOldOneOn(t *testing.T
 const otherAPI = "moostack.other.v1.Other"
 
 // toOther moves a service to otherAPI.
-func toOther(s *nodev1.Service) { s.Api = otherAPI }
+func toOther(s *nodev1.Container) { s.Api = otherAPI }
 
 func TestAServiceThatStartsLaterUnderAnotherAPIIsRoutedForItAlone(t *testing.T) {
 	n := nodetest.Start(t)
@@ -289,9 +290,9 @@ func TestAServiceThatStartsLaterUnderAnotherAPIIsRoutedForItAlone(t *testing.T) 
 	n.StartServices(t)
 	restartWantingAServiceItCantStart(t, n, "dns", toOther)
 	wanted := nodetest.Service("dns")
-	wanted.Version, wanted.Image = "9.9.9", release.ImageRef("dns", "9.9.9")
+	wanted.Image = release.ImageRef("dns", "9.9.9")
 	toOther(wanted)
-	n.ImportFixtureAs(t, wanted)
+	n.Import(t, nodetest.ImageOf(wanted))
 	// The agent tries again within a few seconds.
 	nodetest.Eventually(t, 30*time.Second, func() error {
 		if _, err := call(t.Context(), n.AgentConn(t), otherAPI, "Echo", nil); err != nil {
@@ -348,10 +349,10 @@ func TestAnAPIHeldAtAgentStartIsRoutedNoMoreOnceItsServiceMovesToAnother(t *test
 		return nil
 	})
 	moved := nodetest.Service("dns")
-	moved.Version, moved.Image = "moved", release.ImageRef("dns", "moved")
+	moved.Image = release.ImageRef("dns", "moved")
 	toOther(moved)
-	n.ImportFixtureAs(t, moved)
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: moved}); err != nil {
+	n.Import(t, nodetest.ImageOf(moved))
+	if _, err := runService(t.Context(), t, n, moved); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := call(t.Context(), n.AgentConn(t), nodetest.Service("dns").Api, "Echo", nil); !noRoute(err) {
@@ -368,7 +369,7 @@ func TestRunningAServiceOfAnAPIThatAnotherStillServesIsRefused(t *testing.T) {
 	n.ImportFixtures(t)
 	clash := nodetest.Fixture()
 	clash.Name = "clash"
-	_, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: clash})
+	_, err := runService(t.Context(), t, n, clash)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("running a service of the API the old dns still serves: %v, want a failed precondition", err)
 	}
@@ -388,14 +389,14 @@ func TestRunningAnUnhealthyServiceAgainReplacesIt(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for _, c := range s.Services {
+		for _, c := range nodetest.Services(s) {
 			if c.Name == "dns" && c.Health == nodev1.Health_HEALTH_UNHEALTHY {
 				return nil
 			}
 		}
-		return fmt.Errorf("dns isn't unhealthy yet: %v", s.Services)
+		return fmt.Errorf("dns isn't unhealthy yet: %v", nodetest.Services(s))
 	})
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Service("dns")}); err != nil {
+	if _, err := runService(t.Context(), t, n, nodetest.Service("dns")); err != nil {
 		t.Fatalf("running the unhealthy dns again: %v", err)
 	}
 	if res, err := call(t.Context(), n.AgentConn(t), nodetest.Service("dns").Api, "Echo", nil); err != nil || res.Calls != 1 {
@@ -411,7 +412,7 @@ func TestRunningAServiceAgainUnchangedKeepsItsCalls(t *testing.T) {
 	n.EventuallyHealthy(t)
 	n.ImportFixtures(t)
 	fixture := nodetest.Fixture()
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+	if _, err := runService(t.Context(), t, n, fixture); err != nil {
 		t.Fatal(err)
 	}
 	stream, err := n.AgentConn(t).NewStream(t.Context(), &grpc.StreamDesc{ClientStreams: true, ServerStreams: true}, "/"+fixture.Api+"/Stream", grpc.ForceCodecV2(rawCodec{}))
@@ -420,7 +421,7 @@ func TestRunningAServiceAgainUnchangedKeepsItsCalls(t *testing.T) {
 	}
 	for i := range 2 {
 		if i == 1 {
-			if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+			if _, err := runService(t.Context(), t, n, fixture); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -438,21 +439,21 @@ func TestRunningAServiceAgainUnchangedKeepsItsCalls(t *testing.T) {
 // lacks, and changed by edit too unless it is nil, so that the agent
 // keeps trying to start that one, and returns the service as the agent
 // reports it once it says why it can't.
-func restartWantingAServiceItCantStart(t *testing.T, n *nodetest.Node, name string, edit func(*nodev1.Service)) *nodev1.Component {
+func restartWantingAServiceItCantStart(t *testing.T, n *nodetest.Node, name string, edit func(*nodev1.Container)) *nodev1.Component {
 	t.Helper()
 	n.Kill(t, "agent")
 	var stored []string
 	for _, s := range release.ClusterServices {
 		svc := nodetest.Service(s.Name)
 		if s.Name == name {
-			svc.Version, svc.Image = "9.9.9", release.ImageRef(name, "9.9.9")
+			svc.Image = release.ImageRef(name, "9.9.9")
 			if edit != nil {
 				edit(svc)
 			}
 		}
-		stored = append(stored, fmt.Sprintf(`{"name":%q,"version":%q,"api":%q,"image":%q}`, svc.Name, svc.Version, svc.Api, svc.Image))
+		stored = append(stored, fmt.Sprintf(`{"name":%q,"image":%q,"user":%q,"read_only_root":true,"capabilities":[],"api":%q}`, svc.Name, svc.Image, *svc.User, svc.Api))
 	}
-	n.Exec(t, "root", "sh", "-c", "echo '["+strings.Join(stored, ",")+"]' > "+hostlayout.ServicesFile)
+	n.Exec(t, "root", "sh", "-c", `echo '{"containers":[`+strings.Join(stored, ",")+`]}' > `+hostlayout.ContainersFile)
 	n.Restart(t, "agent")
 	var reported *nodev1.Component
 	nodetest.Eventually(t, time.Minute, func() error {
@@ -460,13 +461,13 @@ func restartWantingAServiceItCantStart(t *testing.T, n *nodetest.Node, name stri
 		if err != nil {
 			return err
 		}
-		for _, c := range status.Services {
+		for _, c := range nodetest.Services(status) {
 			if c.Name == name && strings.Contains(c.Problem, "starting it") {
 				reported = c
 				return nil
 			}
 		}
-		return fmt.Errorf("%s isn't failing to start: %v", name, status.Services)
+		return fmt.Errorf("%s isn't failing to start: %v", name, nodetest.Services(status))
 	})
 	return reported
 }
@@ -489,7 +490,7 @@ func TestImportingAndRunningAServiceAgainChangesNothing(t *testing.T) {
 func TestRunningAServiceWhoseImageTheNodeHasntImportedIsRefused(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
-	_, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Service("dns")})
+	_, err := runService(t.Context(), t, n, nodetest.Service("dns"))
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "no image") {
 		t.Errorf("running dns without its image: %v, want a failed precondition naming the image", err)
 	}
@@ -501,22 +502,21 @@ func TestRunningAServiceOfAnotherServicesAPIIsRefused(t *testing.T) {
 	n.StartServices(t)
 	clash := nodetest.Service("dns")
 	clash.Name = "dns-twin"
-	_, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: clash})
+	_, err := runService(t.Context(), t, n, clash)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("running a second service of dns's API: %v, want a failed precondition", err)
 	}
 }
 
-func TestRunningAServiceAtAnotherVersionOrFromAnotherImageReplacesIt(t *testing.T) {
+func TestRunningAServiceFromAnotherImageReplacesIt(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
 	n.StartServices(t)
 	for _, c := range []struct {
 		what string
-		edit func(*nodev1.Service)
+		edit func(*nodev1.Container)
 	}{
-		{"another version", func(s *nodev1.Service) { s.Version = "9.9.9" }},
-		{"another image", func(s *nodev1.Service) { s.Image = nodetest.Fixture().Image }},
+		{"another image", func(s *nodev1.Container) { s.Image = nodetest.Fixture().Image }},
 	} {
 		n.RunService(t, "dns")
 		// Running dns deletes its other images, as the fixture's.
@@ -524,7 +524,7 @@ func TestRunningAServiceAtAnotherVersionOrFromAnotherImageReplacesIt(t *testing.
 		before := servicePID(t, n, "dns")
 		svc := nodetest.Service("dns")
 		c.edit(svc)
-		if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: svc}); err != nil {
+		if _, err := runService(t.Context(), t, n, svc); err != nil {
 			t.Fatalf("running dns from %s: %v", c.what, err)
 		}
 		if _, err := n.Output("root", "test", "-e", "/proc/"+before); err == nil {
@@ -541,7 +541,7 @@ func TestRunningAServiceUnderAnotherAPIReplacesItAndRoutesTheOldAPINoMore(t *tes
 	moved := nodetest.Service("dns")
 	old := moved.Api
 	moved.Api = otherAPI
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: moved}); err != nil {
+	if _, err := runService(t.Context(), t, n, moved); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := call(t.Context(), n.AgentConn(t), old, "Echo", nil); status.Code(err) != codes.Unimplemented {
@@ -563,7 +563,7 @@ func TestAServiceRunAgainIsAskedAnewWhatItsMethodsAllow(t *testing.T) {
 	// The fixture serves the same API on the same socket, and lets
 	// operators ping.
 	n.ImportFixtures(t)
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Fixture()}); err != nil {
+	if _, err := runService(t.Context(), t, n, nodetest.Fixture()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := call(t.Context(), n.AgentConn(t), api, "Ping", nil); err != nil {
@@ -575,12 +575,12 @@ func TestAServicesOutputGoesToItsLog(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
 	n.ImportFixtures(t)
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Fixture()}); err != nil {
+	if _, err := runService(t.Context(), t, n, nodetest.Fixture()); err != nil {
 		t.Fatal(err)
 	}
 	want := "serving " + nodetest.Fixture().Api + "\n"
 	nodetest.Eventually(t, 10*time.Second, func() error {
-		log, err := n.Output("root", "cat", hostlayout.ServiceLogDir+"/dns.log")
+		log, err := n.Output("root", "cat", hostlayout.ContainerLogDir+"/dns.log")
 		if err != nil {
 			return err
 		}
@@ -595,7 +595,7 @@ func TestAServiceThatFailsToStartAnswersUnavailable(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
 	n.ImportFixtures(t)
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Broken()}); err == nil {
+	if _, err := runService(t.Context(), t, n, nodetest.Broken()); err == nil {
 		t.Fatal("running a service without a program succeeded")
 	}
 	if _, err := call(t.Context(), n.AgentConn(t), nodetest.Broken().Api, "Echo", nil); status.Code(err) != codes.Unavailable {
@@ -645,7 +645,7 @@ func TestOnlyRootReachesAServicesSocket(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
 	n.StartServices(t)
-	socket := hostlayout.ServicesDir + "/dns/" + servicev1.APISocket
+	socket := hostlayout.ContainersDir + "/dns/" + servicev1.APISocket
 	if out, err := n.Output("root", "test", "-S", socket); err != nil {
 		t.Fatalf("the service's socket isn't at %s: %v %s", socket, err, out)
 	}
@@ -778,9 +778,12 @@ func TestAServiceRunGoesOnWhenItsCallEnds(t *testing.T) {
 	n.EventuallyHealthy(t)
 	n.StartServices(t)
 	n.ImportFixtures(t)
+	// The lock is taken first, so that taking it takes none of the
+	// call's time.
+	n.HoldLock(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
-	if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: nodetest.Fixture()}); status.Code(err) != codes.DeadlineExceeded {
+	if _, err := runService(ctx, t, n, nodetest.Fixture()); status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("running dns from the fixture within 50ms: %v, want the call to end first", err)
 	}
 	nodetest.Eventually(t, time.Minute, func() error {
@@ -788,12 +791,12 @@ func TestAServiceRunGoesOnWhenItsCallEnds(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for _, c := range s.Services {
+		for _, c := range nodetest.Services(s) {
 			if c.Name == "dns" && c.Version == "fixture" && c.Health == nodev1.Health_HEALTH_HEALTHY {
 				return nil
 			}
 		}
-		return fmt.Errorf("dns isn't running from the fixture, healthy: %v", s.Services)
+		return fmt.Errorf("dns isn't running from the fixture, healthy: %v", nodetest.Services(s))
 	})
 }
 
@@ -804,10 +807,10 @@ func TestRunningAServiceFromAnotherImageDeletesTheImageItReplaced(t *testing.T) 
 	n.EventuallyHealthy(t)
 	n.StartServices(t)
 	n.ImportFixtures(t)
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Fixture()}); err != nil {
+	if _, err := runService(t.Context(), t, n, nodetest.Fixture()); err != nil {
 		t.Fatal(err)
 	}
-	_, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Service("dns")})
+	_, err := runService(t.Context(), t, n, nodetest.Service("dns"))
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "the node has no image "+nodetest.Service("dns").Image) {
 		t.Errorf("running dns from the image the fixture replaced: %v, want it refused, the image gone", err)
 	}
@@ -823,14 +826,14 @@ func TestRunningAServiceDeletesItsImagesThatNeverRan(t *testing.T) {
 	n.EventuallyHealthy(t)
 	n.StartServices(t)
 	stopped := nodetest.Service("dns")
-	stopped.Version, stopped.Image = "stopped", release.ImageRef("dns", "stopped")
-	n.ImportFixtureAs(t, stopped)
+	stopped.Image = release.ImageRef("dns", "stopped")
+	n.Import(t, nodetest.ImageOf(stopped))
 	n.ImportFixtures(t)
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Fixture()}); err != nil {
+	if _, err := runService(t.Context(), t, n, nodetest.Fixture()); err != nil {
 		t.Fatal(err)
 	}
-	for _, gone := range []*nodev1.Service{stopped, nodetest.Service("dns")} {
-		_, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: gone})
+	for _, gone := range []*nodev1.Container{stopped, nodetest.Service("dns")} {
+		_, err := runService(t.Context(), t, n, gone)
 		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "the node has no image "+gone.Image) {
 			t.Errorf("running dns from %s: %v, want it refused, the image gone", gone.Image, err)
 		}
@@ -838,7 +841,7 @@ func TestRunningAServiceDeletesItsImagesThatNeverRan(t *testing.T) {
 	// The images of other services stay, the broken one's that never ran
 	// too.
 	n.RunService(t, "proxy")
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Broken()}); err != nil && strings.Contains(err.Error(), "the node has no image") {
+	if _, err := runService(t.Context(), t, n, nodetest.Broken()); err != nil && strings.Contains(err.Error(), "the node has no image") {
 		t.Errorf("running broken: %v, want its image kept", err)
 	}
 }
@@ -848,14 +851,14 @@ func TestRunningAServiceDeletesItsImagesThatNeverRan(t *testing.T) {
 // kept: the run's deletion of the service's other images is over before
 // the import.
 func TestARunThatGoesOnKeepsTheImageTheNextUpdateImports(t *testing.T) {
-	for name, next := range map[string]func(n *nodetest.Node) *nodev1.Service{
-		"another tag": func(n *nodetest.Node) *nodev1.Service {
+	for name, next := range map[string]func(n *nodetest.Node) *nodev1.Container{
+		"another tag": func(n *nodetest.Node) *nodev1.Container {
 			svc := nodetest.Service("dns")
-			svc.Version, svc.Image = "next", release.ImageRef("dns", "next")
-			n.ImportFixtureAs(t, svc)
+			svc.Image = release.ImageRef("dns", "next")
+			n.Import(t, nodetest.ImageOf(svc))
 			return svc
 		},
-		"the image it replaced": func(n *nodetest.Node) *nodev1.Service {
+		"the image it replaced": func(n *nodetest.Node) *nodev1.Container {
 			n.ImportImage(t, "dns")
 			return nodetest.Service("dns")
 		},
@@ -865,17 +868,20 @@ func TestARunThatGoesOnKeepsTheImageTheNextUpdateImports(t *testing.T) {
 			n.EventuallyHealthy(t)
 			n.StartServices(t)
 			slow := nodetest.Service("dns")
-			slow.Version, slow.Image = "slow", release.ImageRef("dns", "slow")
-			n.ImportSlowFixtureAs(t, slow)
+			slow.Image = release.ImageRef("dns", "slow")
+			n.Import(t, nodetest.Image{Name: slow.Image, API: slow.Api, Slow: true})
+			// The lock is taken first, so that taking it takes none of the
+			// call's time.
+			n.HoldLock(t)
 			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 			defer cancel()
-			if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: slow}); status.Code(err) != codes.DeadlineExceeded {
+			if _, err := runService(ctx, t, n, slow); status.Code(err) != codes.DeadlineExceeded {
 				t.Fatalf("running dns from the slow image within 50ms: %v, want the call to end first", err)
 			}
 			svc := next(n)
 			ctx, cancel = context.WithTimeout(t.Context(), time.Minute)
 			defer cancel()
-			if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: svc}); err != nil {
+			if _, err := runService(ctx, t, n, svc); err != nil {
 				t.Errorf("running dns from %s, imported while the stopped run went on: %v, want it run", svc.Image, err)
 			}
 		})
@@ -888,19 +894,19 @@ func TestRunningAServiceKeepsTheImagesOtherServicesRun(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
 	n.StartServices(t)
-	shared := &nodev1.Service{Name: "dnsb", Version: "shared", Api: otherAPI, Image: release.ImageRef("dns", "shared")}
-	n.ImportFixtureAs(t, shared)
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: shared}); err != nil {
+	shared := nodeclient.ServiceContainer("dnsb", otherAPI, release.ImageRef("dns", "shared"))
+	n.Import(t, nodetest.ImageOf(shared))
+	if _, err := runService(t.Context(), t, n, shared); err != nil {
 		t.Fatal(err)
 	}
-	prefixed := &nodev1.Service{Name: "dnsx", Version: "1", Api: "moostack.dnsx.v1.DNSX", Image: "moostack.local/dnsx:1"}
-	n.ImportFixtureAs(t, prefixed)
+	prefixed := nodeclient.ServiceContainer("dnsx", "moostack.dnsx.v1.DNSX", "moostack.local/dnsx:1")
+	n.Import(t, nodetest.ImageOf(prefixed))
 	n.ImportFixtures(t)
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: nodetest.Fixture()}); err != nil {
+	if _, err := runService(t.Context(), t, n, nodetest.Fixture()); err != nil {
 		t.Fatal(err)
 	}
-	for _, kept := range []*nodev1.Service{shared, prefixed} {
-		if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: kept}); err != nil && strings.Contains(err.Error(), "the node has no image") {
+	for _, kept := range []*nodev1.Container{shared, prefixed} {
+		if _, err := runService(t.Context(), t, n, kept); err != nil && strings.Contains(err.Error(), "the node has no image") {
 			t.Errorf("running %s from %s after dns ran: %v, want its image kept", kept.Name, kept.Image, err)
 		}
 	}
@@ -915,12 +921,12 @@ func TestRunningAServiceFromARebuildOfItsImageReplacesIt(t *testing.T) {
 	n.StartServices(t)
 	n.ImportFixtures(t)
 	fixture := nodetest.Fixture()
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+	if _, err := runService(t.Context(), t, n, fixture); err != nil {
 		t.Fatal(err)
 	}
 	before := servicePID(t, n, "fixtureservice")
-	n.ImportFixtureRebuiltAs(t, fixture)
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+	n.Import(t, nodetest.Image{Name: fixture.Image, API: fixture.Api, Rebuild: 1})
+	if _, err := runService(t.Context(), t, n, fixture); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := n.Output("root", "test", "-e", "/proc/"+before); err == nil {
@@ -937,7 +943,7 @@ func TestRunningAServiceFromARebuildOfItsConfigAloneSurvivesGarbageCollection(t 
 	n.StartServices(t)
 	n.ImportFixtures(t)
 	fixture := nodetest.Fixture()
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+	if _, err := runService(t.Context(), t, n, fixture); err != nil {
 		t.Fatal(err)
 	}
 	digest, chain := imageOf(t, n, fixture.Image)
@@ -945,13 +951,13 @@ func TestRunningAServiceFromARebuildOfItsConfigAloneSurvivesGarbageCollection(t 
 	defer stop()
 	for build := 1; build <= 5; build++ {
 		before := servicePID(t, n, "fixtureservice")
-		n.ImportFixtureReconfiguredAs(t, fixture, build)
+		n.Import(t, nodetest.Image{Name: fixture.Image, API: fixture.Api, Reconfigure: build})
 		rebuilt, rebuiltChain := imageOf(t, n, fixture.Image)
 		if rebuilt == digest || rebuiltChain != chain {
 			t.Fatalf("rebuild %d is %s on the layers %s, want another image on the layers %s of %s", build, rebuilt, rebuiltChain, chain, digest)
 		}
 		digest = rebuilt
-		if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+		if _, err := runService(t.Context(), t, n, fixture); err != nil {
 			t.Fatalf("running dns from rebuild %d: %v", build, err)
 		}
 		if _, err := n.Output("root", "test", "-e", "/proc/"+before); err == nil {
@@ -969,16 +975,16 @@ func TestTheLayerOfAServicesRebuildsGoesOnceItRunsFromAnother(t *testing.T) {
 	n.StartServices(t)
 	n.ImportFixtures(t)
 	fixture := nodetest.Fixture()
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+	if _, err := runService(t.Context(), t, n, fixture); err != nil {
 		t.Fatal(err)
 	}
 	_, chain := imageOf(t, n, fixture.Image)
-	n.ImportFixtureReconfiguredAs(t, fixture, 1)
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+	n.Import(t, nodetest.Image{Name: fixture.Image, API: fixture.Api, Reconfigure: 1})
+	if _, err := runService(t.Context(), t, n, fixture); err != nil {
 		t.Fatal(err)
 	}
-	n.ImportFixtureRebuiltAs(t, fixture)
-	if _, err := n.Agent.RunService(t.Context(), &nodev1.RunServiceRequest{Service: fixture}); err != nil {
+	n.Import(t, nodetest.Image{Name: fixture.Image, API: fixture.Api, Rebuild: 1})
+	if _, err := runService(t.Context(), t, n, fixture); err != nil {
 		t.Fatal(err)
 	}
 	stop := n.CollectGarbage(t)
@@ -1000,11 +1006,14 @@ func TestAServiceRunsAfterTheAgentIsKilledWhileItUnpacks(t *testing.T) {
 	n.EventuallyHealthy(t)
 	n.StartServices(t)
 	slow := nodetest.Service("dns")
-	slow.Version, slow.Image = "slow", release.ImageRef("dns", "slow")
-	n.ImportSlowFixtureAs(t, slow)
+	slow.Image = release.ImageRef("dns", "slow")
+	n.Import(t, nodetest.Image{Name: slow.Image, API: slow.Api, Slow: true})
+	// The lock is taken first, so that taking it takes none of the
+	// call's time.
+	n.HoldLock(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
-	if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: slow}); status.Code(err) != codes.DeadlineExceeded {
+	if _, err := runService(ctx, t, n, slow); status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("running dns from the slow image within 50ms: %v, want the call to end first", err)
 	}
 	n.Crash(t, "agent")
@@ -1019,11 +1028,11 @@ func TestAServiceRunsAfterTheAgentIsKilledWhileItUnpacks(t *testing.T) {
 	}
 	ctx, cancel = context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: slow}); err != nil {
+	if _, err := runService(ctx, t, n, slow); err != nil {
 		t.Fatalf("running dns from the slow image after the agent was killed unpacking it: %v", err)
 	}
-	if status := n.EventuallyHealthy(t); !slices.ContainsFunc(status.Services, func(c *nodev1.Component) bool { return c.Name == "dns" && c.Version == slow.Version }) {
-		t.Errorf("the agent reports %v, want dns at %s", status.Services, slow.Version)
+	if status := n.EventuallyHealthy(t); !slices.ContainsFunc(nodetest.Services(status), func(c *nodev1.Component) bool { return c.Name == "dns" && c.Version == "slow" }) {
+		t.Errorf("the agent reports %v, want dns at slow", nodetest.Services(status))
 	}
 }
 
@@ -1047,7 +1056,7 @@ func TestARunHoldsItsSnapshotsInItsOwnLeaseWhateverLeaseItsCallNames(t *testing.
 				}
 			}
 			ctx := metadata.AppendToOutgoingContext(t.Context(), "containerd-lease", named.ID)
-			if _, err := n.Agent.RunService(ctx, &nodev1.RunServiceRequest{Service: nodetest.Fixture()}); err != nil {
+			if _, err := runService(ctx, t, n, nodetest.Fixture()); err != nil {
 				t.Errorf("running dns with a call that names the lease %s: %v", named.ID, err)
 			}
 			if existing {
@@ -1073,4 +1082,13 @@ func imageOf(t *testing.T, n *nodetest.Node, ref string) (digest, chain string) 
 		t.Fatal(err)
 	}
 	return img.Target().Digest.String(), identity.ChainID(diffIDs).String()
+}
+
+// runService has n's agent run the cluster service's container c, holding
+// the operation lock for nodetest.Lease, as node add and cluster update
+// do.
+func runService(ctx context.Context, t *testing.T, n *nodetest.Node, c *nodev1.Container) (*nodev1.RunResponse, error) {
+	t.Helper()
+	n.HoldLock(t)
+	return n.Agent.Run(ctx, &nodev1.RunRequest{Container: c, Lease: nodetest.Lease})
 }

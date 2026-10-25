@@ -29,7 +29,8 @@ const (
 	Agent_ReleaseLock_FullMethodName      = "/moostack.node.v1.Agent/ReleaseLock"
 	Agent_BreakLock_FullMethodName        = "/moostack.node.v1.Agent/BreakLock"
 	Agent_ImportImage_FullMethodName      = "/moostack.node.v1.Agent/ImportImage"
-	Agent_RunService_FullMethodName       = "/moostack.node.v1.Agent/RunService"
+	Agent_Run_FullMethodName              = "/moostack.node.v1.Agent/Run"
+	Agent_Remove_FullMethodName           = "/moostack.node.v1.Agent/Remove"
 	Agent_RemoveIdentities_FullMethodName = "/moostack.node.v1.Agent/RemoveIdentities"
 	Agent_UpdateUpdater_FullMethodName    = "/moostack.node.v1.Agent/UpdateUpdater"
 	Agent_UpdateContainerd_FullMethodName = "/moostack.node.v1.Agent/UpdateContainerd"
@@ -76,19 +77,25 @@ type AgentClient interface {
 	// answers with the names of the images it imported. Importing an image
 	// the node has changes nothing.
 	ImportImage(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportImageRequest, ImportImageResponse], error)
-	// RunService runs a cluster service from its image, which the node must
-	// have imported, and routes calls of its API to it from then on, across
-	// restarts of the agent and the node. Running a service that already
-	// runs as asked changes nothing; running a service of a name the node
-	// runs already, at another version, from another image or another
-	// build of its image, or of another API, replaces it, and the API it
-	// served before is routed no more. It
-	// refuses a service whose API a service of another name serves, with
-	// FAILED_PRECONDITION. Once the agent has the call, it goes on running
-	// the service even if the call ends. Once the service runs, the agent
-	// deletes the image of the one it replaced, unless another service
-	// runs from it.
-	RunService(ctx context.Context, in *RunServiceRequest, opts ...grpc.CallOption) (*RunServiceResponse, error)
+	// Run runs a container from its image, which the node must have, and
+	// keeps it running across restarts of the agent, of containerd and of
+	// the node. The container gets no-new-privileges, a cgroup of its
+	// own, and a network namespace of its own with loopback alone. Its
+	// output goes to the node's log as <name>.log. Running a container as
+	// it runs already, from the same build of the same image with the same
+	// properties, changes nothing; otherwise the container of that name is
+	// replaced, and if the new one can't be made, the old one runs on.
+	// Once the agent has the call, it goes on even if the call ends. It is
+	// refused with FAILED_PRECONDITION, changing nothing, unless the
+	// request's lease holds the operation lock, if the node lacks the
+	// image, or if a container of another name serves its API.
+	Run(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*RunResponse, error)
+	// Remove stops and deletes the container of the request's name, and
+	// empties its log; removing one the node doesn't keep succeeds. Once
+	// the agent has the call, it goes on even if the call ends. It is
+	// refused with FAILED_PRECONDITION, changing nothing, unless the
+	// request's lease holds the operation lock.
+	Remove(ctx context.Context, in *RemoveRequest, opts ...grpc.CallOption) (*RemoveResponse, error)
 	// RemoveIdentities adds node identities, by their fingerprints, to
 	// those the node holds as removed from the cluster, and refuses peers
 	// that prove one from then on, cutting off their open connections. The
@@ -97,37 +104,31 @@ type AgentClient interface {
 	// lease holds the operation lock.
 	RemoveIdentities(ctx context.Context, in *RemoveIdentitiesRequest, opts ...grpc.CallOption) (*RemoveIdentitiesResponse, error)
 	// UpdateUpdater replaces the updater with the binary that the requests
-	// carry, through the updater's A/B slots, as the updater's UpdateAgent
-	// replaces the agent, and with the same answers: the new updater must
-	// serve its status at the update's version, healthy. An agent that
-	// crashes before the new updater is healthy, or whose switch back
-	// failed, switches back when it starts again, and refuses another
-	// update of the updater until it has. Both move a binary that a
-	// release before the A/B slots installed into the first of them.
+	// carry, as the updater's UpdateAgent replaces the agent, and with the
+	// same answers: the new updater must serve its status at the update's
+	// version, healthy, or the old one is put back. An update cut off by a
+	// crash of the agent is rolled back when the agent starts again, and
+	// another update of the updater is refused until it is.
 	UpdateUpdater(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpdateUpdaterRequest, UpdateUpdaterResponse], error)
 	// UpdateContainerd replaces containerd's binaries with those that the
 	// requests carry: the first says which containerd they are, and every
 	// request carries the next bytes of one of them, each file's in order.
-	// Once it has them all, the agent puts them in place of the old ones,
-	// which it keeps, restarts containerd, and answers once containerd
-	// serves at the update's version with its shim at the same version. If
-	// it doesn't within the update's health timeout, the agent puts the old
-	// binaries back, restarts containerd and fails the call with ABORTED,
-	// or with INTERNAL if containerd doesn't restart or answer within the
-	// health timeout either. Running containers keep running, through
-	// their shims. It refuses, with INVALID_ARGUMENT, binaries that don't
-	// match their checksums, a file that isn't one of containerd's, and an
-	// update without each of them, and, with FAILED_PRECONDITION, an update
-	// while another runs, changing nothing. Once the agent has the
-	// binaries, the update goes on even if the call ends.
+	// It answers once containerd serves at the update's version with its
+	// shim at the same version. If it doesn't within the update's health
+	// timeout, the old containerd is put back and the call fails with
+	// ABORTED, or with INTERNAL if the old one doesn't serve within the
+	// health timeout either. Running containers keep running. It refuses,
+	// with INVALID_ARGUMENT, binaries that don't match their checksums, a
+	// file that isn't one of containerd's, and an update without each of
+	// them, and, with FAILED_PRECONDITION, an update while another runs,
+	// changing nothing. Once the agent has the binaries, the update goes on
+	// even if the call ends.
 	UpdateContainerd(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpdateContainerdRequest, UpdateContainerdResponse], error)
 	// Detach is the break-glass detach: it returns a node in control plane
 	// mode to direct mode, for good, once the control plane is lost. The
-	// agent logs it at warning level, records direct mode in the node
-	// file, closes its tunnel to the control plane and lifts the local
-	// socket's lockout. The updater, which reads the node file every
-	// second, then does the same, and reports direct mode in its status.
-	// It is refused over the control plane's tunnel with
+	// agent leaves the control plane and lifts the local socket's lockout,
+	// and the updater follows within seconds, reporting direct mode in its
+	// status. It is refused over the control plane's tunnel with
 	// PERMISSION_DENIED, since only root on the node may detach it, and on
 	// a node in direct mode with FAILED_PRECONDITION.
 	Detach(ctx context.Context, in *DetachRequest, opts ...grpc.CallOption) (*DetachResponse, error)
@@ -214,10 +215,20 @@ func (c *agentClient) ImportImage(ctx context.Context, opts ...grpc.CallOption) 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Agent_ImportImageClient = grpc.ClientStreamingClient[ImportImageRequest, ImportImageResponse]
 
-func (c *agentClient) RunService(ctx context.Context, in *RunServiceRequest, opts ...grpc.CallOption) (*RunServiceResponse, error) {
+func (c *agentClient) Run(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*RunResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(RunServiceResponse)
-	err := c.cc.Invoke(ctx, Agent_RunService_FullMethodName, in, out, cOpts...)
+	out := new(RunResponse)
+	err := c.cc.Invoke(ctx, Agent_Run_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) Remove(ctx context.Context, in *RemoveRequest, opts ...grpc.CallOption) (*RemoveResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveResponse)
+	err := c.cc.Invoke(ctx, Agent_Remove_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -310,19 +321,25 @@ type AgentServer interface {
 	// answers with the names of the images it imported. Importing an image
 	// the node has changes nothing.
 	ImportImage(grpc.ClientStreamingServer[ImportImageRequest, ImportImageResponse]) error
-	// RunService runs a cluster service from its image, which the node must
-	// have imported, and routes calls of its API to it from then on, across
-	// restarts of the agent and the node. Running a service that already
-	// runs as asked changes nothing; running a service of a name the node
-	// runs already, at another version, from another image or another
-	// build of its image, or of another API, replaces it, and the API it
-	// served before is routed no more. It
-	// refuses a service whose API a service of another name serves, with
-	// FAILED_PRECONDITION. Once the agent has the call, it goes on running
-	// the service even if the call ends. Once the service runs, the agent
-	// deletes the image of the one it replaced, unless another service
-	// runs from it.
-	RunService(context.Context, *RunServiceRequest) (*RunServiceResponse, error)
+	// Run runs a container from its image, which the node must have, and
+	// keeps it running across restarts of the agent, of containerd and of
+	// the node. The container gets no-new-privileges, a cgroup of its
+	// own, and a network namespace of its own with loopback alone. Its
+	// output goes to the node's log as <name>.log. Running a container as
+	// it runs already, from the same build of the same image with the same
+	// properties, changes nothing; otherwise the container of that name is
+	// replaced, and if the new one can't be made, the old one runs on.
+	// Once the agent has the call, it goes on even if the call ends. It is
+	// refused with FAILED_PRECONDITION, changing nothing, unless the
+	// request's lease holds the operation lock, if the node lacks the
+	// image, or if a container of another name serves its API.
+	Run(context.Context, *RunRequest) (*RunResponse, error)
+	// Remove stops and deletes the container of the request's name, and
+	// empties its log; removing one the node doesn't keep succeeds. Once
+	// the agent has the call, it goes on even if the call ends. It is
+	// refused with FAILED_PRECONDITION, changing nothing, unless the
+	// request's lease holds the operation lock.
+	Remove(context.Context, *RemoveRequest) (*RemoveResponse, error)
 	// RemoveIdentities adds node identities, by their fingerprints, to
 	// those the node holds as removed from the cluster, and refuses peers
 	// that prove one from then on, cutting off their open connections. The
@@ -331,37 +348,31 @@ type AgentServer interface {
 	// lease holds the operation lock.
 	RemoveIdentities(context.Context, *RemoveIdentitiesRequest) (*RemoveIdentitiesResponse, error)
 	// UpdateUpdater replaces the updater with the binary that the requests
-	// carry, through the updater's A/B slots, as the updater's UpdateAgent
-	// replaces the agent, and with the same answers: the new updater must
-	// serve its status at the update's version, healthy. An agent that
-	// crashes before the new updater is healthy, or whose switch back
-	// failed, switches back when it starts again, and refuses another
-	// update of the updater until it has. Both move a binary that a
-	// release before the A/B slots installed into the first of them.
+	// carry, as the updater's UpdateAgent replaces the agent, and with the
+	// same answers: the new updater must serve its status at the update's
+	// version, healthy, or the old one is put back. An update cut off by a
+	// crash of the agent is rolled back when the agent starts again, and
+	// another update of the updater is refused until it is.
 	UpdateUpdater(grpc.ClientStreamingServer[UpdateUpdaterRequest, UpdateUpdaterResponse]) error
 	// UpdateContainerd replaces containerd's binaries with those that the
 	// requests carry: the first says which containerd they are, and every
 	// request carries the next bytes of one of them, each file's in order.
-	// Once it has them all, the agent puts them in place of the old ones,
-	// which it keeps, restarts containerd, and answers once containerd
-	// serves at the update's version with its shim at the same version. If
-	// it doesn't within the update's health timeout, the agent puts the old
-	// binaries back, restarts containerd and fails the call with ABORTED,
-	// or with INTERNAL if containerd doesn't restart or answer within the
-	// health timeout either. Running containers keep running, through
-	// their shims. It refuses, with INVALID_ARGUMENT, binaries that don't
-	// match their checksums, a file that isn't one of containerd's, and an
-	// update without each of them, and, with FAILED_PRECONDITION, an update
-	// while another runs, changing nothing. Once the agent has the
-	// binaries, the update goes on even if the call ends.
+	// It answers once containerd serves at the update's version with its
+	// shim at the same version. If it doesn't within the update's health
+	// timeout, the old containerd is put back and the call fails with
+	// ABORTED, or with INTERNAL if the old one doesn't serve within the
+	// health timeout either. Running containers keep running. It refuses,
+	// with INVALID_ARGUMENT, binaries that don't match their checksums, a
+	// file that isn't one of containerd's, and an update without each of
+	// them, and, with FAILED_PRECONDITION, an update while another runs,
+	// changing nothing. Once the agent has the binaries, the update goes on
+	// even if the call ends.
 	UpdateContainerd(grpc.ClientStreamingServer[UpdateContainerdRequest, UpdateContainerdResponse]) error
 	// Detach is the break-glass detach: it returns a node in control plane
 	// mode to direct mode, for good, once the control plane is lost. The
-	// agent logs it at warning level, records direct mode in the node
-	// file, closes its tunnel to the control plane and lifts the local
-	// socket's lockout. The updater, which reads the node file every
-	// second, then does the same, and reports direct mode in its status.
-	// It is refused over the control plane's tunnel with
+	// agent leaves the control plane and lifts the local socket's lockout,
+	// and the updater follows within seconds, reporting direct mode in its
+	// status. It is refused over the control plane's tunnel with
 	// PERMISSION_DENIED, since only root on the node may detach it, and on
 	// a node in direct mode with FAILED_PRECONDITION.
 	Detach(context.Context, *DetachRequest) (*DetachResponse, error)
@@ -396,8 +407,11 @@ func (UnimplementedAgentServer) BreakLock(context.Context, *BreakLockRequest) (*
 func (UnimplementedAgentServer) ImportImage(grpc.ClientStreamingServer[ImportImageRequest, ImportImageResponse]) error {
 	return status.Error(codes.Unimplemented, "method ImportImage not implemented")
 }
-func (UnimplementedAgentServer) RunService(context.Context, *RunServiceRequest) (*RunServiceResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method RunService not implemented")
+func (UnimplementedAgentServer) Run(context.Context, *RunRequest) (*RunResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Run not implemented")
+}
+func (UnimplementedAgentServer) Remove(context.Context, *RemoveRequest) (*RemoveResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Remove not implemented")
 }
 func (UnimplementedAgentServer) RemoveIdentities(context.Context, *RemoveIdentitiesRequest) (*RemoveIdentitiesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveIdentities not implemented")
@@ -547,20 +561,38 @@ func _Agent_ImportImage_Handler(srv interface{}, stream grpc.ServerStream) error
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Agent_ImportImageServer = grpc.ClientStreamingServer[ImportImageRequest, ImportImageResponse]
 
-func _Agent_RunService_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RunServiceRequest)
+func _Agent_Run_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RunRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(AgentServer).RunService(ctx, in)
+		return srv.(AgentServer).Run(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Agent_RunService_FullMethodName,
+		FullMethod: Agent_Run_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AgentServer).RunService(ctx, req.(*RunServiceRequest))
+		return srv.(AgentServer).Run(ctx, req.(*RunRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_Remove_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).Remove(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_Remove_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).Remove(ctx, req.(*RemoveRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -647,8 +679,12 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Agent_BreakLock_Handler,
 		},
 		{
-			MethodName: "RunService",
-			Handler:    _Agent_RunService_Handler,
+			MethodName: "Run",
+			Handler:    _Agent_Run_Handler,
+		},
+		{
+			MethodName: "Remove",
+			Handler:    _Agent_Remove_Handler,
 		},
 		{
 			MethodName: "RemoveIdentities",
@@ -697,23 +733,20 @@ type UpdaterClient interface {
 	Status(ctx context.Context, in *UpdaterStatusRequest, opts ...grpc.CallOption) (*UpdaterStatusResponse, error)
 	// UpdateAgent replaces the agent with the binary that the requests
 	// carry: the first says which agent it is, and every request carries
-	// the binary's next bytes, in order. The updater writes it into the
-	// agent's inactive A/B slot, switches to that A/B slot and restarts the
-	// agent, and answers once the new agent serves its status at the
-	// update's version with every component it reports healthy. If it
-	// doesn't within the update's health timeout, the updater switches
-	// back, restarts the agent it replaced, and fails the call with
-	// ABORTED, or with INTERNAL if the agent it replaced doesn't restart or
-	// become healthy within the health timeout either. The call fails with
-	// INTERNAL too if the new agent becomes healthy but the updater can't
-	// remove the swap's record, since it then switches back when it next
-	// starts. It refuses a binary that doesn't match the update's checksum
-	// with INVALID_ARGUMENT, and, with FAILED_PRECONDITION, an update while
-	// another runs or while a swap that didn't finish is recorded, changing
-	// nothing. Once it has the whole binary, the update goes on even if the
-	// call ends, and an updater told to stop finishes it first. One that
-	// crashes before the new agent is healthy, or whose switch back failed,
-	// switches back when it starts again.
+	// the binary's next bytes, in order. It answers once the new agent
+	// serves its status at the update's version with every component it
+	// reports healthy. If it doesn't within the update's health timeout,
+	// the old agent is put back and the call fails with ABORTED, or with
+	// INTERNAL if the old one doesn't become healthy within the health
+	// timeout either, or if the update can't be recorded as finished, in
+	// which case it is rolled back when the updater next starts. It
+	// refuses a binary that doesn't match the update's checksum with
+	// INVALID_ARGUMENT, and, with FAILED_PRECONDITION, an update while
+	// another runs or while one cut off is still to be rolled back,
+	// changing nothing. Once it has the whole binary, the update goes on
+	// even if the call ends, and an updater told to stop finishes it
+	// first. An update cut off by a crash of the updater is rolled back
+	// when it starts again.
 	UpdateAgent(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpdateAgentRequest, UpdateAgentResponse], error)
 }
 
@@ -761,23 +794,20 @@ type UpdaterServer interface {
 	Status(context.Context, *UpdaterStatusRequest) (*UpdaterStatusResponse, error)
 	// UpdateAgent replaces the agent with the binary that the requests
 	// carry: the first says which agent it is, and every request carries
-	// the binary's next bytes, in order. The updater writes it into the
-	// agent's inactive A/B slot, switches to that A/B slot and restarts the
-	// agent, and answers once the new agent serves its status at the
-	// update's version with every component it reports healthy. If it
-	// doesn't within the update's health timeout, the updater switches
-	// back, restarts the agent it replaced, and fails the call with
-	// ABORTED, or with INTERNAL if the agent it replaced doesn't restart or
-	// become healthy within the health timeout either. The call fails with
-	// INTERNAL too if the new agent becomes healthy but the updater can't
-	// remove the swap's record, since it then switches back when it next
-	// starts. It refuses a binary that doesn't match the update's checksum
-	// with INVALID_ARGUMENT, and, with FAILED_PRECONDITION, an update while
-	// another runs or while a swap that didn't finish is recorded, changing
-	// nothing. Once it has the whole binary, the update goes on even if the
-	// call ends, and an updater told to stop finishes it first. One that
-	// crashes before the new agent is healthy, or whose switch back failed,
-	// switches back when it starts again.
+	// the binary's next bytes, in order. It answers once the new agent
+	// serves its status at the update's version with every component it
+	// reports healthy. If it doesn't within the update's health timeout,
+	// the old agent is put back and the call fails with ABORTED, or with
+	// INTERNAL if the old one doesn't become healthy within the health
+	// timeout either, or if the update can't be recorded as finished, in
+	// which case it is rolled back when the updater next starts. It
+	// refuses a binary that doesn't match the update's checksum with
+	// INVALID_ARGUMENT, and, with FAILED_PRECONDITION, an update while
+	// another runs or while one cut off is still to be rolled back,
+	// changing nothing. Once it has the whole binary, the update goes on
+	// even if the call ends, and an updater told to stop finishes it
+	// first. An update cut off by a crash of the updater is rolled back
+	// when it starts again.
 	UpdateAgent(grpc.ClientStreamingServer[UpdateAgentRequest, UpdateAgentResponse]) error
 	mustEmbedUnimplementedUpdaterServer()
 }

@@ -5,9 +5,11 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/orchestrate"
 )
 
@@ -369,5 +371,101 @@ func TestTheLeaseOutlivesTheCallersContext(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Error("the held context went on after the operation lost the lock")
+	}
+}
+
+// A node being installed, whose lock Lock took, holds it for the
+// operation for as long as the install goes on, however long, and the
+// lease runs out once the install lets go of it.
+func TestLockKeepsTheLockOfANodeBeingInstalledUntilItIsLetGo(t *testing.T) {
+	f := fakes{"node1": {generation: 1}}
+	nodes := f.nodes()
+	nodes.LeaseTTL = 300 * time.Millisecond
+	cl, err := orchestrate.Preflight(t.Context(), nodes, 1, false, holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	installed := &node{}
+	lease, release, err := cl.Lock(t.Context(), installed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * nodes.LeaseTTL)
+	if l := installed.heldLock(); l == nil || l.Lease != lease {
+		t.Errorf("the node being installed holds the lock for %v after three lease times, want %s", l, lease)
+	}
+	release()
+	time.Sleep(2 * nodes.LeaseTTL)
+	if l := installed.heldLock(); l != nil {
+		t.Errorf("the node holds the lock for %v two lease times after the install let go of it, want it free", l)
+	}
+}
+
+// renewCounter is a node that counts the renewals of its lock it is
+// asked for.
+type renewCounter struct {
+	*node
+	renewals atomic.Int32
+}
+
+func (r *renewCounter) RenewLock(ctx context.Context, lease string, ttl time.Duration) (*nodeclient.Lock, error) {
+	r.renewals.Add(1)
+	return r.node.RenewLock(ctx, lease, ttl)
+}
+
+// The renewals of a node being installed end once the operation ends,
+// as when it is closed or loses its lock, though the install never let go
+// of it, and once the node answers that another lease holds its lock or
+// none does.
+func TestLockStopsRenewingOnceTheOperationEndsOrTheNodeRefuses(t *testing.T) {
+	for what, end := range map[string]string{"the operation closed": "close", "another lease holding the lock": "take", "the lock freed": "free"} {
+		t.Run(what, func(t *testing.T) {
+			f := fakes{"node1": {generation: 1}}
+			nodes := f.nodes()
+			nodes.LeaseTTL = 300 * time.Millisecond
+			cl, err := orchestrate.Preflight(t.Context(), nodes, 1, false, holder)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if end != "close" {
+				defer cl.Close()
+			}
+			installed := &renewCounter{node: &node{}}
+			_, release, err := cl.Lock(t.Context(), installed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			time.Sleep(nodes.LeaseTTL)
+			if installed.renewals.Load() == 0 {
+				t.Fatal("the lock wasn't renewed within a lease time")
+			}
+			switch end {
+			case "close":
+				cl.Close()
+			case "take":
+				installed.lockFor("other", time.Hour)
+			case "free":
+				if _, err := installed.BreakLock(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The renewal that finds it ended comes within a third of a
+			// lease time, and may still be counted.
+			time.Sleep(nodes.LeaseTTL)
+			after := installed.renewals.Load()
+			time.Sleep(2 * nodes.LeaseTTL)
+			if got := installed.renewals.Load(); got != after {
+				t.Errorf("the lock was renewed %d times more over two lease times after %s", got-after, what)
+			}
+			// The node being installed takes no part in whether the
+			// operation holds its lock.
+			if end != "close" {
+				if err := cl.CheckLock(); err != nil || cl.Context().Err() != nil {
+					t.Errorf("after %s, the operation is lost: %v, %v, want it to hold its lock on the other nodes", what, err, cl.Context().Err())
+				}
+			}
+		})
 	}
 }
