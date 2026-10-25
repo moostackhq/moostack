@@ -75,7 +75,9 @@ type AgentClient interface {
 	// ImportImage imports an image into the node's containerd, from an OCI
 	// image layout archive that the requests carry in chunks, in order. It
 	// answers with the names of the images it imported. Importing an image
-	// the node has changes nothing.
+	// the node has changes nothing. It is refused with FAILED_PRECONDITION,
+	// importing nothing, unless the first request's lease holds the
+	// operation lock.
 	ImportImage(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportImageRequest, ImportImageResponse], error)
 	// Run runs a container from its image, which the node must have, and
 	// keeps it running across restarts of the agent, of containerd and of
@@ -319,7 +321,9 @@ type AgentServer interface {
 	// ImportImage imports an image into the node's containerd, from an OCI
 	// image layout archive that the requests carry in chunks, in order. It
 	// answers with the names of the images it imported. Importing an image
-	// the node has changes nothing.
+	// the node has changes nothing. It is refused with FAILED_PRECONDITION,
+	// importing nothing, unless the first request's lease holds the
+	// operation lock.
 	ImportImage(grpc.ClientStreamingServer[ImportImageRequest, ImportImageResponse]) error
 	// Run runs a container from its image, which the node must have, and
 	// keeps it running across restarts of the agent, of containerd and of

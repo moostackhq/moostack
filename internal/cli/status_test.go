@@ -77,7 +77,7 @@ func component(name, version string, health nodev1.Health, problem string) *node
 func asContainers(services []*nodev1.Component) []*nodev1.ContainerStatus {
 	var containers []*nodev1.ContainerStatus
 	for _, s := range services {
-		containers = append(containers, &nodev1.ContainerStatus{Name: s.Name, Image: release.ImageRef(s.Name, s.Version), Digest: s.Build,
+		containers = append(containers, &nodev1.ContainerStatus{Name: release.ContainerName(s.Name), Image: release.ImageRef(s.Name, s.Version), Digest: s.Build,
 			State: nodev1.TaskState_TASK_STATE_RUNNING, Health: s.Health, Problem: s.Problem})
 	}
 	return containers

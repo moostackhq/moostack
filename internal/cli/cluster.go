@@ -786,7 +786,7 @@ func serviceOf(archive []byte, s release.Service) (orchestrate.Service, error) {
 	if err != nil {
 		return orchestrate.Service{}, err
 	}
-	return orchestrate.Service{Name: s.Name, Version: s.Version, Build: build, API: s.API, Image: release.ImageRef(s.Name, s.Version), Archive: archive}, nil
+	return orchestrate.Service{Name: s.Name, Version: s.Version, Build: build, Container: s.Container(), Archive: archive, Replaces: s.Name, ReplacesImages: release.ImageRef(s.Name, "")}, nil
 }
 
 // clusterUnlock is mooctl cluster unlock. It breaks the operation lock on
@@ -1044,11 +1044,11 @@ func componentsOf(pinned []release.Pin, builds map[string]string, reported []*no
 
 // containersOf are the containers that a node whose status is s keeps,
 // with the cluster services pinned as pinned. A container is pinned if
-// the release pins a cluster service of its name: it runs the version of
-// its image, and is as healthy as its API. Another runs its image, or
-// the version of a cluster service's image, and is as healthy as its
-// API, if it has one, or else its process: running, exited with its
-// code, or failed.
+// the release pins the cluster service that release.ContainerName names
+// it for: it runs the version of its image, and is as healthy as its
+// API. Another runs its image, or the version of a cluster service's
+// image, and is as healthy as its API, if it has one, or else its
+// process: running, exited with its code, or failed.
 func containersOf(pinned []release.Pin, builds map[string]string, s nodeclient.Status) []componentStatusView {
 	byName := map[string]*nodev1.ContainerStatus{}
 	for _, c := range s.Containers {
@@ -1056,9 +1056,9 @@ func containersOf(pinned []release.Pin, builds map[string]string, s nodeclient.S
 	}
 	var views []componentStatusView
 	for _, p := range pinned {
-		c, ok := byName[p.Name]
+		c, ok := byName[release.ContainerName(p.Name)]
 		if !ok {
-			views = append(views, componentStatusView{Name: p.Name, Pinned: p.Version, PinnedBuild: builds[p.Name], Health: nodeclient.HealthName(nodev1.Health_HEALTH_UNSPECIFIED)})
+			views = append(views, componentStatusView{Name: release.ContainerName(p.Name), Pinned: p.Version, PinnedBuild: builds[p.Name], Health: nodeclient.HealthName(nodev1.Health_HEALTH_UNSPECIFIED)})
 			continue
 		}
 		// A container under a service's name that runs another image
@@ -1069,7 +1069,7 @@ func containersOf(pinned []release.Pin, builds map[string]string, s nodeclient.S
 		views = append(views, v)
 	}
 	for _, c := range s.Containers {
-		if slices.ContainsFunc(pinned, func(p release.Pin) bool { return p.Name == c.Name }) {
+		if slices.ContainsFunc(pinned, func(p release.Pin) bool { return release.ContainerName(p.Name) == c.Name }) {
 			continue
 		}
 		v := componentStatusView{Name: c.Name, Running: c.Image, Image: c.Image, Build: c.Digest, Health: containerHealth(c), Problem: c.Problem}

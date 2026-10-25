@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -70,9 +71,19 @@ type node struct {
 	// healthy unless it is sickService.
 	components []*nodev1.Component
 	services   []*nodev1.Component
+	// oldNames are the cluster services the node runs under their names
+	// alone, as releases before the service- names ran them, until removed.
+	oldNames []*nodev1.Component
+	// others are containers that no service runs as, which the node
+	// reports as they are.
+	others []*nodev1.ContainerStatus
 	// ran are the containers that Run ran, in order.
 	ran         []*nodev1.Container
 	sickService string
+	// images are the images the node has, as imports leave them and
+	// removals delete them, and importDelay how long an import takes.
+	images      map[string]bool
+	importDelay time.Duration
 
 	mu sync.Mutex
 	// updates are the updates of the node's components, in order.
@@ -148,7 +159,7 @@ func (n *node) Status(ctx context.Context) nodeclient.Status {
 		generation = n.laterGeneration
 	}
 	n.mu.Unlock()
-	return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock(), Components: n.components, Containers: asContainers(n.reportedServices())}
+	return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock(), Components: n.components, Containers: n.containers()}
 }
 
 func (n *node) RecordGeneration(ctx context.Context, g int64, nodes []string, lease string) error {
@@ -311,39 +322,133 @@ func (n *node) UpdateContainerd(ctx context.Context, version string, files map[s
 }
 
 // ImportImage imports the image whose archive is "image " and its name,
-// failing it if failing names the image's service.
-func (n *node) ImportImage(ctx context.Context, archive []byte) ([]string, error) {
+// failing it if failing names the image's service. It refuses the import
+// unless lease holds the node's operation lock.
+func (n *node) ImportImage(ctx context.Context, archive []byte, lease string) ([]string, error) {
+	// A call whose context ended is never sent.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := n.fence(lease); err != nil {
+		return nil, err
+	}
+	select {
+	case <-time.After(n.importDelay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	image := strings.TrimPrefix(string(archive), "image ")
 	if service, _, _ := strings.Cut(strings.TrimPrefix(image, "moostack.local/"), ":"); n.failing == "import "+service {
 		return nil, n.updateErr
 	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.images == nil {
+		n.images = map[string]bool{}
+	}
+	n.images[image] = true
 	return []string{image}, nil
 }
 
-// Run records an update of the service that c runs, as update records
-// one of a component, as "service <name>", with its image as the binary,
-// and keeps c. It refuses c unless lease holds the node's operation lock.
-func (n *node) Run(ctx context.Context, c *nodev1.Container, lease string) error {
+// fence fails unless lease holds the node's operation lock.
+func (n *node) fence(lease string) error {
 	n.mu.Lock()
 	l := n.held()
 	n.mu.Unlock()
 	if l == nil || l.Lease != lease {
 		return errors.New("the operation's lease doesn't hold the node's operation lock")
 	}
+	return nil
+}
+
+// Run records an update of the service that c runs, as update records
+// one of a component, as "service <name>", with its image as the binary,
+// and keeps c. It refuses c once ctx ended, unless lease holds the
+// node's operation lock, and while the service runs under its name alone
+// too, as the agent refuses a container whose API another serves.
+func (n *node) Run(ctx context.Context, c *nodev1.Container, lease string) error {
+	// A call whose context ended is never sent.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := n.fence(lease); err != nil {
+		return err
+	}
+	service, ok := release.ServiceName(c.Name)
+	if !ok {
+		return fmt.Errorf("%s isn't a cluster service's container", c.Name)
+	}
+	n.mu.Lock()
+	clash := slices.ContainsFunc(n.oldNames, func(s *nodev1.Component) bool { return s.Name == service })
+	n.mu.Unlock()
+	if clash {
+		return fmt.Errorf("the container %s serves %s's API", service, c.Name)
+	}
+	n.mu.Lock()
+	missing := !n.images[c.Image]
+	n.mu.Unlock()
+	if missing {
+		return fmt.Errorf("the node has no image %s", c.Image)
+	}
 	version, _ := release.ServiceVersion(c.Name, c.Image)
-	err := n.update(ctx, "service "+c.Name, version, c.Image, 0)
+	err := n.update(ctx, "service "+service, version, c.Image, 0)
 	if err != nil {
 		return err
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	health := nodev1.Health_HEALTH_HEALTHY
-	if c.Name == n.sickService {
+	if service == n.sickService {
 		health = nodev1.Health_HEALTH_UNHEALTHY
 	}
 	n.ran = append(n.ran, c)
-	n.services = slices.DeleteFunc(n.services, func(s *nodev1.Component) bool { return s.Name == c.Name })
-	n.services = append(n.services, &nodev1.Component{Name: c.Name, Version: version, Health: health})
+	n.services = slices.DeleteFunc(n.services, func(s *nodev1.Component) bool { return s.Name == service })
+	n.services = append(n.services, &nodev1.Component{Name: service, Version: version, Health: health})
+	return nil
+}
+
+// Remove records a removal of the container called name, as update
+// records an update, as "remove <name>", and stops reporting it,
+// deleting its image unless another container runs from it, as the agent
+// does, and goes on if the call ends, as the agent's does, answering
+// that the call ended. It refuses a call whose context ended already,
+// which a real one never sends, and unless lease holds the node's
+// operation lock.
+func (n *node) Remove(ctx context.Context, name, lease string) (err error) {
+	// A call whose context ended is never sent.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := n.fence(lease); err != nil {
+		return err
+	}
+	// Its caller hears that its call ended, though the removal goes on.
+	defer func() {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+	}()
+	// The removal goes on if the call ends, as the agent's does.
+	if err := n.update(context.WithoutCancel(ctx), "remove "+name, "", "", 0); err != nil {
+		return err
+	}
+	var image string
+	for _, c := range n.containers() {
+		if c.Name == name {
+			image = c.Image
+		}
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.oldNames = slices.DeleteFunc(n.oldNames, func(s *nodev1.Component) bool { return s.Name == name })
+	service, _ := release.ServiceName(name)
+	n.services = slices.DeleteFunc(n.services, func(s *nodev1.Component) bool { return s.Name == service })
+	n.mu.Unlock()
+	used := slices.ContainsFunc(n.containers(), func(c *nodev1.ContainerStatus) bool { return c.Image == image })
+	n.mu.Lock()
+	if !used {
+		delete(n.images, image)
+	}
 	return nil
 }
 
@@ -354,15 +459,28 @@ func (n *node) containersRun() []*nodev1.Container {
 	return slices.Clone(n.ran)
 }
 
-// asContainers are services as a node reports them: each a container
-// that runs the release's image of the service at its version.
-func asContainers(services []*nodev1.Component) []*nodev1.ContainerStatus {
-	var containers []*nodev1.ContainerStatus
-	for _, s := range services {
-		containers = append(containers, &nodev1.ContainerStatus{Name: s.Name, Image: release.ImageRef(s.Name, s.Version), Digest: s.Build,
-			State: nodev1.TaskState_TASK_STATE_RUNNING, Health: s.Health, Problem: s.Problem})
+// containers are the node's services as it reports them: each a
+// container that runs the release's image of the service at its
+// version, named as release.ContainerName names it, or by the service's
+// name alone for one of oldNames.
+func (n *node) containers() []*nodev1.ContainerStatus {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	containers := slices.Clone(n.others)
+	for _, s := range n.oldNames {
+		containers = append(containers, asContainer(s.Name, s))
+	}
+	for _, s := range n.services {
+		containers = append(containers, asContainer(release.ContainerName(s.Name), s))
 	}
 	return containers
+}
+
+// asContainer is the service s as a node reports it, as the container
+// called name.
+func asContainer(name string, s *nodev1.Component) *nodev1.ContainerStatus {
+	return &nodev1.ContainerStatus{Name: name, Image: release.ImageRef(s.Name, s.Version), Digest: s.Build,
+		State: nodev1.TaskState_TASK_STATE_RUNNING, Health: s.Health, Problem: s.Problem}
 }
 
 // reportedServices are the services the node reports.

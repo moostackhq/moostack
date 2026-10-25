@@ -185,7 +185,7 @@ func TestOpenRefusesAnAgentUpdaterOrServiceAtAnotherVersion(t *testing.T) {
 			m := release.Manifest{Version: "1.0.0", Components: []release.Component{
 				{Name: "agent", Version: c.agent, Files: []string{"agent"}},
 				{Name: "updater", Version: c.updater, Files: []string{"updater"}},
-			}, Services: []release.Service{{Name: "dns", Version: c.service, API: "moostack.dns.v1.DNS", Image: "dns.tar"}}}
+			}, Services: []release.Service{{Name: "dns", Version: c.service, API: "moostack.dns.v1.DNS", Image: "dns.tar", Properties: release.Properties{User: "65534:65534"}}}}
 			if err := release.Write(dir, m); err != nil {
 				t.Fatal(err)
 			}
@@ -279,7 +279,7 @@ func TestTheBuildOfAServiceIsItsImagesDigest(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := release.Write(dir, release.Manifest{Version: "1.0.0", Services: []release.Service{{Name: "dns", Version: "1.0.0", API: "moostack.dns.v1.DNS", Image: "dns.tar"}}}); err != nil {
+	if err := release.Write(dir, release.Manifest{Version: "1.0.0", Services: []release.Service{{Name: "dns", Version: "1.0.0", API: "moostack.dns.v1.DNS", Image: "dns.tar", Properties: release.Properties{User: "65534:65534"}}}}); err != nil {
 		t.Fatal(err)
 	}
 	r, err := release.Open(source, "1.0.0")

@@ -110,8 +110,12 @@ func TestAJoinedNodeServesTheNodeAPIOverItsTunnels(t *testing.T) {
 		t.Errorf("after the lock and the generation over the tunnel, status is %v, %v, want generation 3 and the lock free", res, err)
 	}
 
-	// The control plane runs a cluster service, and calls it.
-	images, err := nodeclient.ImportImage(ctx, agent, nodetest.ImageArchive(t, "dns"))
+	// The control plane runs a cluster service, and calls it. An import
+	// without the lease is refused over the tunnel too.
+	if _, err := nodeclient.ImportImage(ctx, agent, nodetest.ImageArchive(t, "dns"), "other"); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("importing dns's image over the tunnel without the lock: %v, want failed precondition", err)
+	}
+	images, err := importOver(ctx, agent, nodetest.ImageArchive(t, "dns"))
 	if err != nil {
 		t.Fatalf("importing dns's image over the tunnel: %v", err)
 	}
@@ -173,7 +177,7 @@ func TestAJoinedNodesLocalSocketsAnswerStatusAlone(t *testing.T) {
 	// A cluster service runs, run by the control plane.
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	if _, err := nodeclient.ImportImage(ctx, agent, nodetest.ImageArchive(t, "dns")); err != nil {
+	if _, err := importOver(ctx, agent, nodetest.ImageArchive(t, "dns")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runOver(ctx, agent, nodetest.Service("dns")); err != nil {
@@ -552,7 +556,7 @@ func TestTheControlPlaneRunsAndRemovesContainersOverTheTunnel(t *testing.T) {
 	if _, err := agent.AcquireLock(ctx, &nodev1.AcquireLockRequest{Lock: &nodev1.Lock{Lease: "cp", Holder: "control plane"}, Ttl: durationpb.New(time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := nodeclient.ImportImage(ctx, agent, nodetest.ImageArchive(t, "dns")); err != nil {
+	if _, err := nodeclient.ImportImage(ctx, agent, nodetest.ImageArchive(t, "dns"), "cp"); err != nil {
 		t.Fatal(err)
 	}
 	dns := nodetest.Service("dns")
@@ -579,6 +583,20 @@ func TestTheControlPlaneRunsAndRemovesContainersOverTheTunnel(t *testing.T) {
 	if err != nil || len(res.Containers) != 0 {
 		t.Errorf("status over the tunnel after the removal: %v, %v, want no containers", res.GetContainers(), err)
 	}
+}
+
+// importOver has agent import the image archive data, holding the
+// operation lock for the call, as runOver runs a container.
+func importOver(ctx context.Context, agent nodev1.AgentClient, data []byte) ([]string, error) {
+	if _, err := agent.AcquireLock(ctx, &nodev1.AcquireLockRequest{Lock: &nodev1.Lock{Lease: "cp", Holder: "control plane"}, Ttl: durationpb.New(time.Minute)}); err != nil {
+		return nil, err
+	}
+	images, err := nodeclient.ImportImage(ctx, agent, data, "cp")
+	if err != nil {
+		return nil, err
+	}
+	_, err = agent.ReleaseLock(ctx, &nodev1.ReleaseLockRequest{Lease: "cp"})
+	return images, err
 }
 
 // runOver has the agent run c over the tunnel agent, holding the

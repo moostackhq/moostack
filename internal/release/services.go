@@ -6,22 +6,35 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/ociimage"
 )
 
 // ClusterService is a cluster service every release has: its name,
-// which is that of its binary in the checkout's cargo workspace, and the
-// gRPC service name of its API.
-type ClusterService struct{ Name, API string }
+// which is that of its binary in the checkout's cargo workspace, the
+// gRPC service name of its API, and how its container runs.
+type ClusterService struct {
+	Name, API string
+	Properties
+}
+
+// lockedDown is how every cluster service runs: as nobody, with a
+// read-only root and no capabilities.
+var lockedDown = Properties{
+	User:         strconv.Itoa(hostlayout.ServiceUser) + ":" + strconv.Itoa(hostlayout.ServiceUser),
+	ReadOnlyRoot: true,
+	Capabilities: []string{},
+}
 
 // ClusterServices are the cluster services every release has.
 var ClusterServices = []ClusterService{
-	{"registry", "moostack.registry.v1.Registry"},
-	{"dns", "moostack.dns.v1.DNS"},
-	{"proxy", "moostack.proxy.v1.Proxy"},
-	{"telemetry", "moostack.telemetry.v1.Telemetry"},
+	{"registry", "moostack.registry.v1.Registry", lockedDown},
+	{"dns", "moostack.dns.v1.DNS", lockedDown},
+	{"proxy", "moostack.proxy.v1.Proxy", lockedDown},
+	{"telemetry", "moostack.telemetry.v1.Telemetry", lockedDown},
 }
 
 // CheckClusterServices fails unless m has each of ClusterServices,
@@ -184,7 +197,7 @@ func BuildServices(ctx context.Context, checkout, arch, version, dir string, ser
 		if err != nil {
 			return nil, err
 		}
-		built = append(built, Service{Name: s.Name, Version: version, API: s.API, Image: file})
+		built = append(built, Service{Name: s.Name, Version: version, API: s.API, Image: file, Properties: s.Properties})
 	}
 	return built, nil
 }

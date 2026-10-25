@@ -22,17 +22,20 @@ import (
 const devVersion = "0123456789ab-dirty"
 
 // updatedTo are the components and services n was updated to, as
-// "agent 1.1.0" or "service dns 1.1.0", without their binaries.
+// "agent 1.1.0", "run service-dns 1.1.0" or "remove dns", without their
+// binaries or images.
 func updatedTo(n *fakeNode) []string {
 	var got []string
 	for _, u := range n.nodeUpdates() {
 		f := strings.Fields(u)
-		if f[0] == "service" {
-			f = f[1:]
-			got = append(got, "service "+f[0]+" "+f[1])
-			continue
+		switch f[0] {
+		case "run":
+			got = append(got, "run "+f[1]+" "+f[2])
+		case "remove":
+			got = append(got, u)
+		default:
+			got = append(got, f[0]+" "+f[1])
 		}
-		got = append(got, f[0]+" "+f[1])
 	}
 	return got
 }
@@ -50,7 +53,7 @@ func TestClusterUpdateFromASourceBuildsEachComponentNamedForEachNodesArchitectur
 	r := o.mustRun("cluster", "update", "--source", checkout, "dns", "agent")
 
 	for name, n := range o.nodes {
-		if got, want := updatedTo(n), []string{"agent " + version, "service dns " + version}; !slices.Equal(got, want) {
+		if got, want := updatedTo(n), []string{"agent " + version, "run service-dns " + version}; !slices.Equal(got, want) {
 			t.Errorf("%s was updated to %q, want %q", name, got, want)
 		}
 		wantProgram(t, name+"'s agent", n.sentFile("agent"), nodeArch[name], version)
@@ -95,7 +98,7 @@ func TestClusterUpdateFromASourceBuildsEveryComponentWhenItNamesNone(t *testing.
 	r := o.mustRun("cluster", "update", "--source", checkout)
 	want := []string{"agent " + version, "updater " + version}
 	for _, s := range release.ClusterServices {
-		want = append(want, "service "+s.Name+" "+version)
+		want = append(want, "run "+release.ContainerName(s.Name)+" "+version)
 	}
 	for name, n := range o.nodes {
 		if got := updatedTo(n); !slices.Equal(got, want) {
@@ -454,9 +457,9 @@ func TestClusterUpdateReplacesDevelopmentBuildsWithThePinnedRelease(t *testing.T
 	o.nodes["node3"].runs("1.1.0", "agent", "updater").runsServices(devVersion, "dns")
 	o.mustRun("--release-source", source, "cluster", "update")
 	for name, want := range map[string][]string{
-		"node1": {"agent 1.1.0", "updater 1.1.0", "containerd 2.1.0", "service dns 1.1.0", "service proxy 1.1.0"},
-		"node2": {"agent 1.1.0", "updater 1.1.0", "containerd 2.1.0", "service dns 1.1.0", "service proxy 1.1.0"},
-		"node3": {"containerd 2.1.0", "service dns 1.1.0", "service proxy 1.1.0"},
+		"node1": {"agent 1.1.0", "updater 1.1.0", "containerd 2.1.0", "run service-dns 1.1.0", "run service-proxy 1.1.0"},
+		"node2": {"agent 1.1.0", "updater 1.1.0", "containerd 2.1.0", "run service-dns 1.1.0", "run service-proxy 1.1.0"},
+		"node3": {"containerd 2.1.0", "run service-dns 1.1.0", "run service-proxy 1.1.0"},
 	} {
 		if got := updatedTo(o.nodes[name]); !slices.Equal(got, want) {
 			t.Errorf("%s was updated to %q, want %q", name, got, want)
@@ -475,7 +478,7 @@ func TestClusterStatusSaysADevelopmentBuildThePinnedReleaseLacksStays(t *testing
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	wantContains(t, "cluster status", r.stdout,
 		"Update: development builds run; mooctl cluster update replaces them with the pinned release\n",
-		"node2: registry: it is a development build of a service the pinned release doesn't have, which cluster update leaves running")
+		"node2: service-registry: it is a development build of a service the pinned release doesn't have, which cluster update leaves running")
 }
 
 func TestClusterStatusMarksDevelopmentBuilds(t *testing.T) {
@@ -485,8 +488,8 @@ func TestClusterStatusMarksDevelopmentBuilds(t *testing.T) {
 	o.nodes["node2"].runsServices(devVersion, "dns")
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	wantContains(t, "cluster status", r.stdout,
-		"\nnode1  direct\n  agent       "+devVersion+" (development build)  1.1.0   healthy\n",
-		"\nnode2  direct\n  agent       1.0.0                                   1.1.0   healthy\n    dns       "+devVersion+" (development build)  1.1.0   healthy\n")
+		"\nnode1  direct\n  agent            "+devVersion+" (development build)  1.1.0   healthy\n",
+		"\nnode2  direct\n  agent            1.0.0                                   1.1.0   healthy\n    service-dns    "+devVersion+" (development build)  1.1.0   healthy\n")
 	if n := strings.Count(r.stdout, "(development build)"); n != 2 {
 		t.Errorf("cluster status marks %d development builds, want 2:\n%s", n, r.stdout)
 	}
@@ -511,7 +514,7 @@ func TestClusterStatusMarksDevelopmentBuilds(t *testing.T) {
 			}
 		}
 	}
-	if want := []string{"node1 agent " + devVersion, "node2 dns " + devVersion}; !slices.Equal(marked, want) {
+	if want := []string{"node1 agent " + devVersion, "node2 service-dns " + devVersion}; !slices.Equal(marked, want) {
 		t.Errorf("cluster status --json marks %q as development builds, want %q", marked, want)
 	}
 }

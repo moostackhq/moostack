@@ -23,7 +23,10 @@ import (
 	"slices"
 	"strings"
 
+	"google.golang.org/grpc/status"
 	"gopkg.in/yaml.v3"
+
+	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 
 	"github.com/moostackhq/moostack/internal/buildid"
 	"github.com/moostackhq/moostack/internal/ociimage"
@@ -66,7 +69,34 @@ type Service struct {
 	API string `yaml:"api"`
 	// Image is the file of the service's image, an OCI image layout
 	// archive, for every architecture. It names the image ImageRef.
-	Image string `yaml:"image"`
+	Image      string `yaml:"image"`
+	Properties `yaml:",inline"`
+}
+
+// Properties are how a cluster service's container runs, as its release
+// states them.
+type Properties struct {
+	// User is the uid the service runs as, with a gid after a colon.
+	User         string `yaml:"user"`
+	ReadOnlyRoot bool   `yaml:"read_only_root"`
+	// Capabilities are the Linux capabilities the service runs with,
+	// none if empty.
+	Capabilities []string `yaml:"capabilities"`
+}
+
+// Container is the container that the cluster service s runs as, named
+// as ContainerName names it, from its image at its version, serving its
+// API, with the properties its release states.
+func (s Service) Container() *nodev1.Container {
+	user := s.User
+	return &nodev1.Container{
+		Name:         ContainerName(s.Name),
+		Image:        ImageRef(s.Name, s.Version),
+		User:         &user,
+		ReadOnlyRoot: s.ReadOnlyRoot,
+		Capabilities: &nodev1.Capabilities{Names: slices.Clone(s.Capabilities)},
+		Api:          s.API,
+	}
 }
 
 // ImageRef is the name of the image of version of the service called
@@ -75,24 +105,48 @@ func ImageRef(name, version string) string {
 	return "moostack.local/" + name + ":" + version
 }
 
+// servicePrefix starts the name of every cluster service's container.
+//
+// Temporary: the prefix is what keeps an app, whose container mooctl
+// names app-<name>, from replacing a cluster service by its name, until
+// a container's name gets an owner on the node.
+const servicePrefix = "service-"
+
+// ContainerName is the name of the container that the cluster service
+// called service runs as.
+func ContainerName(service string) string { return servicePrefix + service }
+
 // MayBeService reports whether the container called name, running
-// image, may be one of the cluster services: one that runs the
-// release's image of the service of its name, or one whose image the
-// node can't tell, as one it can't read.
+// image, may be one of the cluster services: one named for a service
+// that runs the release's image of that service, or one so named whose
+// image the node can't tell, as one it can't read.
 func MayBeService(name, image string) bool {
+	_, named := ServiceName(name)
 	_, ok := ServiceVersion(name, image)
-	return ok || image == ""
+	return ok || (named && image == "")
 }
 
-// ServiceVersion is the version of the cluster service called name whose
-// image is image, as ImageRef names it, and whether image is one: if it
-// isn't, the version is empty.
+// ServiceVersion is the version of the cluster service whose container
+// is called name, as ContainerName names it, and whose image is image,
+// as ImageRef names it, and whether they are one's: if they aren't, the
+// version is empty.
 func ServiceVersion(name, image string) (string, bool) {
-	version, ok := strings.CutPrefix(image, ImageRef(name, ""))
+	service, ok := ServiceName(name)
+	if !ok {
+		return "", false
+	}
+	version, ok := strings.CutPrefix(image, ImageRef(service, ""))
 	if !ok || version == "" {
 		return "", false
 	}
 	return version, true
+}
+
+// ServiceName is the name of the cluster service whose container is
+// called name, as ContainerName names it, and whether name is one's.
+func ServiceName(name string) (string, bool) {
+	service, ok := strings.CutPrefix(name, servicePrefix)
+	return service, ok && service != ""
 }
 
 // Service returns the service called name.
@@ -229,11 +283,16 @@ func Open(source, version string) (*Release, error) {
 	}
 	names, apis := map[string]bool{}, map[string]bool{}
 	for _, s := range r.Services {
-		if s.Name == "" || s.Version == "" || s.API == "" || s.Image == "" {
-			return nil, fmt.Errorf("release %s: a service without a name, version, API or image", version)
+		if s.Name == "" || s.Version == "" || s.API == "" || s.Image == "" || s.User == "" {
+			return nil, fmt.Errorf("release %s: a service without a name, version, API, image or user", version)
 		}
 		if s.Version != version {
 			return nil, fmt.Errorf("release %s: its %s service, at %s, isn't at the release's version", version, s.Name, s.Version)
+		}
+		// A service the node API wouldn't run is refused before anything
+		// changes, rather than once the container it replaces is gone.
+		if err := nodev1.CheckContainer(s.Container()); err != nil {
+			return nil, fmt.Errorf("release %s: its %s service can't run: %s", version, s.Name, status.Convert(err).Message())
 		}
 		if names[s.Name] || apis[s.API] {
 			return nil, fmt.Errorf("release %s: two services called %s or serving %s", version, s.Name, s.API)

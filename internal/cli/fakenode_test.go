@@ -66,12 +66,15 @@ type fakeNode struct {
 	// updating, if set, is called as an update of the agent starts, with
 	// the call's context.
 	updating func(ctx context.Context)
-	// updateErr, if set, is why updating the agent fails, and
-	// serviceErr why running a service does.
-	updateErr, serviceErr error
+	// updateErr, if set, is why updating the agent fails, serviceErr why
+	// running a service does, and removeErr why removing a container does.
+	updateErr, serviceErr, removeErr error
 	// updates are the components the node was updated to, as the
 	// component, its version and its binaries, in order.
 	updates []string
+	// asked are the containers the node was asked to run, in order, those
+	// it refused too.
+	asked []*nodev1.Container
 	// sent are the last binary of the agent and of the updater the node
 	// was sent, and the last archive of each image it imported, by the
 	// image's name.
@@ -222,12 +225,30 @@ func (n *fakeNode) runsServices(version string, services ...string) *fakeNode {
 	return n
 }
 
+// runsUnderOldNames has the node report that it runs each of services at
+// version, healthy, under its name alone, as releases before the
+// service- names ran them.
+func (n *fakeNode) runsUnderOldNames(version string, services ...string) *fakeNode {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, name := range services {
+		n.setContainer(name, &nodev1.Component{Name: name, Version: version, Health: nodev1.Health_HEALTH_HEALTHY})
+	}
+	return n
+}
+
 // setService has the node report the cluster service c as an agent
-// does: as a container from the release's image of it, of the build c
-// says. n.mu is held.
+// does: as a container named for it, from the release's image of it, of
+// the build c says. n.mu is held.
 func (n *fakeNode) setService(c *nodev1.Component) {
-	n.status.Containers = slices.DeleteFunc(n.status.Containers, func(s *nodev1.ContainerStatus) bool { return s.Name == c.Name })
-	n.status.Containers = append(n.status.Containers, &nodev1.ContainerStatus{Name: c.Name, Image: release.ImageRef(c.Name, c.Version), Digest: c.Build,
+	n.setContainer(release.ContainerName(c.Name), c)
+}
+
+// setContainer has the node report the cluster service c as the
+// container called name. n.mu is held.
+func (n *fakeNode) setContainer(name string, c *nodev1.Component) {
+	n.status.Containers = slices.DeleteFunc(n.status.Containers, func(s *nodev1.ContainerStatus) bool { return s.Name == name })
+	n.status.Containers = append(n.status.Containers, &nodev1.ContainerStatus{Name: name, Image: release.ImageRef(c.Name, c.Version), Digest: c.Build,
 		State: nodev1.TaskState_TASK_STATE_RUNNING, Health: c.Health, Problem: c.Problem})
 }
 
@@ -338,8 +359,15 @@ func (n *fakeNode) UpdateContainerd(_ context.Context, version string, files map
 }
 
 // ImportImage imports the image in the OCI image layout archive, as the
-// name its index gives it.
-func (n *fakeNode) ImportImage(_ context.Context, archive []byte) ([]string, error) {
+// name its index gives it, unless its call ended, or lease doesn't hold
+// the node's operation lock.
+func (n *fakeNode) ImportImage(ctx context.Context, archive []byte, lease string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if l := n.heldLock(); l == nil || l.Lease != lease {
+		return nil, status.Error(codes.FailedPrecondition, "the operation's lease doesn't hold the node's operation lock")
+	}
 	r := tar.NewReader(bytes.NewReader(archive))
 	for {
 		h, err := r.Next()
@@ -363,14 +391,17 @@ func (n *fakeNode) ImportImage(_ context.Context, archive []byte) ([]string, err
 	}
 }
 
-// Run records an update to the service that c runs, as "service", its
-// name, version and image, and has the node report it running at its
-// version, healthy, of the build of the image it imported under that
-// name, unless serviceErr is set. As the agent does, it refuses c once
-// ctx ended, unless lease holds the node's operation lock, or from an
-// image the node wasn't sent; and it refuses c run other than locked
-// down. Successful updates of components show in the node's status too,
-// with the build of their binaries.
+// Run records an update to the service that c runs, as "run", its
+// container's name, version and image, and has the node report it
+// running at its version, healthy, of the build of the image it imported
+// under that name, unless serviceErr is set. As the agent does, it
+// refuses c once ctx ended, unless lease holds the node's operation
+// lock, from an image the node wasn't sent, or while the service runs
+// under its name alone, from its image, whose container serves c's API;
+// and it refuses c
+// run other than locked down, or not named for its service.
+// Successful updates of components show in the node's status too, with
+// the build of their binaries.
 func (n *fakeNode) Run(ctx context.Context, c *nodev1.Container, lease string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -381,9 +412,19 @@ func (n *fakeNode) Run(ctx context.Context, c *nodev1.Container, lease string) e
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	version, _ := release.ServiceVersion(c.Name, c.Image)
-	n.updates = append(n.updates, "service "+c.Name+" "+version+" "+c.Image)
+	n.updates = append(n.updates, "run "+c.Name+" "+version+" "+c.Image)
+	n.asked = append(n.asked, c)
 	if c.GetUser() != "65534:65534" || !c.ReadOnlyRoot || c.Capabilities == nil || len(c.Capabilities.Names) != 0 || c.Api == "" {
 		return status.Errorf(codes.InvalidArgument, "%s doesn't run locked down: %v", c.Name, c)
+	}
+	service, ok := release.ServiceName(c.Name)
+	if !ok || release.ImageRef(service, version) != c.Image {
+		return status.Errorf(codes.InvalidArgument, "%s isn't named for the service of its image %s", c.Name, c.Image)
+	}
+	if slices.ContainsFunc(n.status.Containers, func(k *nodev1.ContainerStatus) bool {
+		return k.Name == service && strings.HasPrefix(k.Image, release.ImageRef(service, ""))
+	}) {
+		return status.Errorf(codes.FailedPrecondition, "the container %s serves %s already", service, c.Api)
 	}
 	if n.serviceErr != nil {
 		return n.serviceErr
@@ -392,7 +433,38 @@ func (n *fakeNode) Run(ctx context.Context, c *nodev1.Container, lease string) e
 		return status.Errorf(codes.FailedPrecondition, "the node has no image %s", c.Image)
 	}
 	build, _ := ociimage.Digest(n.sent[c.Image])
-	n.setService(&nodev1.Component{Name: c.Name, Version: version, Build: build, Health: nodev1.Health_HEALTH_HEALTHY})
+	n.setService(&nodev1.Component{Name: service, Version: version, Build: build, Health: nodev1.Health_HEALTH_HEALTHY})
+	return nil
+}
+
+// Remove records a removal of the container called name, as "remove"
+// and its name, and stops reporting it, unless removeErr is set. As the
+// agent does, it deletes the container's image unless another container
+// runs from it, and refuses once ctx ended, or unless lease holds the
+// node's operation lock.
+func (n *fakeNode) Remove(ctx context.Context, name, lease string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if l := n.heldLock(); l == nil || l.Lease != lease {
+		return status.Error(codes.FailedPrecondition, "the operation's lease doesn't hold the node's operation lock")
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.updates = append(n.updates, "remove "+name)
+	if n.removeErr != nil {
+		return n.removeErr
+	}
+	var image string
+	for _, k := range n.status.Containers {
+		if k.Name == name {
+			image = k.Image
+		}
+	}
+	n.status.Containers = slices.DeleteFunc(n.status.Containers, func(k *nodev1.ContainerStatus) bool { return k.Name == name })
+	if !slices.ContainsFunc(n.status.Containers, func(k *nodev1.ContainerStatus) bool { return k.Image == image }) {
+		delete(n.sent, image)
+	}
 	return nil
 }
 
@@ -444,36 +516,48 @@ func (o *operator) dialNode() func(context.Context, cluster.Node) (orchestrate.N
 }
 
 // The fake node refuses a run as the agent does, and one that isn't
-// locked down, so that the tests that use it fail when mooctl runs a
-// service as the agent would refuse or as no cluster service runs.
+// locked down or named for its service, so that the tests that use it
+// fail when mooctl runs a service as the agent would refuse or as no
+// cluster service runs.
 func TestTheFakeNodeRefusesARunAsTheAgentDoes(t *testing.T) {
 	image := release.ImageRef("dns", "1.0.0")
-	locked := func() *nodev1.Container { return nodeclient.ServiceContainer("dns", "moostack.dns.v1.DNS", image) }
+	locked := func() *nodev1.Container {
+		nobody := "65534:65534"
+		return &nodev1.Container{Name: "service-dns", Image: image, User: &nobody, ReadOnlyRoot: true, Capabilities: &nodev1.Capabilities{}, Api: "moostack.dns.v1.DNS"}
+	}
 	ended, cancel := context.WithCancel(t.Context())
 	cancel()
 	for name, c := range map[string]struct {
 		ctx       context.Context
 		container func() *nodev1.Container
 		lease     string
+		// oldNames has the node run dns under its name alone.
+		oldNames bool
 	}{
-		"as mooctl runs a service": {t.Context(), locked, "op"},
-		"without the lease":        {t.Context(), locked, "other"},
-		"once its call ended":      {ended, locked, "op"},
+		"under the service's name alone": {t.Context(), func() *nodev1.Container { c := locked(); c.Name = "dns"; return c }, "op", false},
+		"named for another service":      {t.Context(), func() *nodev1.Container { c := locked(); c.Name = "service-proxy"; return c }, "op", false},
+		"while its old container runs":   {t.Context(), locked, "op", true},
+		"as mooctl runs a service":       {t.Context(), locked, "op", false},
+		"without the lease":              {t.Context(), locked, "other", false},
+		"once its call ended":            {ended, locked, "op", false},
 		"from an image never sent": {t.Context(), func() *nodev1.Container {
 			c := locked()
 			c.Image = release.ImageRef("dns", "2.0.0")
 			return c
-		}, "op"},
-		"with a writable root": {t.Context(), func() *nodev1.Container { c := locked(); c.ReadOnlyRoot = false; return c }, "op"},
-		"as root":              {t.Context(), func() *nodev1.Container { c := locked(); c.User = nil; return c }, "op"},
+		}, "op", false},
+		"with a writable root": {t.Context(), func() *nodev1.Container { c := locked(); c.ReadOnlyRoot = false; return c }, "op", false},
+		"as root":              {t.Context(), func() *nodev1.Container { c := locked(); c.User = nil; return c }, "op", false},
 		"with capabilities": {t.Context(), func() *nodev1.Container {
 			c := locked()
 			c.Capabilities = &nodev1.Capabilities{Names: []string{"CAP_KILL"}}
 			return c
-		}, "op"},
-		"with the default capabilities": {t.Context(), func() *nodev1.Container { c := locked(); c.Capabilities = nil; return c }, "op"},
+		}, "op", false},
+		"with the default capabilities": {t.Context(), func() *nodev1.Container { c := locked(); c.Capabilities = nil; return c }, "op", false},
 	} {
 		n := healthyNode(1)
+		if c.oldNames {
+			n.runsUnderOldNames("1.0.0", "dns")
+		}
 		n.sent = map[string][]byte{image: []byte("archive")}
 		if _, err := n.AcquireLock(t.Context(), nodeclient.Lock{Lease: "op"}, time.Minute); err != nil {
 			t.Fatal(err)
@@ -482,5 +566,54 @@ func TestTheFakeNodeRefusesARunAsTheAgentDoes(t *testing.T) {
 		if want := name == "as mooctl runs a service"; (err == nil) != want {
 			t.Errorf("%s: the fake node's run says %v, want it run: %v", name, err, want)
 		}
+	}
+}
+
+// The fake node refuses an import and a removal as the agent does, and
+// its removal deletes the image no other container runs from, so that
+// the tests that use it fail when mooctl imports or removes as the agent
+// would refuse, or runs from an image a removal deleted.
+func TestTheFakeNodeRefusesAnImportAndARemovalAsTheAgentDoes(t *testing.T) {
+	archive := func(t *testing.T) []byte {
+		var b bytes.Buffer
+		if err := ociimage.Write(&b, ociimage.Image{Name: release.ImageRef("dns", "1.0.0"), Architecture: "amd64", Entrypoint: []string{"/dns"}}); err != nil {
+			t.Fatal(err)
+		}
+		return b.Bytes()
+	}
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+	n := healthyNode(1).runsUnderOldNames("1.0.0", "dns")
+	if _, err := n.AcquireLock(t.Context(), nodeclient.Lock{Lease: "op"}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.ImportImage(t.Context(), archive(t), "other"); err == nil {
+		t.Error("the fake imported for another lease")
+	}
+	if err := n.Remove(t.Context(), "dns", "other"); err == nil {
+		t.Error("the fake removed for another lease")
+	}
+	if err := n.Remove(ended, "dns", "op"); err == nil {
+		t.Error("the fake removed once the call ended")
+	}
+	if _, err := n.ImportImage(ended, archive(t), "op"); err == nil {
+		t.Error("the fake imported once the call ended")
+	}
+	if _, err := n.ImportImage(t.Context(), archive(t), "op"); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Remove(t.Context(), "dns", "op"); err != nil {
+		t.Fatal(err)
+	}
+	nobody := "65534:65534"
+	dns := &nodev1.Container{Name: "service-dns", Image: release.ImageRef("dns", "1.0.0"), User: &nobody, ReadOnlyRoot: true, Capabilities: &nodev1.Capabilities{}, Api: "moostack.dns.v1.DNS"}
+	if err := n.Run(t.Context(), dns, "op"); err == nil {
+		t.Error("the fake ran service-dns from the image the removal of dns deleted")
+	}
+	if _, err := n.ImportImage(t.Context(), archive(t), "op"); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Run(t.Context(), dns, "op"); err != nil {
+		t.Errorf("the fake refused service-dns, its image imported again: %v", err)
 	}
 }

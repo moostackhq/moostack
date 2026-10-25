@@ -62,6 +62,10 @@ func updateCluster(t *testing.T, o *operator) string {
 	return source
 }
 
+// lockedDown is how a release states each cluster service runs: as
+// nobody, with a read-only root and no capabilities.
+var lockedDown = release.Properties{User: "65534:65534", ReadOnlyRoot: true}
+
 // writeUpdateRelease writes the release version into the release source
 // at source, after the release previous, with its agent and updater at
 // version, containerd at containerd, and the dns and proxy services at
@@ -69,10 +73,17 @@ func updateCluster(t *testing.T, o *operator) string {
 // service's image is an image of a program that says them.
 func writeUpdateRelease(t *testing.T, source, version, previous, containerd string) {
 	t.Helper()
+	writeUpdateReleaseWith(t, source, version, previous, containerd, lockedDown)
+}
+
+// writeUpdateReleaseWith is writeUpdateRelease, with its services stated
+// to run with props.
+func writeUpdateReleaseWith(t *testing.T, source, version, previous, containerd string, props release.Properties) {
+	t.Helper()
 	dir := filepath.Join(source, version)
 	services := []release.Service{
-		{Name: "dns", Version: version, API: "moostack.dns.v1.DNS", Image: "dns.tar"},
-		{Name: "proxy", Version: version, API: "moostack.proxy.v1.Proxy", Image: "proxy.tar"},
+		{Name: "dns", Version: version, API: "moostack.dns.v1.DNS", Image: "dns.tar", Properties: props},
+		{Name: "proxy", Version: version, API: "moostack.proxy.v1.Proxy", Image: "proxy.tar", Properties: props},
 	}
 	for _, arch := range release.Architectures {
 		for _, f := range append([]string{"agent", "updater"}, release.ContainerdFiles...) {
@@ -123,8 +134,8 @@ func TestClusterUpdateSendsEachNodeThePinnedComponentsThenTheServicesForItsArchi
 			"agent 1.1.0 agent for " + arch + " at 1.1.0",
 			"updater 1.1.0 updater for " + arch + " at 1.1.0",
 			"containerd 2.1.0 containerd: containerd for " + arch + " at 1.1.0 containerd-shim-runc-v2: containerd-shim-runc-v2 for " + arch + " at 1.1.0",
-			"service dns 1.1.0 moostack.local/dns:1.1.0",
-			"service proxy 1.1.0 moostack.local/proxy:1.1.0",
+			"run service-dns 1.1.0 moostack.local/dns:1.1.0",
+			"run service-proxy 1.1.0 moostack.local/proxy:1.1.0",
 		}
 		if got := o.nodes[name].nodeUpdates(); !slices.Equal(got, want) {
 			t.Errorf("%s was updated to\n%s\nwant\n%s", name, strings.Join(got, "\n"), strings.Join(want, "\n"))
@@ -168,7 +179,7 @@ func TestClusterUpdateSkipsTheAgentAndTheUpdaterANodeRunsAlready(t *testing.T) {
 		{Name: "updater", Version: "1.1.0", Health: healthy},
 	}
 	r := o.mustRun("--release-source", source, "cluster", "update")
-	if got := o.nodes["node1"].nodeUpdates(); len(got) != 3 || !strings.HasPrefix(got[0], "containerd 2.1.0") || !strings.HasPrefix(got[1], "service ") {
+	if got := o.nodes["node1"].nodeUpdates(); len(got) != 3 || !strings.HasPrefix(got[0], "containerd 2.1.0") || !strings.HasPrefix(got[1], "run service-") {
 		t.Errorf("node1 was updated to %q, want containerd only, then the services", got)
 	}
 	wantContains(t, "cluster update's output", r.stdout,

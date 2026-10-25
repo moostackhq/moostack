@@ -10,7 +10,6 @@ import (
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/nodeclient"
-	"github.com/moostackhq/moostack/internal/release"
 )
 
 // A machine that sleeps stops the monotonic clock but not the wall
@@ -196,8 +195,7 @@ func (r *lateAgent) RenewLock(context.Context, string, time.Duration) (*nodeclie
 // an update that succeeded isn't taken for one whose agent doesn't
 // answer.
 func TestTheRenewalAfterALateAgentUpdateHasItsOwnTime(t *testing.T) {
-	defer func(d time.Duration) { updateTimeout = d }(updateTimeout)
-	updateTimeout = 500 * time.Millisecond
+	defer SetUpdateTimeout(500 * time.Millisecond)()
 	var l leased
 	l.granted(time.Now(), time.Minute)
 	node := &lateAgent{took: 450 * time.Millisecond, restarting: 300 * time.Millisecond}
@@ -221,29 +219,30 @@ func TestTheRenewalAfterALateAgentUpdateHasItsOwnTime(t *testing.T) {
 // and onRun, if set, run as an image is imported and a service is run.
 type serviceRecorder struct {
 	stepRecorder
-	services        []*nodev1.Component
+	containers      []*nodev1.ContainerStatus
 	onImport, onRun func()
 }
 
 func (r *serviceRecorder) Status(context.Context) nodeclient.Status {
-	var containers []*nodev1.ContainerStatus
-	for _, c := range r.services {
-		containers = append(containers, &nodev1.ContainerStatus{Name: c.Name, Image: release.ImageRef(c.Name, c.Version), Health: c.Health})
-	}
-	return nodeclient.Status{Containers: containers}
+	return nodeclient.Status{Containers: r.containers}
 }
 
-func (r *serviceRecorder) ImportImage(_ context.Context, archive []byte) ([]string, error) {
+func (r *serviceRecorder) ImportImage(_ context.Context, archive []byte, _ string) ([]string, error) {
 	if r.onImport != nil {
 		r.onImport()
 	}
 	return []string{string(archive)}, nil
 }
 
+func (r *serviceRecorder) Remove(_ context.Context, name, _ string) error {
+	r.steps = append(r.steps, "remove "+name)
+	r.containers = slices.DeleteFunc(r.containers, func(c *nodev1.ContainerStatus) bool { return c.Name == name })
+	return nil
+}
+
 func (r *serviceRecorder) Run(_ context.Context, c *nodev1.Container, _ string) error {
 	r.steps = append(r.steps, c.Name)
-	version, _ := release.ServiceVersion(c.Name, c.Image)
-	r.services = append(r.services, &nodev1.Component{Name: c.Name, Version: version, Health: nodev1.Health_HEALTH_HEALTHY})
+	r.containers = append(r.containers, &nodev1.ContainerStatus{Name: c.Name, Image: c.Image, Health: nodev1.Health_HEALTH_HEALTHY})
 	if r.onRun != nil {
 		r.onRun()
 	}
@@ -267,15 +266,15 @@ func TestUpdateRunsNoNextServiceOnceTheLeaseRanOutWhileTheMachineSlept(t *testin
 	}
 	releaseOf := func(string) (NodeRelease, error) {
 		return NodeRelease{Services: []Service{
-			{Name: "dns", Version: "2.0.0", Image: "moostack.local/dns:2.0.0", Archive: []byte("moostack.local/dns:2.0.0")},
-			{Name: "proxy", Version: "2.0.0", Image: "moostack.local/proxy:2.0.0", Archive: []byte("moostack.local/proxy:2.0.0")},
+			{Name: "dns", Version: "2.0.0", Container: &nodev1.Container{Name: "service-dns", Image: "moostack.local/dns:2.0.0"}, Archive: []byte("moostack.local/dns:2.0.0")},
+			{Name: "proxy", Version: "2.0.0", Container: &nodev1.Container{Name: "service-proxy", Image: "moostack.local/proxy:2.0.0"}, Archive: []byte("moostack.local/proxy:2.0.0")},
 		}}, nil
 	}
 	err := c.updateServices(context.Background(), n, must(releaseOf("node1")), func(Step) {})
 	if !errors.Is(err, ErrLockLost) {
 		t.Errorf("updateServices says %v, want ErrLockLost", err)
 	}
-	if want := []string{"dns"}; !slices.Equal(node.steps, want) {
+	if want := []string{"service-dns"}; !slices.Equal(node.steps, want) {
 		t.Errorf("node1 ran the services %v, want %v", node.steps, want)
 	}
 }
@@ -297,7 +296,7 @@ func TestUpdateRunsNoServiceOnceTheLeaseRanOutWhileItsImageImported(t *testing.T
 		c.mu.Unlock()
 	}
 	releaseOf := func(string) (NodeRelease, error) {
-		return NodeRelease{Services: []Service{{Name: "dns", Version: "2.0.0", Image: "moostack.local/dns:2.0.0", Archive: []byte("moostack.local/dns:2.0.0")}}}, nil
+		return NodeRelease{Services: []Service{{Name: "dns", Version: "2.0.0", Container: &nodev1.Container{Name: "service-dns", Image: "moostack.local/dns:2.0.0"}, Archive: []byte("moostack.local/dns:2.0.0")}}}, nil
 	}
 	err := c.updateServices(context.Background(), n, must(releaseOf("node1")), func(Step) {})
 	if !errors.Is(err, ErrLockLost) {
@@ -378,4 +377,29 @@ func must(rel NodeRelease, err error) NodeRelease {
 		panic(err)
 	}
 	return rel
+}
+
+// Asleep while a service's image imports, Update must not remove the
+// container the service replaces once the lease may have run out.
+func TestUpdateRemovesNoOldContainerOnceTheLeaseRanOutWhileItsImageImported(t *testing.T) {
+	var l leased
+	l.granted(time.Now(), time.Minute)
+	node := &serviceRecorder{stepRecorder: stepRecorder{lease: "ours"}, containers: []*nodev1.ContainerStatus{{Name: "dns", Image: "moostack.local/dns:1.0.0"}}}
+	n := &namedConn{name: "node1", conn: node, lease: l}
+	c := &Cluster{conns: []*namedConn{n}, ttl: time.Minute, lease: nodeclient.Lock{Lease: "ours"}, serviceTimeout: time.Second, reachTimeout: time.Second}
+	c.ctx, c.cancel = context.WithCancelCause(context.Background())
+	c.held, c.endHeld = context.WithCancelCause(context.Background())
+	node.onImport = func() {
+		c.mu.Lock()
+		n.lease.expiresWall = time.Now().Add(-time.Second)
+		c.mu.Unlock()
+	}
+	rel := NodeRelease{Services: []Service{{Name: "dns", Version: "2.0.0", Container: &nodev1.Container{Name: "service-dns", Image: "moostack.local/dns:2.0.0"}, Archive: []byte("moostack.local/dns:2.0.0"), Replaces: "dns", ReplacesImages: "moostack.local/dns:"}}}
+	err := c.updateServices(context.Background(), n, rel, func(Step) {})
+	if !errors.Is(err, ErrLockLost) {
+		t.Errorf("updateServices says %v, want ErrLockLost", err)
+	}
+	if len(node.steps) > 0 {
+		t.Errorf("node1 had %v, want nothing", node.steps)
+	}
 }

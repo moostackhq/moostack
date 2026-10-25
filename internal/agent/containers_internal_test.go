@@ -188,7 +188,7 @@ func TestARunThatCantReadTheReplacedImageChangesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := takeOver(t, n, "app-web", "example.test/app:1", client)
-	if _, err := s.Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/app:2", Rebuild: 2}.Archive(t))); err != nil {
+	if _, err := s.Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/app:2", Rebuild: 2}.Archive(t)), unfenced); err != nil {
 		t.Fatal(err)
 	}
 	fail = true
@@ -230,7 +230,7 @@ func TestARunWhoseImageFailsToUnpackLeavesTheOldContainerRunning(t *testing.T) {
 	fail := true
 	s := takeOver(t, n, "app-web", "example.test/app:1", failing(t, n, "/containerd.services.diff.v1.Diff/Apply", &fail))
 	// Imported once app:1 runs, whose run deletes the other tags.
-	if _, err := s.Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/app:2", Rebuild: 2}.Archive(t))); err != nil {
+	if _, err := s.Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/app:2", Rebuild: 2}.Archive(t)), unfenced); err != nil {
 		t.Fatal(err)
 	}
 	err := s.Run(t.Context(), &container{Name: "app-web", Image: "example.test/app:2"}, unfenced)
@@ -280,7 +280,7 @@ func TestAnImageImportedAgainIsKept(t *testing.T) {
 	if !hasImageIn(t, n, "example.test/app:1") {
 		t.Fatal("app-web's image went while images can't be deleted")
 	}
-	if _, err := s.Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/app:1"}.Archive(t))); err != nil {
+	if _, err := s.Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/app:1"}.Archive(t)), unfenced); err != nil {
 		t.Fatal(err)
 	}
 	fail = false
@@ -363,7 +363,7 @@ func TestAnImportWaitsForAChangeUnderWay(t *testing.T) {
 	}
 	imported := make(chan error, 1)
 	go func() {
-		_, err := s.Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/app:2"}.Archive(t)))
+		_, err := s.Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/app:2"}.Archive(t)), unfenced)
 		imported <- err
 	}()
 	select {
@@ -401,7 +401,7 @@ func TestTheOldContainerStartsAgainWhateverKeepsTheNewOneFromBeingMade(t *testin
 			n.Import(t, nodetest.Image{Name: "example.test/app:1"})
 			fail := false
 			s := takeOver(t, n, "app-web", "example.test/app:1", failing(t, n, c.method, &fail))
-			if _, err := s.Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/app:2", Rebuild: 2}.Archive(t))); err != nil {
+			if _, err := s.Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/app:2", Rebuild: 2}.Archive(t)), unfenced); err != nil {
 				t.Fatal(err)
 			}
 			ctx := namespaced(t.Context())
@@ -556,7 +556,7 @@ func TestAnImportHoldsWhatItWritesInItsOwnLeaseWhateverLeaseItsCallNames(t *test
 		return invoker(ctx, method, req, reply, cc, opts...)
 	})
 	ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("containerd-lease", "none"))
-	if _, err := s.Import(ctx, bytes.NewReader(nodetest.ImageArchive(t, "dns"))); err != nil {
+	if _, err := s.Import(ctx, bytes.NewReader(nodetest.ImageArchive(t, "dns")), unfenced); err != nil {
 		t.Errorf("importing dns with a call that names the lease none: %v", err)
 	}
 }
@@ -602,7 +602,7 @@ func TestAnImportThatFailsLeavesNothing(t *testing.T) {
 				}
 				return invoker(ctx, method, req, reply, cc, opts...)
 			})
-			if _, err := s.Import(t.Context(), bytes.NewReader(archive)); err == nil || !made {
+			if _, err := s.Import(t.Context(), bytes.NewReader(archive), unfenced); err == nil || !made {
 				t.Fatalf("the import with its images failing to be made: %v (tried: %v), want it failed", err, made)
 			}
 		},
@@ -614,7 +614,7 @@ func TestAnImportThatFailsLeavesNothing(t *testing.T) {
 				cancel()
 				return 0, io.ErrUnexpectedEOF
 			}))
-			if _, err := s.Import(ctx, r); err == nil {
+			if _, err := s.Import(ctx, r, unfenced); err == nil {
 				t.Fatal("the import cut off succeeded")
 			}
 		},

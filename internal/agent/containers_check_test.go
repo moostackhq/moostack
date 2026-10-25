@@ -38,7 +38,7 @@ func TestRunAcceptsEachKindOfValidContainer(t *testing.T) {
 		"an API of 255":             func(c *nodev1.Container) { c.Api = "a" + strings.Repeat(".b", 127) },
 		"the highest uid and gid":   func(c *nodev1.Container) { u := "2147483647:2147483647"; c.User = &u },
 		"a uid of ten digits":       func(c *nodev1.Container) { u := "0000000001:0000000001"; c.User = &u },
-		"every capability":          func(c *nodev1.Container) { c.Capabilities.Names = slices.Clone(capabilities) },
+		"every capability":          func(c *nodev1.Container) { c.Capabilities.Names = slices.Clone(nodev1.LinuxCapabilities) },
 		"capabilities out of order": func(c *nodev1.Container) { c.Capabilities.Names = []string{"CAP_KILL", "CAP_CHOWN"} },
 	} {
 		c := valid()

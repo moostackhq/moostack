@@ -464,30 +464,64 @@ func (s *agentServer) runcStatus(ctx context.Context) *nodev1.Component {
 }
 
 func (s *agentServer) ImportImage(stream nodev1.Agent_ImportImageServer) error {
-	r, w := io.Pipe()
-	go func() {
-		for {
-			req, err := stream.Recv()
-			if err == io.EOF {
-				w.Close()
-				return
-			}
-			if err != nil {
-				w.CloseWithError(err)
-				return
-			}
-			if _, err := w.Write(req.Chunk); err != nil {
-				return
-			}
-		}
-	}()
-	images, err := s.containers.Import(stream.Context(), r)
-	// An import that stopped early leaves the rest of the stream unread.
-	r.CloseWithError(errors.New("the import ended"))
+	// The first request carries the lease; a stream without one has none.
+	first, err := stream.Recv()
+	if err != nil && err != io.EOF {
+		return err
+	}
+	fence := s.fence(first.GetLease())
+	// Refused at once, the archive isn't read.
+	if err := fence(); err != nil {
+		return err
+	}
+	// The archive is read whole before the import waits for its turn, so
+	// that a client that stalls holds up no change of the containers.
+	archive, err := spool(filepath.Dir(s.containers.file), first, stream)
+	if err != nil {
+		return err
+	}
+	defer archive.Close()
+	var refused error
+	images, err := s.containers.Import(stream.Context(), archive, func() error { refused = fence(); return refused })
+	if refused != nil {
+		return refused
+	}
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "importing the image: %v", err)
 	}
 	return stream.SendAndClose(&nodev1.ImportImageResponse{Images: images})
+}
+
+// spool writes the chunks of first and of the rest of stream to a file
+// in dir, which no other process can open, since it is unlinked at once,
+// so that nothing is left of it once it is closed or the agent stops.
+// It returns the file, read from its start.
+func spool(dir string, first *nodev1.ImportImageRequest, stream nodev1.Agent_ImportImageServer) (*os.File, error) {
+	f, err := os.CreateTemp(dir, ".import-")
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "keeping the image's archive: %v", err)
+	}
+	if err := os.Remove(f.Name()); err != nil {
+		f.Close()
+		return nil, status.Errorf(codes.Internal, "keeping the image's archive: %v", err)
+	}
+	for req := first; req != nil; {
+		if _, err := f.Write(req.Chunk); err != nil {
+			f.Close()
+			return nil, status.Errorf(codes.Internal, "keeping the image's archive: %v", err)
+		}
+		if req, err = stream.Recv(); err == io.EOF {
+			break
+		} else if err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		return nil, status.Errorf(codes.Internal, "keeping the image's archive: %v", err)
+	}
+	return f, nil
 }
 
 func (s *agentServer) Run(ctx context.Context, req *nodev1.RunRequest) (*nodev1.RunResponse, error) {

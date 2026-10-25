@@ -201,25 +201,18 @@ func (n *Node) Status(ctx context.Context) Status {
 	return s
 }
 
-// ServiceContainer is the container that the cluster service called
-// name runs as, from image, serving api: as nobody, with a read-only
-// root and no capabilities.
-func ServiceContainer(name, api, image string) *nodev1.Container {
-	user := strconv.Itoa(hostlayout.ServiceUser) + ":" + strconv.Itoa(hostlayout.ServiceUser)
-	return &nodev1.Container{Name: name, Image: image, User: &user, ReadOnlyRoot: true, Capabilities: &nodev1.Capabilities{}, Api: api}
-}
-
 // Services are the cluster services among the node's containers, as
-// release.MayBeService tells them, each as a component at the version of
-// its image, as healthy as its API: one whose image the node can't tell
-// at a version unknown.
+// release.MayBeService tells them, each as a component named for its
+// service, at the version of its image, as healthy as its API: one whose
+// image the node can't tell at a version unknown.
 func (s Status) Services() []*nodev1.Component {
 	var services []*nodev1.Component
 	for _, c := range s.Containers {
 		if release.MayBeService(c.Name, c.Image) {
+			name, _ := release.ServiceName(c.Name)
 			// One whose image the node can't tell has no version.
 			version, _ := release.ServiceVersion(c.Name, c.Image)
-			services = append(services, &nodev1.Component{Name: c.Name, Version: version, Build: c.Digest, Health: c.Health, Problem: c.Problem})
+			services = append(services, &nodev1.Component{Name: name, Version: version, Build: c.Digest, Health: c.Health, Problem: c.Problem})
 		}
 	}
 	return services
@@ -357,19 +350,27 @@ func HealthName(h nodev1.Health) string {
 const importChunk = 1 << 20
 
 // ImportImage has agent import the OCI image layout archive data into
-// the node's containerd, and returns the names of the images imported.
-func ImportImage(ctx context.Context, agent nodev1.AgentClient, data []byte) ([]string, error) {
+// the node's containerd, for the operation whose lease holds the node's
+// operation lock, and returns the names of the images imported.
+func ImportImage(ctx context.Context, agent nodev1.AgentClient, data []byte, lease string) ([]string, error) {
 	stream, err := agent.ImportImage(ctx)
 	if err != nil {
 		return nil, err
 	}
-	for len(data) > 0 {
+	// The first request carries the lease, even for an empty archive.
+	req := &nodev1.ImportImageRequest{Lease: lease}
+	for {
 		n := min(len(data), importChunk)
-		if err := stream.Send(&nodev1.ImportImageRequest{Chunk: data[:n]}); err != nil {
+		req.Chunk = data[:n]
+		if err := stream.Send(req); err != nil {
 			// The agent ended the call; CloseAndRecv says why.
 			break
 		}
 		data = data[n:]
+		if len(data) == 0 {
+			break
+		}
+		req = &nodev1.ImportImageRequest{}
 	}
 	res, err := stream.CloseAndRecv()
 	if err != nil {
@@ -383,9 +384,17 @@ func ImportImage(ctx context.Context, agent nodev1.AgentClient, data []byte) ([]
 }
 
 // ImportImage has the agent import the OCI image layout archive into
-// the node's containerd, and returns the names of the images imported.
-func (n *Node) ImportImage(ctx context.Context, archive []byte) ([]string, error) {
-	return ImportImage(ctx, n.Agent, archive)
+// the node's containerd, for the operation whose lease holds the node's
+// operation lock, and returns the names of the images imported.
+func (n *Node) ImportImage(ctx context.Context, archive []byte, lease string) ([]string, error) {
+	return ImportImage(ctx, n.Agent, archive, lease)
+}
+
+// Remove has the agent stop and delete the container called name, for
+// the operation whose lease holds the node's operation lock.
+func (n *Node) Remove(ctx context.Context, name, lease string) error {
+	_, err := n.Agent.Remove(ctx, &nodev1.RemoveRequest{Name: name, Lease: lease})
+	return err
 }
 
 // Run has the agent run c from its image, replacing the container of its

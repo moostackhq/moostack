@@ -29,8 +29,8 @@ func pinServices(t *testing.T, source string) {
 			{Name: "containerd", Version: "2.0.0", Files: []string{"containerd"}},
 		},
 		Services: []release.Service{
-			{Name: "registry", Version: "1.0.0", API: "moostack.registry.v1.Registry", Image: "registry.tar"},
-			{Name: "dns", Version: "1.0.0", API: "moostack.dns.v1.DNS", Image: "dns.tar"},
+			{Name: "registry", Version: "1.0.0", API: "moostack.registry.v1.Registry", Image: "registry.tar", Properties: lockedDown},
+			{Name: "dns", Version: "1.0.0", API: "moostack.dns.v1.DNS", Image: "dns.tar", Properties: lockedDown},
 		},
 	})
 	if err != nil {
@@ -73,23 +73,23 @@ Update: refused, so cluster update won't run:
 node1: its dns service runs release 0.9.0, and release 1.0.0 updates nodes on 1.0.0 only
 Pin the release the nodes run, or the one after it, and run the mooctl of that release.
 
-NODE          RUNNING  PINNED  HEALTH
+NODE                  RUNNING  PINNED  HEALTH
 node1  direct
-  agent       1.0.0    1.0.0   healthy
-    registry  1.0.0    1.0.0   healthy
-    dns       0.9.0    1.0.0   unhealthy
-    extra     0.1.0    -       healthy
-  updater     1.0.0    1.0.0   healthy
-  containerd  2.0.0    2.0.0   healthy
+  agent               1.0.0    1.0.0   healthy
+    service-registry  1.0.0    1.0.0   healthy
+    service-dns       0.9.0    1.0.0   unhealthy
+    service-extra     0.1.0    -       healthy
+  updater             1.0.0    1.0.0   healthy
+  containerd          2.0.0    2.0.0   healthy
 node2  mode unknown
-  agent       -        1.0.0   unhealthy
-    registry  -        1.0.0   unknown
-    dns       -        1.0.0   unknown
-  updater     1.0.0    1.0.0   healthy
-  containerd  -        2.0.0   unknown
+  agent               -        1.0.0   unhealthy
+    service-registry  -        1.0.0   unknown
+    service-dns       -        1.0.0   unknown
+  updater             1.0.0    1.0.0   healthy
+  containerd          -        2.0.0   unknown
 node3  unreachable
 
-node1: dns: the service doesn't answer: connection refused
+node1: service-dns: the service doesn't answer: connection refused
 node2: agent: the agent doesn't answer: connection refused
 node3: dial tcp: no route to host
 `
@@ -108,14 +108,14 @@ func TestClusterStatusJSONListsTheContainersApart(t *testing.T) {
 	r := o.mustRun("--release-source", source, "cluster", "status", "--json")
 	wantContains(t, "cluster status --json", r.stdout, `      "containers": [
         {
-          "name": "registry",
+          "name": "service-registry",
           "running": "1.0.0",
           "pinned": "1.0.0",
           "image": "moostack.local/registry:1.0.0",
           "health": "healthy"
         },
         {
-          "name": "dns",
+          "name": "service-dns",
           "pinned": "1.0.0",
           "health": "unknown"
         }
@@ -146,21 +146,21 @@ func TestClusterStatusTreeKeepsItsShapeWhateverTheNodesReport(t *testing.T) {
 	}
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	_, tree, _ := strings.Cut(r.stdout, "\nNODE")
-	want := `          RUNNING                        PINNED  HEALTH
+	want := `                  RUNNING                        PINNED  HEALTH
 node1  control plane
-  agent       1.0.0                          1.0.0   healthy
-    registry  1.0.0                          1.0.0   healthy
-    dns       1.0.0                          1.0.0   unhealthy
-  updater     1.0.0                          1.0.0   unhealthy
-  containerd  2.0.0                          2.0.0   healthy
+  agent               1.0.0                          1.0.0   healthy
+    service-registry  1.0.0                          1.0.0   healthy
+    service-dns       1.0.0                          1.0.0   unhealthy
+  updater             1.0.0                          1.0.0   unhealthy
+  containerd          2.0.0                          2.0.0   healthy
 node2  direct
-  agent       1.0.0                          1.0.0   healthy
-    registry  1.0.0-ünïcödé-ünïcödé-ünïcödé  1.0.0   healthy
-    dns       "1.0.0\nnode9  unreachable"    1.0.0   healthy
-  updater     1.0.0                          1.0.0   healthy
-  containerd  2.0.0                          2.0.0   healthy
+  agent               1.0.0                          1.0.0   healthy
+    service-registry  1.0.0-ünïcödé-ünïcödé-ünïcödé  1.0.0   healthy
+    service-dns       "1.0.0\nnode9  unreachable"    1.0.0   healthy
+  updater             1.0.0                          1.0.0   healthy
+  containerd          2.0.0                          2.0.0   healthy
 
-node1: dns: the service doesn't answer
+node1: service-dns: the service doesn't answer
 node1: updater: it is stuck
 `
 	if tree != want {
@@ -182,10 +182,10 @@ func TestClusterStatusPutsServicesWithoutAnAgentAtTheComponentsLevel(t *testing.
 	s.Close()
 	r := o.mustRun("--release-source", s.URL, "cluster", "status")
 	wantContains(t, "cluster status", r.stdout, `
-NODE        RUNNING  PINNED  HEALTH
+NODE                RUNNING  PINNED  HEALTH
 node1  direct
-  updater   1.0.0    -       healthy
-  registry  1.0.0    -       healthy
+  updater           1.0.0    -       healthy
+  service-registry  1.0.0    -       healthy
 `)
 }
 
@@ -204,7 +204,7 @@ func TestClusterStatusQuotesWhatNodesReportInItsProblems(t *testing.T) {
 	}
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	_, problems, _ := strings.Cut(r.stdout, "\n\nnode1: ")
-	want := `"extra\nnode9  unreachable": "stuck\x1b[2A"
+	want := `"service-extra\nnode9  unreachable": "stuck\x1b[2A"
 node2: "it can't tell the generation it has applied: the file is bad\nnode9: connecting to root@node9.invalid: connection refused"
 node3: "dial tcp: banner\r\nnode9: forged"
 `

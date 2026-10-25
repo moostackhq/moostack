@@ -423,15 +423,15 @@ func startServices(ctx context.Context, node *nodeclient.Node, h Host, rel *rele
 		if err != nil {
 			return err
 		}
-		ref := release.ImageRef(s.Name, s.Version)
-		images, err := nodeclient.ImportImage(ctx, node.Agent, data)
+		c := s.Container()
+		images, err := nodeclient.ImportImage(ctx, node.Agent, data, lease)
 		if err != nil {
 			return fmt.Errorf("seeding %s's image: %w", s.Name, err)
 		}
-		if !slices.Contains(images, ref) {
-			return fmt.Errorf("seeding %s's image imported %s, not %s", s.Name, strings.Join(images, ", "), ref)
+		if !slices.Contains(images, c.Image) {
+			return fmt.Errorf("seeding %s's image imported %s, not %s", s.Name, strings.Join(images, ", "), c.Image)
 		}
-		if err := node.Run(ctx, nodeclient.ServiceContainer(s.Name, s.API, ref), lease); err != nil {
+		if err := node.Run(ctx, c, lease); err != nil {
 			return fmt.Errorf("starting %s: %w", s.Name, err)
 		}
 	}

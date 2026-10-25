@@ -147,21 +147,29 @@ func FuzzPrintable(f *testing.F) {
 	})
 }
 
-// The cluster services are the containers that run the release's image
-// of the service of their name, at the version of that image, as healthy
-// as the container's API; no other container is one.
+// The cluster services are the containers named for a service that run
+// the release's image of that service, each named for its service, at
+// the version of that image, as healthy as the container's API, and
+// those so named whose image the node can't tell, at no version; no
+// other container is one: not one under the service's name alone, as
+// releases before the service- names ran it.
 func TestStatusTellsTheClusterServicesAmongTheContainers(t *testing.T) {
 	n := &nodeclient.Node{
 		Agent: statusOf{agent: &nodev1.StatusResponse{Containers: []*nodev1.ContainerStatus{
-			{Name: "dns", Image: "moostack.local/dns:1.2.0", Digest: "sha256:dns", Health: nodev1.Health_HEALTH_UNHEALTHY, Problem: "it is stuck"},
-			{Name: "proxy", Image: "moostack.local/dns:1.2.0"},
-			{Name: "registry", Image: "moostack.local/registry:"},
+			{Name: "service-dns", Image: "moostack.local/dns:1.2.0", Digest: "sha256:dns", Health: nodev1.Health_HEALTH_UNHEALTHY, Problem: "it is stuck"},
+			{Name: "service-proxy", Image: "moostack.local/dns:1.2.0"},
+			{Name: "service-registry", Image: "moostack.local/registry:"},
+			{Name: "service-telemetry", Problem: "its image can't be read"},
+			{Name: "dns", Image: "moostack.local/dns:1.1.0"},
 			{Name: "app-web", Image: "docker.io/library/nginx:1.27"},
 		}}},
 		Updater: updaterStatusOf{res: &nodev1.UpdaterStatusResponse{Updater: &nodev1.Component{Name: "updater"}}},
 	}
 	got := n.Status(t.Context()).Services()
-	want := []*nodev1.Component{{Name: "dns", Version: "1.2.0", Build: "sha256:dns", Health: nodev1.Health_HEALTH_UNHEALTHY, Problem: "it is stuck"}}
+	want := []*nodev1.Component{
+		{Name: "dns", Version: "1.2.0", Build: "sha256:dns", Health: nodev1.Health_HEALTH_UNHEALTHY, Problem: "it is stuck"},
+		{Name: "telemetry", Problem: "its image can't be read"},
+	}
 	if !slices.EqualFunc(got, want, func(a, b *nodev1.Component) bool { return proto.Equal(a, b) }) {
 		t.Errorf("Status says the services are %v, want %v", got, want)
 	}

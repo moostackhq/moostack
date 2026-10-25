@@ -43,7 +43,9 @@ service Agent {
   // ImportImage imports an image into the node's containerd, from an OCI
   // image layout archive that the requests carry in chunks, in order. It
   // answers with the names of the images it imported. Importing an image
-  // the node has changes nothing.
+  // the node has changes nothing. It is refused with FAILED_PRECONDITION,
+  // importing nothing, unless the first request's lease holds the
+  // operation lock.
   rpc ImportImage(stream ImportImageRequest) returns (ImportImageResponse);
   // Run runs a container from its image, which the node must have, and
   // keeps it running across restarts of the agent, of containerd and of
@@ -253,6 +255,9 @@ message BreakLockResponse {
 message ImportImageRequest {
   // Chunk is the archive's next bytes.
   bytes chunk = 1;
+  // Lease is the operation's lease, which must hold the operation lock,
+  // in the first request; the agent reads it from no other.
+  string lease = 2;
 }
 
 message ImportImageResponse {

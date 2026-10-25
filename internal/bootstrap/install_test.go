@@ -17,7 +17,7 @@ func TestInstallRefusesAReleaseWithoutTheClusterServicesBeforeReachingTheHost(t 
 	var services []release.Service
 	for _, s := range release.ClusterServices {
 		if s.Name != "telemetry" {
-			services = append(services, release.Service{Name: s.Name, Version: "1.0.0", API: s.API, Image: s.Name + ".tar"})
+			services = append(services, release.Service{Name: s.Name, Version: "1.0.0", API: s.API, Image: s.Name + ".tar", Properties: s.Properties})
 		}
 	}
 	for _, arch := range release.Architectures {

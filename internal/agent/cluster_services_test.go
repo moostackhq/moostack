@@ -26,7 +26,6 @@ import (
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	servicev1 "github.com/moostackhq/moostack/api/service/v1"
 	"github.com/moostackhq/moostack/internal/hostlayout"
-	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/nodetest"
 	"github.com/moostackhq/moostack/internal/release"
 )
@@ -580,7 +579,7 @@ func TestAServicesOutputGoesToItsLog(t *testing.T) {
 	}
 	want := "serving " + nodetest.Fixture().Api + "\n"
 	nodetest.Eventually(t, 10*time.Second, func() error {
-		log, err := n.Output("root", "cat", hostlayout.ContainerLogDir+"/dns.log")
+		log, err := n.Output("root", "cat", hostlayout.ContainerLogDir+"/"+nodetest.Fixture().Name+".log")
 		if err != nil {
 			return err
 		}
@@ -645,7 +644,7 @@ func TestOnlyRootReachesAServicesSocket(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
 	n.StartServices(t)
-	socket := hostlayout.ContainersDir + "/dns/" + servicev1.APISocket
+	socket := hostlayout.ContainersDir + "/" + release.ContainerName("dns") + "/" + servicev1.APISocket
 	if out, err := n.Output("root", "test", "-S", socket); err != nil {
 		t.Fatalf("the service's socket isn't at %s: %v %s", socket, err, out)
 	}
@@ -888,18 +887,26 @@ func TestARunThatGoesOnKeepsTheImageTheNextUpdateImports(t *testing.T) {
 	}
 }
 
+// lockedDown is the container called name, from image, serving api, run
+// as a cluster service runs: as nobody, with a read-only root and no
+// capabilities.
+func lockedDown(name, api, image string) *nodev1.Container {
+	nobody := "65534:65534"
+	return &nodev1.Container{Name: name, Image: image, User: &nobody, ReadOnlyRoot: true, Capabilities: &nodev1.Capabilities{}, Api: api}
+}
+
 // A service's run keeps the images of its repository that another service
 // runs, and those of another repository whose name starts as its does.
 func TestRunningAServiceKeepsTheImagesOtherServicesRun(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
 	n.StartServices(t)
-	shared := nodeclient.ServiceContainer("dnsb", otherAPI, release.ImageRef("dns", "shared"))
+	shared := lockedDown("dnsb", otherAPI, release.ImageRef("dns", "shared"))
 	n.Import(t, nodetest.ImageOf(shared))
 	if _, err := runService(t.Context(), t, n, shared); err != nil {
 		t.Fatal(err)
 	}
-	prefixed := nodeclient.ServiceContainer("dnsx", "moostack.dnsx.v1.DNSX", "moostack.local/dnsx:1")
+	prefixed := lockedDown("dnsx", "moostack.dnsx.v1.DNSX", "moostack.local/dnsx:1")
 	n.Import(t, nodetest.ImageOf(prefixed))
 	n.ImportFixtures(t)
 	if _, err := runService(t.Context(), t, n, nodetest.Fixture()); err != nil {

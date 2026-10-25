@@ -11,18 +11,13 @@ import (
 	"io"
 	"io/fs"
 	"maps"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/containerd/containerd/api/types/runc/options"
@@ -78,57 +73,6 @@ const (
 	leaseExpiry         = 24 * time.Hour
 	leaseReleaseTimeout = 10 * time.Second
 )
-
-// containerName is what a container may be called: its name names its
-// containerd container, snapshot, socket directory and log, and
-// containerd takes no hyphen at its end or next to another. Its length
-// is checked apart.
-var containerName = regexp.MustCompile(`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`)
-
-// validName is whether name may name a container: at most 63 bytes, of
-// containerName's form.
-func validName(name string) bool {
-	return len(name) <= 63 && containerName.MatchString(name)
-}
-
-// invalidName is the refusal of name, which validName refuses.
-func invalidName(name string) error {
-	return status.Errorf(codes.InvalidArgument, "a container's name is of lowercase letters, digits and single hyphens between them, starting with a letter, at most 63, not %q", name)
-}
-
-// apiName is the form of an API's name, as gRPC names a service.
-var apiName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$`)
-
-// The bounds of a container's image and API names.
-const (
-	maxImage = 1024
-	maxAPI   = 255
-)
-
-// capabilities are the capabilities Linux has, by the names runc takes,
-// which drops a name it doesn't know.
-var capabilities = []string{
-	"CAP_AUDIT_CONTROL", "CAP_AUDIT_READ", "CAP_AUDIT_WRITE", "CAP_BLOCK_SUSPEND", "CAP_BPF",
-	"CAP_CHECKPOINT_RESTORE", "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER",
-	"CAP_FSETID", "CAP_IPC_LOCK", "CAP_IPC_OWNER", "CAP_KILL", "CAP_LEASE",
-	"CAP_LINUX_IMMUTABLE", "CAP_MAC_ADMIN", "CAP_MAC_OVERRIDE", "CAP_MKNOD", "CAP_NET_ADMIN",
-	"CAP_NET_BIND_SERVICE", "CAP_NET_BROADCAST", "CAP_NET_RAW", "CAP_PERFMON", "CAP_SETFCAP",
-	"CAP_SETGID", "CAP_SETPCAP", "CAP_SETUID", "CAP_SYSLOG", "CAP_SYS_ADMIN",
-	"CAP_SYS_BOOT", "CAP_SYS_CHROOT", "CAP_SYS_MODULE", "CAP_SYS_NICE", "CAP_SYS_PACCT",
-	"CAP_SYS_PTRACE", "CAP_SYS_RAWIO", "CAP_SYS_RESOURCE", "CAP_SYS_TIME", "CAP_SYS_TTY_CONFIG",
-	"CAP_WAKE_ALARM",
-}
-
-// idPart is whether part of a user is a uid or a gid runc takes: a
-// number of at most 2^31-1. A name would be looked up in the image only
-// once the container it replaces is gone, so Run takes none.
-func idPart(part string) bool {
-	if part == "" || len(part) > 10 || strings.Trim(part, "0123456789") != "" {
-		return false
-	}
-	n, err := strconv.ParseUint(part, 10, 31)
-	return err == nil && n <= math.MaxInt32
-}
 
 // container is a container as the agent runs it, and as the file keeps
 // it: its name, the image it runs and its properties.
@@ -296,10 +240,14 @@ func namespaced(ctx context.Context) context.Context {
 // that goes on after its call ended, so that the run's deletion of the
 // container's other images doesn't take the one imported. An image
 // imported again, as to go back to it, is no longer unused, as its time
-// of update in containerd tells.
-func (s *containers) Import(ctx context.Context, r io.Reader) ([]string, error) {
+// of update in containerd tells. It imports only if fence lets it once
+// no run waits.
+func (s *containers) Import(ctx context.Context, r io.Reader, fence func() error) ([]string, error) {
 	s.running.Lock()
 	defer s.running.Unlock()
+	if err := fence(); err != nil {
+		return nil, err
+	}
 	// A lease holds what the import writes until the images hold it.
 	ctx, _, release, err := s.ownLease(namespaced(ctx))
 	if err != nil {
@@ -317,34 +265,15 @@ func (s *containers) Import(ctx context.Context, r io.Reader) ([]string, error) 
 	return names, nil
 }
 
-// checkContainer fails with INVALID_ARGUMENT unless c can be run: a name
-// of lowercase letters, digits and hyphens, an image's name, a uid and
-// gid if any, capabilities Linux has, each once, and an API as gRPC
-// names one if any, each within its bounds, so that a container that
-// can't be made is refused before the one it would replace goes.
+// checkContainer fails with INVALID_ARGUMENT unless c can be run, as
+// nodev1.CheckContainer says, so that a container that can't be made is
+// refused before the one it would replace goes.
 func checkContainer(c *container) error {
-	switch {
-	case !validName(c.Name):
-		return invalidName(c.Name)
-	case c.Image == "" || len(c.Image) > maxImage || !utf8.ValidString(c.Image) || strings.ContainsFunc(c.Image, func(r rune) bool { return !unicode.IsPrint(r) || unicode.IsSpace(r) }):
-		return status.Errorf(codes.InvalidArgument, "the container %s needs the name of an image, at most %d bytes, not %q", c.Name, maxImage, c.Image)
-	case c.API != "" && (len(c.API) > maxAPI || !apiName.MatchString(c.API)):
-		return status.Errorf(codes.InvalidArgument, "the container %s's API is a gRPC service name, at most %d bytes, not %q", c.Name, maxAPI, c.API)
-	}
-	if c.User != nil {
-		user, group, hasGroup := strings.Cut(*c.User, ":")
-		if !idPart(user) || (hasGroup && !idPart(group)) {
-			return status.Errorf(codes.InvalidArgument, "the container %s's user is a uid, with a gid after a colon, each at most 2147483647, not %q", c.Name, *c.User)
-		}
-	}
+	req := &nodev1.Container{Name: c.Name, Image: c.Image, User: c.User, ReadOnlyRoot: c.ReadOnlyRoot, Api: c.API}
 	if c.Capabilities != nil {
-		for i, name := range *c.Capabilities {
-			if !slices.Contains(capabilities, name) || slices.Contains((*c.Capabilities)[:i], name) {
-				return status.Errorf(codes.InvalidArgument, "the container %s's capabilities are Linux's, such as CAP_NET_BIND_SERVICE, each once, not %q", c.Name, *c.Capabilities)
-			}
-		}
+		req.Capabilities = &nodev1.Capabilities{Names: *c.Capabilities}
 	}
-	return nil
+	return nodev1.CheckContainer(req)
 }
 
 // changeTimeout bounds a run or a removal of a container, which goes on
@@ -1012,8 +941,8 @@ func truncate(path string) error {
 // list without it, so that a crash in between leaves it kept, for a
 // Remove again to finish.
 func (s *containers) Remove(ctx context.Context, name string, fence func() error) error {
-	if !validName(name) {
-		return invalidName(name)
+	if err := nodev1.CheckName(name); err != nil {
+		return err
 	}
 	return s.change(ctx, fence, func(ctx context.Context) error {
 		if c := s.stored(name); c != nil {

@@ -79,8 +79,8 @@ func TestARerunOfClusterUpdateGoesOnFromTheStepThatFailed(t *testing.T) {
 	r = o.mustRun("--release-source", source, "cluster", "update")
 	for name, want := range map[string][]string{
 		"node1": nil,
-		"node2": {"service dns 1.1.0 moostack.local/dns:1.1.0", "service proxy 1.1.0 moostack.local/proxy:1.1.0"},
-		"node3": {"service dns 1.1.0 moostack.local/dns:1.1.0", "service proxy 1.1.0 moostack.local/proxy:1.1.0"},
+		"node2": {"run service-dns 1.1.0 moostack.local/dns:1.1.0", "run service-proxy 1.1.0 moostack.local/proxy:1.1.0"},
+		"node3": {"run service-dns 1.1.0 moostack.local/dns:1.1.0", "run service-proxy 1.1.0 moostack.local/proxy:1.1.0"},
 	} {
 		if got := o.nodes[name].nodeUpdates()[before[name]:]; !slices.Equal(got, want) {
 			t.Errorf("the rerun updated %s to %v, want %v", name, got, want)
@@ -199,7 +199,7 @@ func unknownService(n *fakeNode, name string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, c := range n.status.Containers {
-		if c.Name == name {
+		if c.Name == release.ContainerName(name) {
 			c.Image, c.Digest, c.State = "", "", nodev1.TaskState_TASK_STATE_UNSPECIFIED
 			c.Health, c.Problem = nodev1.Health_HEALTH_UNHEALTHY, "reading its container: connection refused"
 		}
@@ -661,9 +661,9 @@ func TestAnotherBuildOfAPinnedServiceIsReplacedAndStatusSaysSo(t *testing.T) {
 	n.setService(&nodev1.Component{Name: "dns", Version: "1.1.0", Build: "sha256:another", Health: nodev1.Health_HEALTH_HEALTHY})
 	n.mu.Unlock()
 	r := o.mustRun("--release-source", source, "cluster", "status")
-	wantContains(t, "cluster status", r.stdout, "Update: stopped partway", "node3: dns: it runs another build of 1.1.0 than the release pins")
+	wantContains(t, "cluster status", r.stdout, "Update: stopped partway", "node3: service-dns: it runs another build of 1.1.0 than the release pins")
 	o.mustRun("--release-source", source, "cluster", "update")
-	if got := updatedTo(n); !slices.Contains(got, "service dns 1.1.0") {
+	if got := updatedTo(n); !slices.Contains(got, "run service-dns 1.1.0") {
 		t.Errorf("node3 was updated to %q, want dns run again at 1.1.0's build", got)
 	}
 }

@@ -207,7 +207,7 @@ func start(t *testing.T, peer *TunnelPeer) *Node {
 				t.Logf("%s's log:\n%s", p.name, log)
 			}
 			for _, s := range release.ClusterServices {
-				log, _ := exec.Command("docker", "exec", n.Name, "cat", hostlayout.ContainerLogDir+"/"+s.Name+".log").CombinedOutput()
+				log, _ := exec.Command("docker", "exec", n.Name, "cat", hostlayout.ContainerLogDir+"/"+release.ContainerName(s.Name)+".log").CombinedOutput()
 				t.Logf("%s's log:\n%s", s.Name, log)
 			}
 		}
@@ -673,9 +673,15 @@ func (n *Node) importImage(t *testing.T, file, want string) {
 // failure.
 func (n *Node) importArchive(t *testing.T, what string, data []byte, want string) {
 	t.Helper()
+	// The import holds the lock for Lease, as a run does, and lets go of
+	// it after, unless Lease held it already.
+	if !n.holdsLock(t) {
+		n.HoldLock(t)
+		defer n.releaseLock(t)
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	images, err := nodeclient.ImportImage(ctx, n.Agent, data)
+	images, err := nodeclient.ImportImage(ctx, n.Agent, data, Lease)
 	if err != nil {
 		t.Fatalf("importing %s: %v", what, err)
 	}
@@ -687,16 +693,18 @@ func (n *Node) importArchive(t *testing.T, what string, data []byte, want string
 // Fixture is the dns service as the test program fixtureservice serves
 // it, as Image says.
 func Fixture() *nodev1.Container {
-	return nodeclient.ServiceContainer("dns", Service("dns").Api, release.ImageRef("dns", "fixture"))
+	dns := clusterService("dns")
+	return release.Service{Name: dns.Name, Version: "fixture", API: dns.API, Properties: dns.Properties}.Container()
 }
 
 // Broken is a service whose image has no program, so that it never
 // starts.
 func Broken() *nodev1.Container {
-	return nodeclient.ServiceContainer("broken", "moostack.broken.v1.Broken", release.ImageRef("broken", Version))
+	return release.Service{Name: "broken", Version: Version, API: "moostack.broken.v1.Broken", Properties: clusterService("dns").Properties}.Container()
 }
 
-// Lease is the lease that RunService runs a cluster service for.
+// Lease is the lease that RunService runs a cluster service for, and
+// that the imports hold the operation lock for while they import.
 const Lease = "nodetest"
 
 // HoldLock has the node's operation lock held for Lease, for an hour.
@@ -710,6 +718,28 @@ func (n *Node) HoldLock(t *testing.T) {
 	}
 	if res.Lock.GetLease() != Lease {
 		t.Fatalf("the operation lock is held for %s", res.Lock.GetLease())
+	}
+}
+
+// holdsLock reports whether Lease holds the node's operation lock.
+func (n *Node) holdsLock(t *testing.T) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	res, err := n.Agent.Status(ctx, &nodev1.StatusRequest{})
+	if err != nil {
+		t.Fatalf("asking for the operation lock: %v", err)
+	}
+	return res.Lock.GetLease() == Lease
+}
+
+// releaseLock has the node's operation lock released, if Lease holds it.
+func (n *Node) releaseLock(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+	defer cancel()
+	if _, err := n.Agent.ReleaseLock(ctx, &nodev1.ReleaseLockRequest{Lease: Lease}); err != nil {
+		t.Fatalf("releasing the operation lock: %v", err)
 	}
 }
 
@@ -734,9 +764,16 @@ func Services(status *nodev1.StatusResponse) []*nodev1.Component {
 // Service is the container of the cluster service called name, as the
 // release under test pins it.
 func Service(name string) *nodev1.Container {
+	s := clusterService(name)
+	return release.Service{Name: s.Name, Version: Version, API: s.API, Properties: s.Properties}.Container()
+}
+
+// clusterService is the cluster service called name, of
+// release.ClusterServices.
+func clusterService(name string) release.ClusterService {
 	for _, s := range release.ClusterServices {
 		if s.Name == name {
-			return nodeclient.ServiceContainer(s.Name, s.API, release.ImageRef(s.Name, Version))
+			return s
 		}
 	}
 	panic("nodetest: no cluster service " + name)

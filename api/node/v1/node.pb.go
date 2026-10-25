@@ -980,7 +980,10 @@ func (x *BreakLockResponse) GetBroken() *Lock {
 type ImportImageRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Chunk is the archive's next bytes.
-	Chunk         []byte `protobuf:"bytes,1,opt,name=chunk,proto3" json:"chunk,omitempty"`
+	Chunk []byte `protobuf:"bytes,1,opt,name=chunk,proto3" json:"chunk,omitempty"`
+	// Lease is the operation's lease, which must hold the operation lock,
+	// in the first request; the agent reads it from no other.
+	Lease         string `protobuf:"bytes,2,opt,name=lease,proto3" json:"lease,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1020,6 +1023,13 @@ func (x *ImportImageRequest) GetChunk() []byte {
 		return x.Chunk
 	}
 	return nil
+}
+
+func (x *ImportImageRequest) GetLease() string {
+	if x != nil {
+		return x.Lease
+	}
+	return ""
 }
 
 type ImportImageResponse struct {
@@ -2319,9 +2329,10 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"\x13ReleaseLockResponse\"\x12\n" +
 	"\x10BreakLockRequest\"C\n" +
 	"\x11BreakLockResponse\x12.\n" +
-	"\x06broken\x18\x01 \x01(\v2\x16.moostack.node.v1.LockR\x06broken\"*\n" +
+	"\x06broken\x18\x01 \x01(\v2\x16.moostack.node.v1.LockR\x06broken\"@\n" +
 	"\x12ImportImageRequest\x12\x14\n" +
-	"\x05chunk\x18\x01 \x01(\fR\x05chunk\"-\n" +
+	"\x05chunk\x18\x01 \x01(\fR\x05chunk\x12\x14\n" +
+	"\x05lease\x18\x02 \x01(\tR\x05lease\"-\n" +
 	"\x13ImportImageResponse\x12\x16\n" +
 	"\x06images\x18\x01 \x03(\tR\x06images\"\xd3\x01\n" +
 	"\tContainer\x12\x12\n" +

@@ -3,6 +3,7 @@
 package agent_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"slices"
@@ -22,6 +23,7 @@ import (
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	servicev1 "github.com/moostackhq/moostack/api/service/v1"
 	"github.com/moostackhq/moostack/internal/hostlayout"
+	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/nodetest"
 	"github.com/moostackhq/moostack/internal/release"
 )
@@ -73,6 +75,15 @@ func removeContainer(t *testing.T, n *nodetest.Node, lease, name string) error {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	_, err := n.Agent.Remove(ctx, &nodev1.RemoveRequest{Name: name, Lease: lease})
+	return err
+}
+
+// importImage has n's agent import the image archive data for lease.
+func importImage(t *testing.T, n *nodetest.Node, lease string, data []byte) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	_, err := nodeclient.ImportImage(ctx, n.Agent, data, lease)
 	return err
 }
 
@@ -596,9 +607,10 @@ func TestRemovingAContainerTheNodeDoesntKeepChangesNothing(t *testing.T) {
 	}
 }
 
-// Run and Remove are refused without the lease that holds the operation
-// lock, whatever else holds it, changing nothing.
-func TestRunAndRemoveAreRefusedWithoutTheLeaseThatHoldsTheLock(t *testing.T) {
+// Run, Remove and ImportImage are refused without the lease that holds
+// the operation lock, whatever else holds it, changing nothing: an
+// import imports nothing.
+func TestRunRemoveAndImportAreRefusedWithoutTheLeaseThatHoldsTheLock(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
 	n.Import(t, nodetest.Image{Name: appImage})
@@ -609,7 +621,11 @@ func TestRunAndRemoveAreRefusedWithoutTheLeaseThatHoldsTheLock(t *testing.T) {
 	acquire(t, n, "expired", 100*time.Millisecond)
 	time.Sleep(200 * time.Millisecond)
 	acquire(t, n, "holder", time.Hour)
+	unfenced := nodetest.Image{Name: "example.test/unfenced:1"}.Archive(t)
 	for _, lease := range []string{"", "foreign", "expired"} {
+		if err := importImage(t, n, lease, unfenced); status.Code(err) != codes.FailedPrecondition {
+			t.Errorf("importing an image with the lease %q: %v, want it refused", lease, err)
+		}
 		if err := run(t, n, lease, app("app-web", thirdImage)); status.Code(err) != codes.FailedPrecondition {
 			t.Errorf("replacing app-web with the lease %q: %v, want it refused", lease, err)
 		}
@@ -632,6 +648,27 @@ func TestRunAndRemoveAreRefusedWithoutTheLeaseThatHoldsTheLock(t *testing.T) {
 	}
 	if !hasImage(t, n, thirdImage) || !hasImage(t, n, appImage) {
 		t.Errorf("an image went")
+	}
+	if hasImage(t, n, "example.test/unfenced:1") {
+		t.Errorf("an import refused imported its image")
+	}
+	// An import of no archive at all carries no lease.
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	stream, err := n.Agent.ImportImage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.CloseAndRecv(); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("an import of no requests: %v, want it refused", err)
+	}
+	// The lease that holds the lock imports, its lease in the first
+	// request alone.
+	if err := importImage(t, n, "holder", unfenced); err != nil {
+		t.Errorf("importing an image with the lease that holds the lock: %v", err)
+	}
+	if !hasImage(t, n, "example.test/unfenced:1") {
+		t.Errorf("the import for the lease that holds the lock imported nothing")
 	}
 }
 
@@ -670,7 +707,7 @@ func TestTheAgentStartsTheContainersAgainAfterTheNodeReboots(t *testing.T) {
 	n.EventuallyHealthy(t)
 	eventuallyRunning(t, n, "app-web")
 	for _, s := range release.ClusterServices {
-		if got := eventuallyRunning(t, n, s.Name); got.Health != nodev1.Health_HEALTH_HEALTHY {
+		if got := eventuallyRunning(t, n, release.ContainerName(s.Name)); got.Health != nodev1.Health_HEALTH_HEALTHY {
 			t.Errorf("the agent reports %v after it started again", got)
 		}
 	}
@@ -722,6 +759,10 @@ var allCapabilities = []string{
 	"CAP_WAKE_ALARM",
 }
 
+// shortLease is a lease that runs out while a run from an image of
+// nodetest.Image's Slow unpacks, which takes a second or more.
+const shortLease = 500 * time.Millisecond
+
 // A run waiting for another to end is refused if its lease ran out
 // meanwhile.
 func TestARunWhoseLeaseRunsOutWhileItWaitsIsRefused(t *testing.T) {
@@ -729,7 +770,9 @@ func TestARunWhoseLeaseRunsOutWhileItWaitsIsRefused(t *testing.T) {
 	n.EventuallyHealthy(t)
 	n.Import(t, nodetest.Image{Name: appImage, Slow: true})
 	n.Import(t, nodetest.Image{Name: thirdImage})
-	acquire(t, n, "short", 2*time.Second)
+	// Well short of how long the slow image takes to unpack, a second or
+	// more.
+	acquire(t, n, "short", shortLease)
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 	if _, err := n.Agent.Run(ctx, &nodev1.RunRequest{Container: app("app-web", appImage), Lease: "short"}); status.Code(err) != codes.DeadlineExceeded {
@@ -740,12 +783,37 @@ func TestARunWhoseLeaseRunsOutWhileItWaitsIsRefused(t *testing.T) {
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("running app-api after waiting %s for the slow run: %v, want it refused, its lease run out", time.Since(start), err)
 	}
-	if time.Since(start) < 2*time.Second {
+	if time.Since(start) < shortLease {
 		t.Fatalf("the run waited %s, less than the lease had left: the slow run didn't hold it", time.Since(start))
 	}
 	eventuallyRunning(t, n, "app-web")
 	if got := containerStatus(t, n, "app-api"); got != nil {
 		t.Errorf("the agent reports %v", got)
+	}
+}
+
+// An import waiting for a run to end is refused if its lease ran out
+// meanwhile, importing nothing.
+func TestAnImportWhoseLeaseRunsOutWhileItWaitsIsRefused(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.Import(t, nodetest.Image{Name: appImage, Slow: true})
+	acquire(t, n, "short", shortLease)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := n.Agent.Run(ctx, &nodev1.RunRequest{Container: app("app-web", appImage), Lease: "short"}); status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("running app-web from the slow image within 50ms: %v, want the call to end first", err)
+	}
+	start := time.Now()
+	err := importImage(t, n, "short", nodetest.Image{Name: thirdImage}.Archive(t))
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("importing after waiting %s for the slow run: %v, want it refused, its lease run out", time.Since(start), err)
+	}
+	if time.Since(start) < shortLease {
+		t.Fatalf("the import waited %s, less than the lease had left: the slow run didn't hold it", time.Since(start))
+	}
+	if hasImage(t, n, thirdImage) {
+		t.Errorf("the import refused imported its image")
 	}
 }
 
@@ -985,5 +1053,92 @@ func TestAReplacementThatCantUnpackKeepsTheOldContainerAcrossAReboot(t *testing.
 	n.EventuallyHealthy(t)
 	if got := eventuallyRunning(t, n, "app-web"); got.Image != appImage {
 		t.Errorf("after the reboot, the agent reports %v, want app-web from %s", got, appImage)
+	}
+}
+
+// An import whose client stalls after its first request, as a mooctl
+// frozen or cut off, holds up no change of the containers: once its lease
+// ran out, the operation that holds the lock now runs a container at
+// once.
+func TestAStalledImportHoldsUpNoChange(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.Import(t, nodetest.Image{Name: appImage})
+	acquire(t, n, "stale", time.Second)
+	archive := nodetest.Image{Name: thirdImage}.Archive(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stream, err := n.Agent.ImportImage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(&nodev1.ImportImageRequest{Lease: "stale", Chunk: archive[:512]}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	acquire(t, n, "fresh", time.Hour)
+	runCtx, cancelRun := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancelRun()
+	if _, err := n.Agent.Run(runCtx, &nodev1.RunRequest{Container: app("app-web", appImage), Lease: "fresh"}); err != nil {
+		t.Errorf("the run of the operation that holds the lock now, an import stalled: %v, want it run", err)
+	}
+	cancel()
+	if hasImage(t, n, thirdImage) {
+		t.Errorf("the stalled import imported its image")
+	}
+}
+
+// The agent reads the lease from an import's first request alone: one in
+// a later request is no lease.
+func TestAnImportsLeaseInALaterRequestIsNotRead(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	acquire(t, n, "holder", time.Hour)
+	archive := nodetest.Image{Name: thirdImage}.Archive(t)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	stream, err := n.Agent.ImportImage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stream.Send(&nodev1.ImportImageRequest{Chunk: archive[:512]})
+	_ = stream.Send(&nodev1.ImportImageRequest{Lease: "holder", Chunk: archive[512:]})
+	if _, err := stream.CloseAndRecv(); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("an import with the lease in its second request alone: %v, want it refused", err)
+	}
+	if hasImage(t, n, thirdImage) {
+		t.Errorf("it imported its image")
+	}
+}
+
+// An import for a lease that doesn't hold the lock is refused at its
+// first request, before the agent reads the rest of the archive, so that
+// a caller without the lock can't fill the node's disk with it.
+func TestARefusedImportIsNotRead(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	acquire(t, n, "holder", time.Hour)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	stream, err := n.Agent.ImportImage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := bytes.Repeat([]byte{0}, 1<<20)
+	sent := 0
+	for ; sent < 256; sent++ {
+		if err := stream.Send(&nodev1.ImportImageRequest{Lease: "intruder", Chunk: chunk}); err != nil {
+			break
+		}
+		if sent == 0 {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	_, err = stream.CloseAndRecv()
+	if sent >= 256 {
+		t.Errorf("the agent read 256 MiB of a refused import")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("got %v, want refused", err)
 	}
 }

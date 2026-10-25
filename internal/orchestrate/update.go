@@ -2,13 +2,16 @@ package orchestrate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
-	"github.com/moostackhq/moostack/internal/nodeclient"
 )
 
 // NodeComponents are the node components that an update installs on
@@ -30,12 +33,23 @@ type Component struct {
 }
 
 // Service is a cluster service as an update runs it: its version and
-// build, as node status says them, the gRPC service name of its API, and
-// its image, an OCI image layout archive, which imports as the image
-// named Image.
+// build, as node status says them, the container it runs as, and its
+// image, an OCI image layout archive, which imports as the container's
+// image.
 type Service struct {
-	Name, Version, Build, API, Image string
-	Archive                          []byte
+	Name, Version, Build string
+	Container            *nodev1.Container
+	Archive              []byte
+	// Replaces is the name of the container a release before ran the
+	// service as, which the update removes before it runs Container, since
+	// no two containers serve one API, empty if none, and ReplacesImages
+	// what the name of an image of the service starts with: a container of
+	// that name running any other image isn't the service's, and stays.
+	//
+	// Temporary: they are the service's name and its image's repository,
+	// as releases before the service- names ran it, until no release a
+	// cluster updates from does.
+	Replaces, ReplacesImages string
 	// ManyBuilds is Component's.
 	ManyBuilds bool
 }
@@ -174,68 +188,118 @@ func (c *Cluster) updateComponents(ctx context.Context, n *namedConn, rel NodeRe
 }
 
 // updateServices updates the cluster services of n that rel has, each in
-// turn: it
-// imports the service's image and runs the service from it, and waits
-// for the service to answer its health call at the new version, for up
-// to the cluster's service timeout. It skips a service the node runs at
-// the target already, healthy.
+// turn: it imports the service's image, removes the container the
+// service replaces if the node has it running one of the service's
+// images, runs the service from the image, and waits for the service to
+// answer its health call at the new version, for up to the cluster's
+// service timeout. It skips a service the node runs at the target
+// already, healthy.
 func (c *Cluster) updateServices(ctx context.Context, n *namedConn, rel NodeRelease, told func(Step)) error {
 	statusCtx, cancel := context.WithTimeout(ctx, c.reachTimeout)
-	running := runningHealthy(n.conn.Status(statusCtx).Services())
+	reported := n.conn.Status(statusCtx)
 	cancel()
+	running := runningHealthy(reported.Services())
 	for _, svc := range rel.Services {
 		step := Step{Node: n.name, Component: "the " + svc.Name + " service", Version: svc.Version}
 		if err := c.CheckLock(); err != nil {
 			return err
 		}
+		// The node runs no container in place of one it has at the target,
+		// since the agent refuses a container whose API another serves.
 		if atTarget(running[svc.Name], svc.Version, svc.Build, svc.ManyBuilds) {
 			step.Already = true
 			told(step)
 			continue
 		}
+		replaced := svc.Replaces != "" && slices.ContainsFunc(reported.Containers, func(k *nodev1.ContainerStatus) bool {
+			return k.Name == svc.Replaces && len(k.Image) > len(svc.ReplacesImages) && strings.HasPrefix(k.Image, svc.ReplacesImages)
+		})
 		told(step)
-		if err := c.runStep(ctx, n, step, func(ctx context.Context) error { return c.updateService(ctx, n, svc) }); err != nil {
+		if err := c.runStep(ctx, n, step, func(ctx context.Context) error { return c.updateService(ctx, n, svc, replaced) }); err != nil {
 			return err
 		}
 	}
 	return c.CheckLock()
 }
 
-// updateService imports svc's image on n, runs svc from it, once sure the
-// operation still holds the lock, and waits for it to answer its health
-// call at its version.
-func (c *Cluster) updateService(ctx context.Context, n *namedConn, svc Service) error {
-	images, err := n.conn.ImportImage(ctx, svc.Archive)
-	if err != nil {
+// updateService imports svc's image on n, removes the container svc
+// replaces if replaced says n has it, and runs svc from the image, once
+// sure the operation still holds the lock, and waits for it to answer its
+// health call at its version. The image is imported before the removal,
+// so that one that won't import leaves the old container running, and
+// again after it, since the removal deletes the old container's image,
+// which is the new one's at the same version.
+func (c *Cluster) updateService(ctx context.Context, n *namedConn, svc Service, replaced bool) error {
+	if err := c.importImage(ctx, n, svc); err != nil {
 		return err
-	}
-	if !slices.Contains(images, svc.Image) {
-		return fmt.Errorf("its image imported %s, not %s", strings.Join(images, ", "), svc.Image)
 	}
 	// The import may have outlasted the lease, as when the machine slept,
 	// and running the service replaces the one that runs.
 	if err := c.CheckLock(); err != nil {
 		return err
 	}
-	err = n.conn.Run(ctx, nodeclient.ServiceContainer(svc.Name, svc.API, svc.Image), c.lease.Lease)
-	if err != nil {
+	runCtx := ctx
+	if replaced {
+		// Once the old container is to go, the removal, the import and the
+		// run are sent even if mooctl is stopped meanwhile, so that the
+		// node isn't left without the service, as the agent finishes each
+		// once it has the call.
+		// They keep the step's deadline, as the rest of the step does.
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			deadline = time.Now().Add(updateTimeout)
+		}
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithDeadline(context.WithoutCancel(ctx), deadline)
+		defer cancel()
+		if err := n.conn.Remove(runCtx, svc.Replaces, c.lease.Lease); err != nil {
+			return fmt.Errorf("removing its container %s: %w", svc.Replaces, err)
+		}
+		if err := c.importImage(runCtx, n, svc); err != nil {
+			return err
+		}
+	}
+	if err := n.conn.Run(runCtx, svc.Container, c.lease.Lease); err != nil {
 		return err
 	}
+	stepCtx := ctx
 	ctx, cancel := context.WithTimeout(ctx, c.serviceTimeout)
 	defer cancel()
 	for {
 		statusCtx, cancelStatus := context.WithTimeout(ctx, c.reachTimeout)
-		status := n.conn.Status(statusCtx)
+		reported := n.conn.Status(statusCtx)
 		cancelStatus()
-		if atTarget(runningHealthy(status.Services())[svc.Name], svc.Version, svc.Build, svc.ManyBuilds) {
+		if atTarget(runningHealthy(reported.Services())[svc.Name], svc.Version, svc.Build, svc.ManyBuilds) {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
+			// The operation stopped or lost its lock, rather than the
+			// service's time ran out.
+			if !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+				return ctx.Err()
+			}
+			// The step's time can run out before the service's does.
+			if stepCtx.Err() != nil {
+				return fmt.Errorf("it didn't become healthy within the step's %s", updateTimeout)
+			}
 			return fmt.Errorf("it didn't become healthy within %s", c.serviceTimeout)
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
+}
+
+// importImage imports svc's image on n, and fails unless it imports as
+// the image svc's container runs.
+func (c *Cluster) importImage(ctx context.Context, n *namedConn, svc Service) error {
+	images, err := n.conn.ImportImage(ctx, svc.Archive, c.lease.Lease)
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(images, svc.Container.Image) {
+		return fmt.Errorf("its image imported %s, not %s", strings.Join(images, ", "), svc.Container.Image)
+	}
+	return nil
 }
 
 // runStep runs the step of n, update, within updateTimeout, and says why
@@ -246,7 +310,9 @@ func (c *Cluster) runStep(ctx context.Context, n *namedConn, step Step, update f
 	cancel()
 	// The operation ending, as when it is stopped or its lock lost, ends
 	// a renewal on the restarted agent too, which is no fault of the agent.
-	if err != nil && ctx.Err() != nil {
+	// A step that failed of itself meanwhile says why.
+	var unanswered *unansweredError
+	if err != nil && ctx.Err() != nil && (ended(err) || errors.As(err, &unanswered)) {
 		return &NodeError{Node: n.name, Err: fmt.Errorf("mooctl stopped waiting for the update of %s to %s, which goes on on the node: %w", step.Component, step.Version, context.Cause(ctx))}
 	}
 	if r, ok := err.(*unansweredError); ok {
@@ -256,6 +322,16 @@ func (c *Cluster) runStep(ctx context.Context, n *namedConn, step Step, update f
 		return &NodeError{Node: n.name, Err: fmt.Errorf("updating %s to %s: %w", step.Component, step.Version, err)}
 	}
 	return nil
+}
+
+// ended reports whether err is a call's or a wait's for want of time or
+// for being stopped, rather than a failure of what it waited for.
+func ended(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	code := status.Code(err)
+	return code == codes.Canceled || code == codes.DeadlineExceeded
 }
 
 // ComponentNoun is the node component called name as a sentence says

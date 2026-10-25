@@ -33,8 +33,8 @@ func containersStatus() nodeclient.Status {
 			running("app-api", "docker.io/library/httpd:2.4", nodev1.Health_HEALTH_UNSPECIFIED, ""),
 			exited("app-crash", "moostack.local/crash:20261024T153000Z", 3),
 			failed("app-web", "docker.io/library/nginx:1.27", "starting it: the node has no image docker.io/library/nginx:1.27"),
-			running("dns", release.ImageRef("dns", "1.0.0"), healthy, ""),
-			running("registry", release.ImageRef("registry", "1.0.0"), healthy, ""),
+			running("service-dns", release.ImageRef("dns", "1.0.0"), healthy, ""),
+			running("service-registry", release.ImageRef("registry", "1.0.0"), healthy, ""),
 		}}
 }
 
@@ -46,8 +46,8 @@ func TestClusterStatusListsEachNodesContainersFlatUnderTheAgent(t *testing.T) {
 		"node1": {status: containersStatus()},
 		// A node that runs only the cluster services, one of another release.
 		"node2": {status: nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: 1, Components: upToDate(), Containers: []*nodev1.ContainerStatus{
-			running("registry", release.ImageRef("registry", "1.0.0"), healthy, ""),
-			running("dns", release.ImageRef("dns", "0.9.0"), unhealthy, "the service doesn't answer"),
+			running("service-registry", release.ImageRef("registry", "1.0.0"), healthy, ""),
+			running("service-dns", release.ImageRef("dns", "0.9.0"), unhealthy, "the service doesn't answer"),
 		}}},
 	}
 	want := `Cluster prod on release 1.0.0
@@ -56,25 +56,25 @@ Update: refused, so cluster update won't run:
 node2: its dns service runs release 0.9.0, and release 1.0.0 updates nodes on 1.0.0 only
 Pin the release the nodes run, or the one after it, and run the mooctl of that release.
 
-NODE           RUNNING                                PINNED  HEALTH
+NODE                  RUNNING                                PINNED  HEALTH
 node1  direct
-  agent        1.0.0                                  1.0.0   healthy
-    registry   1.0.0                                  1.0.0   healthy
-    dns        1.0.0                                  1.0.0   healthy
-    app-api    docker.io/library/httpd:2.4            -       running
-    app-crash  moostack.local/crash:20261024T153000Z  -       exited 3
-    app-web    docker.io/library/nginx:1.27           -       failed
-  updater      1.0.0                                  1.0.0   healthy
-  containerd   2.0.0                                  2.0.0   healthy
+  agent               1.0.0                                  1.0.0   healthy
+    service-registry  1.0.0                                  1.0.0   healthy
+    service-dns       1.0.0                                  1.0.0   healthy
+    app-api           docker.io/library/httpd:2.4            -       running
+    app-crash         moostack.local/crash:20261024T153000Z  -       exited 3
+    app-web           docker.io/library/nginx:1.27           -       failed
+  updater             1.0.0                                  1.0.0   healthy
+  containerd          2.0.0                                  2.0.0   healthy
 node2  direct
-  agent        1.0.0                                  1.0.0   healthy
-    registry   1.0.0                                  1.0.0   healthy
-    dns        0.9.0                                  1.0.0   unhealthy
-  updater      1.0.0                                  1.0.0   healthy
-  containerd   2.0.0                                  2.0.0   healthy
+  agent               1.0.0                                  1.0.0   healthy
+    service-registry  1.0.0                                  1.0.0   healthy
+    service-dns       0.9.0                                  1.0.0   unhealthy
+  updater             1.0.0                                  1.0.0   healthy
+  containerd          2.0.0                                  2.0.0   healthy
 
 node1: app-web: starting it: the node has no image docker.io/library/nginx:1.27
-node2: dns: the service doesn't answer
+node2: service-dns: the service doesn't answer
 `
 	piped := o.mustRun("--release-source", source, "cluster", "status")
 	if piped.stdout != want {
@@ -95,17 +95,17 @@ func TestClusterStatusShowsAPinnedContainerByItsVersion(t *testing.T) {
 	pinServices(t, source)
 	s := containersStatus()
 	s.Containers = []*nodev1.ContainerStatus{
-		running("dns", release.ImageRef("dns", "0.9.0"), unhealthy, "the service doesn't answer"),
+		running("service-dns", release.ImageRef("dns", "0.9.0"), unhealthy, "the service doesn't answer"),
 		running("app-web", "docker.io/library/nginx:1.27", nodev1.Health_HEALTH_UNSPECIFIED, ""),
 	}
 	o.nodes = map[string]*fakeNode{"node1": {status: s}}
 	r := o.mustRun("--release-source", source, "cluster", "status")
 	wantContains(t, "cluster status", r.stdout, `
-  agent       1.0.0                         1.0.0   healthy
-    registry  -                             1.0.0   unknown
-    dns       0.9.0                         1.0.0   unhealthy
-    app-web   docker.io/library/nginx:1.27  -       running
-`, "\nnode1: dns: the service doesn't answer\n")
+  agent               1.0.0                         1.0.0   healthy
+    service-registry  -                             1.0.0   unknown
+    service-dns       0.9.0                         1.0.0   unhealthy
+    app-web           docker.io/library/nginx:1.27  -       running
+`, "\nnode1: service-dns: the service doesn't answer\n")
 }
 
 // Apps take no part in whether the nodes run the pinned release.
@@ -143,18 +143,18 @@ func TestClusterStatusJSONListsTheContainersOfEachNode(t *testing.T) {
 	}
 	want := `[
   {
-    "build": "sha256:registry",
+    "build": "sha256:service-registry",
     "health": "healthy",
     "image": "moostack.local/registry:1.0.0",
-    "name": "registry",
+    "name": "service-registry",
     "pinned": "1.0.0",
     "running": "1.0.0"
   },
   {
-    "build": "sha256:dns",
+    "build": "sha256:service-dns",
     "health": "healthy",
     "image": "moostack.local/dns:1.0.0",
-    "name": "dns",
+    "name": "service-dns",
     "pinned": "1.0.0",
     "running": "1.0.0"
   },
@@ -211,9 +211,9 @@ func TestClusterStatusShowsAContainerTheNodeCantReadAsUnknown(t *testing.T) {
 	wantContains(t, "cluster status", r.stdout, "    app-web   -        -       unknown\n", "node1: app-web: reading its container: connection refused\n")
 }
 
-// A container under a pinned service's name that runs another image, as
-// another service's or one named as the pinned version, runs no version
-// of the service, to status as to update.
+// A container under the name of a pinned service's container that runs
+// another image, as another service's or one named as the pinned
+// version, runs no version of the service, to status as to update.
 func TestClusterStatusShowsAPinnedNameRunningAnotherImageAsNoVersion(t *testing.T) {
 	for _, image := range []string{"1.0.0", release.ImageRef("registry", "1.0.0")} {
 		o := newOperator(t, "op")
@@ -221,15 +221,15 @@ func TestClusterStatusShowsAPinnedNameRunningAnotherImageAsNoVersion(t *testing.
 		pinServices(t, source)
 		s := containersStatus()
 		s.Containers = []*nodev1.ContainerStatus{
-			running("dns", image, healthy, ""),
-			running("registry", release.ImageRef("registry", "1.0.0"), healthy, ""),
+			running("service-dns", image, healthy, ""),
+			running("service-registry", release.ImageRef("registry", "1.0.0"), healthy, ""),
 		}
 		if slices.ContainsFunc(s.Services(), func(c *nodev1.Component) bool { return c.Name == "dns" }) {
-			t.Errorf("%s: update takes dns for the service", image)
+			t.Errorf("%s: update takes service-dns for the service", image)
 		}
 		o.nodes = map[string]*fakeNode{"node1": {status: s}}
 		r := o.mustRun("--release-source", source, "cluster", "status")
-		wantContains(t, "cluster status of dns running "+image, r.stdout, "\n    dns       -        1.0.0   healthy\n")
+		wantContains(t, "cluster status of service-dns running "+image, r.stdout, "\n    service-dns       -        1.0.0   healthy\n")
 		if strings.Contains(r.stdout, "Update: none needed") {
 			t.Errorf("%s: cluster status says no update is needed:\n%s", image, r.stdout)
 		}

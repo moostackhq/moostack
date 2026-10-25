@@ -56,12 +56,16 @@ type Node interface {
 	// within healthTimeout, or the agent puts the old ones back.
 	UpdateContainerd(ctx context.Context, version string, files map[string][]byte, healthTimeout time.Duration) error
 	// ImportImage has the node's agent import the image in archive, an OCI
-	// image layout archive, and returns the names of the images imported.
-	ImportImage(ctx context.Context, archive []byte) ([]string, error)
+	// image layout archive, for the operation whose lease holds the node's
+	// operation lock, and returns the names of the images imported.
+	ImportImage(ctx context.Context, archive []byte, lease string) ([]string, error)
 	// Run has the node's agent run the container c, from its image, which
 	// the node must have imported, replacing the one of its name, for the
 	// operation whose lease holds the node's operation lock.
 	Run(ctx context.Context, c *nodev1.Container, lease string) error
+	// Remove has the node's agent stop and delete the container called
+	// name, for the operation whose lease holds the node's operation lock.
+	Remove(ctx context.Context, name, lease string) error
 	// Close closes the connection.
 	Close() error
 }

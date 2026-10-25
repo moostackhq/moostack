@@ -234,13 +234,18 @@ func TestBuildServicesBuildsWhereTheTemporaryDirectoryRunsNothing(t *testing.T) 
 }
 
 // buildDNS builds the dns service with BuildServices in checkout, and
-// returns the binary in its image.
+// returns the binary in its image. The service built is as the release
+// lists it: with the properties the release states for it.
 func buildDNS(t *testing.T, checkout string) []byte {
 	t.Helper()
 	dns := release.ClusterServices[slices.IndexFunc(release.ClusterServices, func(s release.ClusterService) bool { return s.Name == "dns" })]
 	dir := t.TempDir()
-	if _, err := release.BuildServices(t.Context(), checkout, runtime.GOARCH, "1.0.0", dir, []release.ClusterService{dns}); err != nil {
+	built, err := release.BuildServices(t.Context(), checkout, runtime.GOARCH, "1.0.0", dir, []release.ClusterService{dns})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(built) != 1 || built[0].User != dns.User || built[0].ReadOnlyRoot != dns.ReadOnlyRoot || !slices.Equal(built[0].Capabilities, dns.Capabilities) || built[0].Capabilities == nil {
+		t.Errorf("BuildServices listed %+v, want dns with %+v", built, dns.Properties)
 	}
 	archive, err := os.Open(filepath.Join(dir, "dns.tar"))
 	if err != nil {
