@@ -68,6 +68,10 @@ type Env struct {
 	// before it checks that the container still runs. Zero means
 	// orchestrate.DefaultStartCheck.
 	StartCheck time.Duration
+	// LeaseTTL is how long a node holds the operation lock after an
+	// operation last renewed it. Zero means orchestrate.DefaultLeaseTTL, or
+	// MOOSTACK_DEV_LEASE_TTL in a dev build.
+	LeaseTTL time.Duration
 }
 
 // OSEnv is the Env of the running process.
@@ -283,6 +287,7 @@ func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir, s
 	if err != nil {
 		return nil, err
 	}
+	ttl = cmp.Or(env.LeaseTTL, ttl)
 	toDial := nodesToDial(env, nodes)
 	toDial.LeaseTTL = ttl
 	toDial.StartCheck = env.StartCheck
@@ -297,6 +302,10 @@ func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir, s
 		return nil
 	}
 	operation := strings.TrimPrefix(cmd.FullName(), cmd.Root().Name+" ")
+	// A removal holds the lock as one, not as the deploy it is a flag of.
+	if slices.Contains(cmd.FlagNames(), removeFlag) && cmd.Bool(removeFlag) {
+		operation += " --" + removeFlag
+	}
 	c, err := orchestrate.Preflight(ctx, toDial, d.Cluster.Generation, cmd.Bool("force"), orchestrate.Holder{Who: env.LocalUser, Machine: env.Machine, Operation: operation})
 	if errors.As(err, new(*orchestrate.LockHeldError)) {
 		return nil, fmt.Errorf("%w\nAnother operation holds the operation lock. Ask its holder, or wait for it to end. If their mooctl has died, the lock expires on its own, or break it now with mooctl cluster unlock.", err)

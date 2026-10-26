@@ -87,6 +87,9 @@ type node struct {
 	importDelay time.Duration
 	// app is how the node pulls and runs apps, as deploy_test.go fakes it.
 	app appFake
+	// runner is held through an app's run and a removal, one at a time,
+	// as the agent's runner is.
+	runner sync.Mutex
 
 	mu sync.Mutex
 	// updates are the updates of the node's components, in order.
@@ -391,11 +394,11 @@ func (n *node) run(ctx context.Context, c *nodev1.Container, lease string) error
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if appfile.IsApp(c.Name) {
+		return n.runAppCall(ctx, c, lease)
+	}
 	if err := n.fence(lease); err != nil {
 		return err
-	}
-	if appfile.IsApp(c.Name) {
-		return n.runApp(c)
 	}
 	service, ok := release.ServiceName(c.Name)
 	if !ok {
@@ -437,33 +440,38 @@ func (n *node) run(ctx context.Context, c *nodev1.Container, lease string) error
 // that the call ended. It refuses a call whose context ended already,
 // which a real one never sends, and unless lease holds the node's
 // operation lock.
-func (n *node) Remove(ctx context.Context, name, lease string) (err error) {
+func (n *node) Remove(ctx context.Context, name, lease string) (removed bool, err error) {
 	// A call whose context ended is never sent.
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
+	// It waits for a run or a removal under way, and the lease is checked
+	// once it no longer waits, as the agent's is.
+	n.runner.Lock()
+	defer n.runner.Unlock()
 	if err := n.fence(lease); err != nil {
-		return err
+		return false, err
 	}
 	// Its caller hears that its call ended, though the removal goes on.
 	defer func() {
 		if ctx.Err() != nil {
-			err = ctx.Err()
+			removed, err = false, ctx.Err()
 		}
 	}()
 	// The removal goes on if the call ends, as the agent's does.
 	if err := n.update(context.WithoutCancel(ctx), "remove "+name, "", "", 0); err != nil {
-		return err
+		return false, err
 	}
 	var image string
 	for _, c := range n.containers() {
 		if c.Name == name {
-			image = c.Image
+			image, removed = c.Image, true
 		}
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.oldNames = slices.DeleteFunc(n.oldNames, func(s *nodev1.Component) bool { return s.Name == name })
+	n.others = slices.DeleteFunc(n.others, func(c *nodev1.ContainerStatus) bool { return c.Name == name })
 	service, _ := release.ServiceName(name)
 	n.services = slices.DeleteFunc(n.services, func(s *nodev1.Component) bool { return s.Name == service })
 	n.mu.Unlock()
@@ -472,7 +480,7 @@ func (n *node) Remove(ctx context.Context, name, lease string) (err error) {
 	if !used {
 		delete(n.images, image)
 	}
-	return nil
+	return removed, nil
 }
 
 // containersRun are the containers the node ran, in order.
@@ -575,12 +583,16 @@ func (n *node) isClosed() bool {
 // fakes is a cluster of fake nodes, by name.
 type fakes map[string]*node
 
-// names are the names of the cluster's nodes.
+// names are the names of the cluster's nodes, last by name first, so
+// that an operation that goes through the nodes in order of their names
+// sorts them itself.
 func (f fakes) names() []string {
 	var names []string
 	for name := range f {
 		names = append(names, name)
 	}
+	slices.Sort(names)
+	slices.Reverse(names)
 	return names
 }
 
@@ -805,6 +817,26 @@ func TestThePreflightFindsTheNodesTheLatestGenerationListsButTheDirectoryDoesnt(
 	}
 	if cl.Latest != 3 {
 		t.Errorf("the latest generation is %d, want 3", cl.Latest)
+	}
+}
+
+// A forced preflight finds the nodes that a generation as late as the
+// directory's lists but the directory doesn't, and none from a generation
+// older than the directory's, whose nodes the directory removed since.
+func TestThePreflightFindsUnlistedNodesFromNoGenerationOlderThanTheDirectorys(t *testing.T) {
+	for directory, want := range map[int64][]string{2: {"node3"}, 3: nil} {
+		f := fakes{
+			"node1": {generation: 2, nodes: []string{"node1", "node2", "node3"}},
+			"node2": {generation: 2, nodes: []string{"node1", "node2", "node3"}},
+		}
+		cl, err := orchestrate.Preflight(t.Context(), f.nodes(), directory, true, holder)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(cl.Unlisted, want) {
+			t.Errorf("with the directory at generation %d, the unlisted nodes are %v, want %v", directory, cl.Unlisted, want)
+		}
+		cl.Close()
 	}
 }
 

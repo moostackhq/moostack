@@ -252,7 +252,7 @@ func (c *Cluster) updateService(ctx context.Context, n *namedConn, svc Service, 
 		var cancel context.CancelFunc
 		runCtx, cancel = context.WithDeadline(context.WithoutCancel(ctx), deadline)
 		defer cancel()
-		if err := n.conn.Remove(runCtx, svc.Replaces, c.lease.Lease); err != nil {
+		if _, err := n.conn.Remove(runCtx, svc.Replaces, c.lease.Lease); err != nil {
 			return fmt.Errorf("removing its container %s: %w", svc.Replaces, err)
 		}
 		if err := c.importImage(runCtx, n, svc); err != nil {

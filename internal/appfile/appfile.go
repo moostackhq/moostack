@@ -39,10 +39,10 @@ type App struct {
 // them.
 var fields = []string{"name", "image", "build"}
 
-// name is what an app's name may be: lowercase letters, digits and
+// namePattern is what an app's name may be: lowercase letters, digits and
 // single hyphens between them, starting with a letter, so that its
 // container's name, ContainerName, is one, and it is a DNS label.
-var name = regexp.MustCompile(`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`)
+var namePattern = regexp.MustCompile(`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`)
 
 // maxName bounds an app's name, so that its container's name is at most
 // 63, as a container's and a DNS label's are.
@@ -69,19 +69,64 @@ func (e *Error) Error() string {
 // place of image, isn't supported yet. Every refusal is an *Error, but
 // for a file that can't be read.
 func Read(dir string) (*App, error) {
-	file := filepath.Join(dir, FileName)
-	data, err := os.ReadFile(file)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, &Error{File: file, Reason: "there is no app file; run mooctl deploy in the app's directory, or give it the directory"}
-	}
-	if errors.Is(err, syscall.ENOTDIR) {
-		return nil, &Error{File: file, Reason: dir + " isn't a directory; give mooctl deploy the app's directory, which holds its " + FileName}
-	}
+	file, values, err := read(dir)
 	if err != nil {
 		return nil, err
 	}
 	refuse := func(field, reason string, args ...any) (*App, error) {
 		return nil, &Error{File: file, Field: field, Reason: fmt.Sprintf(reason, args...)}
+	}
+	for _, field := range []string{"image", "build"} {
+		if v, ok := values[field]; ok && !isString(v) {
+			return refuse(field, "is %s, not a string", kindOf(v))
+		}
+	}
+	imageNode, hasImage := values["image"]
+	_, hasBuild := values["build"]
+	switch {
+	case hasImage && hasBuild:
+		return refuse("image", "is given with build; give one of them")
+	case hasBuild:
+		// Temporary: build is refused until local builds are deployed.
+		return refuse("build", "isn't supported yet; name a public image in image")
+	case !hasImage:
+		return refuse("image", "is missing; name a public image, such as nginx:1.27")
+	}
+	normalized, err := nodev1.NormalizeReference(imageNode.Value)
+	if err != nil {
+		return refuse("image", "%s", status.Convert(err).Message())
+	}
+	return &App{Name: values["name"].Value, Image: normalized}, nil
+}
+
+// ReadName reads the app file in dir for the app's name alone, as Read
+// checks the file but for image and build, which it doesn't check: what
+// they are, or whether either is given.
+func ReadName(dir string) (string, error) {
+	_, values, err := read(dir)
+	if err != nil {
+		return "", err
+	}
+	return values["name"].Value, nil
+}
+
+// read reads the app file in dir, and checks its shape and its name as
+// Read says, but not what image and build are: it returns the file's
+// path and its fields' values, by field.
+func read(dir string) (string, map[string]*yaml.Node, error) {
+	file := filepath.Join(dir, FileName)
+	data, err := os.ReadFile(file)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil, &Error{File: file, Reason: "there is no app file; run mooctl deploy in the app's directory, or give it the directory"}
+	}
+	if errors.Is(err, syscall.ENOTDIR) {
+		return "", nil, &Error{File: file, Reason: dir + " isn't a directory; give mooctl deploy the app's directory, which holds its " + FileName}
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	refuse := func(field, reason string, args ...any) (string, map[string]*yaml.Node, error) {
+		return "", nil, &Error{File: file, Field: field, Reason: fmt.Sprintf(reason, args...)}
 	}
 	var doc yaml.Node
 	if err := strictyaml.Unmarshal(data, &doc); err != nil {
@@ -90,7 +135,7 @@ func Read(dir string) (*App, error) {
 	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
 		return refuse("", "an app file is a mapping of the fields %s", strings.Join(fields, ", "))
 	}
-	values := map[string]string{}
+	values := map[string]*yaml.Node{}
 	pairs := doc.Content[0].Content
 	for i := 0; i < len(pairs); i += 2 {
 		key, value := pairs[i], pairs[i+1]
@@ -103,35 +148,27 @@ func Read(dir string) (*App, error) {
 		if _, ok := values[key.Value]; ok {
 			return refuse(key.Value, "is given twice")
 		}
-		if value.Kind != yaml.ScalarNode || value.ShortTag() != "!!str" {
-			return refuse(key.Value, "is %s, not a string", kindOf(value))
+		values[key.Value] = value
+	}
+	var name string
+	if v, ok := values["name"]; ok {
+		if !isString(v) {
+			return refuse("name", "is %s, not a string", kindOf(v))
 		}
-		values[key.Value] = value.Value
+		name = v.Value
 	}
-	app := &App{Name: values["name"]}
 	switch {
-	case app.Name == "":
+	case name == "":
 		return refuse("name", "is missing; give the app a name, such as web")
-	case len(app.Name) > maxName || !name.MatchString(app.Name):
-		return refuse("name", "%q isn't lowercase letters, digits and single hyphens between them, starting with a letter, at most %d", app.Name, maxName)
+	case len(name) > maxName || !namePattern.MatchString(name):
+		return refuse("name", "%q isn't lowercase letters, digits and single hyphens between them, starting with a letter, at most %d", name, maxName)
 	}
-	image, hasImage := values["image"]
-	_, hasBuild := values["build"]
-	switch {
-	case hasImage && hasBuild:
-		return refuse("image", "is given with build; give one of them")
-	case hasBuild:
-		// Temporary: build is refused until local builds are deployed.
-		return refuse("build", "isn't supported yet; name a public image in image")
-	case !hasImage:
-		return refuse("image", "is missing; name a public image, such as nginx:1.27")
-	}
-	normalized, err := nodev1.NormalizeReference(image)
-	if err != nil {
-		return refuse("image", "%s", status.Convert(err).Message())
-	}
-	app.Image = normalized
-	return app, nil
+	return file, values, nil
+}
+
+// isString reports whether the field's value node is a string.
+func isString(node *yaml.Node) bool {
+	return node.Kind == yaml.ScalarNode && node.ShortTag() == "!!str"
 }
 
 // printable is s, a text from the file, quoted if it holds a rune that

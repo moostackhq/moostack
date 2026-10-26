@@ -470,34 +470,45 @@ func (n *fakeNode) run(ctx context.Context, c *nodev1.Container, lease string) e
 }
 
 // Remove records a removal of the container called name, as "remove"
-// and its name, and stops reporting it, unless removeErr is set. As the
-// agent does, it deletes the container's image unless another container
-// runs from it, and refuses once ctx ended, or unless lease holds the
-// node's operation lock.
-func (n *fakeNode) Remove(ctx context.Context, name, lease string) error {
+// and its name, and stops reporting it, saying whether it reported it,
+// unless removeErr is set. The apps' removing hook, if set, is called as
+// it starts, and their removed hook once it is done. As the agent does,
+// it deletes the container's image unless another container runs from
+// it, and refuses once ctx ended, or unless lease holds the node's
+// operation lock.
+func (n *fakeNode) Remove(ctx context.Context, name, lease string) (bool, error) {
+	if n.apps.removing != nil {
+		n.apps.removing(ctx)
+	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	if l := n.heldLock(); l == nil || l.Lease != lease {
-		return status.Error(codes.FailedPrecondition, "the operation's lease doesn't hold the node's operation lock")
+		return false, status.Error(codes.FailedPrecondition, "the operation's lease doesn't hold the node's operation lock")
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.updates = append(n.updates, "remove "+name)
 	if n.removeErr != nil {
-		return n.removeErr
+		return false, n.removeErr
 	}
 	var image string
+	removed := false
 	for _, k := range n.status.Containers {
 		if k.Name == name {
-			image = k.Image
+			image, removed = k.Image, true
 		}
 	}
 	n.status.Containers = slices.DeleteFunc(n.status.Containers, func(k *nodev1.ContainerStatus) bool { return k.Name == name })
 	if !slices.ContainsFunc(n.status.Containers, func(k *nodev1.ContainerStatus) bool { return k.Image == image }) {
 		delete(n.sent, image)
 	}
-	return nil
+	if n.apps.removed != nil {
+		n.mu.Unlock()
+		n.apps.removed(ctx)
+		n.mu.Lock()
+	}
+	return removed, nil
 }
 
 // nodeUpdates are the components the node was updated to so far.
@@ -622,10 +633,10 @@ func TestTheFakeNodeRefusesAnImportAndARemovalAsTheAgentDoes(t *testing.T) {
 	if _, err := n.ImportImage(t.Context(), archive(t), "other"); err == nil {
 		t.Error("the fake imported for another lease")
 	}
-	if err := n.Remove(t.Context(), "dns", "other"); err == nil {
+	if _, err := n.Remove(t.Context(), "dns", "other"); err == nil {
 		t.Error("the fake removed for another lease")
 	}
-	if err := n.Remove(ended, "dns", "op"); err == nil {
+	if _, err := n.Remove(ended, "dns", "op"); err == nil {
 		t.Error("the fake removed once the call ended")
 	}
 	if _, err := n.ImportImage(ended, archive(t), "op"); err == nil {
@@ -634,7 +645,7 @@ func TestTheFakeNodeRefusesAnImportAndARemovalAsTheAgentDoes(t *testing.T) {
 	if _, err := n.ImportImage(t.Context(), archive(t), "op"); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.Remove(t.Context(), "dns", "op"); err != nil {
+	if _, err := n.Remove(t.Context(), "dns", "op"); err != nil {
 		t.Fatal(err)
 	}
 	nobody := "65534:65534"

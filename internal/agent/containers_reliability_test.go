@@ -4,6 +4,7 @@ package agent_test
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"os"
 	"slices"
@@ -158,6 +159,17 @@ func TestARemovalCrashedAtAnyStepFinishesWhenRemovedAgain(t *testing.T) {
 		// the removal is known to be unfinished.
 		if err == nil && reported == nil {
 			t.Fatalf("crashed after %s: app-web's container is there, but the agent doesn't report it", delay)
+		}
+		// Once the node keeps it no more, as when the crash came after
+		// the removal stored the list without it, the agent's start
+		// deletes its image, which no removal again would see.
+		if reported == nil {
+			nodetest.Eventually(t, 30*time.Second, func() error {
+				if hasImage(t, n, appImage) {
+					return fmt.Errorf("crashed after %s: the agent keeps app-web no more, but %s is kept after its start", delay, appImage)
+				}
+				return nil
+			})
 		}
 		// Removing it again finishes what the crash left, even once the
 		// node no longer keeps it, its image still to delete.

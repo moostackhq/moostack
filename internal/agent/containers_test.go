@@ -550,6 +550,24 @@ func TestAContainersOutputGoesToItsLogWhichStartsAgainWhenItIsReplacedOrRemoved(
 	wantLog("")
 }
 
+// Remove answers whether the node kept the container it was asked to
+// remove: once it removed it, and no more when asked again.
+func TestRemoveSaysWhetherTheNodeKeptTheContainer(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.Import(t, nodetest.Image{Name: appImage})
+	lease := hold(t, n)
+	mustRun(t, n, lease, app("app-web", appImage))
+	for i, want := range []bool{true, false} {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		res, err := n.Agent.Remove(ctx, &nodev1.RemoveRequest{Name: "app-web", Lease: lease})
+		cancel()
+		if err != nil || res.Removed != want {
+			t.Errorf("removal %d of app-web = %v, %v, want removed %v", i+1, res, err, want)
+		}
+	}
+}
+
 func TestRemoveDeletesAContainerWithItsSnapshotAndImage(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)

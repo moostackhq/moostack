@@ -188,3 +188,94 @@ func FuzzRead(f *testing.F) {
 		}
 	})
 }
+
+// ReadName and Read agree on every file: what Read takes, ReadName takes
+// by the same name, and what ReadName refuses, Read refuses alike, while
+// a file Read refuses for anything but image or build, ReadName refuses
+// alike too.
+func FuzzReadNameAgreesWithRead(f *testing.F) {
+	for _, seed := range []string{
+		"name: web\nimage: nginx:1.27\n", "name: web\nbuild: .\n", "name: web\n", "name: web\nimage: 1.27\n", "name: Web\nimage: nginx\n",
+		"name: web\nimage: NGINX\nbuild: [x]\n", "image: nginx\n", "name: web\nports: 80\n", "", "- a\n", "name: &n web\nimage: *n\n",
+		"name: web\nimage: nginx\nimage: httpd\n", "name: web\nbuild: .\nbuild: [x]\n",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, data string) {
+		dir := write(t, data)
+		app, readErr := appfile.Read(dir)
+		name, nameErr := appfile.ReadName(dir)
+		if nameErr != nil {
+			var e *appfile.Error
+			if !errors.As(nameErr, &e) {
+				t.Fatalf("ReadName of %q = %v, not an *appfile.Error", data, nameErr)
+			}
+			if msg := strings.TrimPrefix(nameErr.Error(), e.File); strings.ContainsFunc(msg, func(r rune) bool { return !strconv.IsPrint(r) }) || !utf8.ValidString(msg) {
+				t.Fatalf("ReadName of %q says %q, which isn't printable", data, msg)
+			}
+			// Of image and build, only the file's shape counts: a field
+			// given twice.
+			if (e.Field == "image" || e.Field == "build") && e.Reason != "is given twice" {
+				t.Fatalf("ReadName of %q refused %s: %v", data, e.Field, nameErr)
+			}
+			if readErr == nil || readErr.Error() != nameErr.Error() {
+				t.Fatalf("ReadName of %q = %v, but Read = %v", data, nameErr, readErr)
+			}
+			return
+		}
+		if readErr == nil && app.Name != name {
+			t.Fatalf("ReadName of %q = %q, but Read took the name %q", data, name, app.Name)
+		}
+		var e *appfile.Error
+		if readErr != nil && (!errors.As(readErr, &e) || e.Field != "image" && e.Field != "build" || e.Reason == "is given twice") {
+			t.Fatalf("ReadName of %q took %q, but Read refused it for other than image or build: %v", data, name, readErr)
+		}
+	})
+}
+
+// ReadName takes an app file by its name alone: image and build, whether
+// given, valid, or both, aren't checked.
+func TestReadNameTakesAnAppFileByItsNameAlone(t *testing.T) {
+	for _, data := range []string{
+		"name: web\nimage: nginx:1.27\n",
+		"name: web\nbuild: .\n",
+		"name: web\n",
+		"name: web\nimage: nginx:1.27\nbuild: .\n",
+		"name: web\nimage: NGINX\n",
+		"name: web\nimage: \"nginx:\"\n",
+		"name: web\nimage: 1.27\n",
+		"name: web\nimage:\n",
+		"name: web\nimage: [nginx]\n",
+		"name: web\nbuild: {context: .}\n",
+	} {
+		if got, err := appfile.ReadName(write(t, data)); err != nil || got != "web" {
+			t.Errorf("ReadName of\n%s= %q, %v, want web", data, got, err)
+		}
+	}
+}
+
+// ReadName refuses what Read refuses of the file's shape and its name.
+func TestReadNameRefusesABadNameOrFileNamingTheFieldAndWhy(t *testing.T) {
+	for data, want := range map[string]struct{ field, reason string }{
+		"":                                {"", "empty"},
+		"- web\n":                         {"", "a mapping of the fields name, image, build"},
+		"image: nginx:1.27\n":             {"name", "is missing"},
+		"name: 7\n":                       {"name", "is a number, not a string"},
+		"name: Web\n":                     {"name", `"Web" isn't lowercase letters, digits and single hyphens`},
+		"name: we--b\nbuild: .\n":         {"name", "single hyphens between them"},
+		"name: web\nports: [80]\n":        {"ports", "isn't a field of an app file"},
+		"name: web\nimage: a\nimage: b\n": {"image", "is given twice"},
+		"name: web\nbuild: .\nbuild: x\n": {"build", "is given twice"},
+		"name: web\nname: api\n":          {"name", "is given twice"},
+	} {
+		dir := write(t, data)
+		_, err := appfile.ReadName(dir)
+		var e *appfile.Error
+		if !errors.As(err, &e) || e.File != filepath.Join(dir, appfile.FileName) || e.Field != want.field || !strings.Contains(e.Reason, want.reason) {
+			t.Errorf("ReadName of\n%s= %v, want the field %q refused for %q", data, err, want.field, want.reason)
+		}
+	}
+	if _, err := appfile.ReadName(t.TempDir()); err == nil || !strings.Contains(err.Error(), "there is no app file") {
+		t.Errorf("ReadName of a directory without an app file: %v, want it to say there is none", err)
+	}
+}

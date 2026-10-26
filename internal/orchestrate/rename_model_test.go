@@ -14,9 +14,10 @@ import (
 	"github.com/moostackhq/moostack/internal/orchestrate"
 )
 
-// renameSeed is the seed of TestRenameSequencesMatchTheModel, from
-// MOOSTACK_STATE_SEED if set, so that a failing sequence runs again.
-func renameSeed(t *testing.T) uint64 {
+// stateSeed is the seed of the package's seeded sequences, as
+// TestRenameSequencesMatchTheModel's, from MOOSTACK_STATE_SEED if set, so
+// that a failing sequence runs again.
+func stateSeed(t *testing.T) uint64 {
 	if s := os.Getenv("MOOSTACK_STATE_SEED"); s != "" {
 		seed, err := strconv.ParseUint(s, 10, 64)
 		if err != nil {
@@ -35,7 +36,7 @@ func renameSeed(t *testing.T) uint64 {
 // in the update just ended, an update that fails nowhere leaves every service
 // under its service- name at the target, and the next changes nothing.
 func TestRenameSequencesMatchTheModel(t *testing.T) {
-	seed := renameSeed(t)
+	seed := stateSeed(t)
 	t.Logf("MOOSTACK_STATE_SEED=%d", seed)
 	r := rand.New(rand.NewPCG(seed, seed))
 	steps := []string{"import dns", "remove dns", "service dns", "import proxy", "remove proxy", "service proxy"}

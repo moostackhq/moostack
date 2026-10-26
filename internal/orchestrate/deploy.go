@@ -81,7 +81,8 @@ func Place(app string, containers map[string][]*nodev1.ContainerStatus) (Placeme
 }
 
 // DuplicateAppError says the app runs on more than one node, Nodes, so a
-// deploy can't tell which to replace.
+// deploy can't tell which to replace, though a removal removes it from
+// each.
 type DuplicateAppError struct {
 	App   string
 	Nodes []string
@@ -210,25 +211,9 @@ func (e *UncheckedError) Unwrap() error { return e.Err }
 // Temporary: placement is naive, and the nodes are the only record of
 // where an app runs, as Place says.
 func (c *Cluster) Deploy(ctx context.Context, app App, told func(DeployStep)) (*Deployed, error) {
-	c.mu.Lock()
-	conns := slices.Clone(c.conns)
-	c.mu.Unlock()
-	reported := make([]nodeclient.Status, len(conns))
-	var wg sync.WaitGroup
-	for i, n := range conns {
-		wg.Go(func() { reported[i] = c.status(ctx, n) })
-	}
-	wg.Wait()
-	// The statuses of a deploy stopped meanwhile say nothing of the nodes.
-	if cause := stopped(ctx); cause != nil {
-		return nil, fmt.Errorf("mooctl stopped before it changed anything: %w", cause)
-	}
-	containers := map[string][]*nodev1.ContainerStatus{}
-	for i, n := range conns {
-		if err := reported[i].AgentErr; err != nil {
-			return nil, &NodeError{Node: n.name, Err: fmt.Errorf("its agent doesn't say which containers it runs, so nothing changed: %w", err)}
-		}
-		containers[n.name] = reported[i].Containers
+	conns, containers, err := c.containers(ctx)
+	if err != nil {
+		return nil, err
 	}
 	p, err := Place(app.Name, containers)
 	if err != nil {
@@ -291,6 +276,127 @@ func (c *Cluster) Deploy(ctx context.Context, app App, told func(DeployStep)) (*
 		return nil, &NotRunningError{Node: p.Node, App: app.Name, Within: c.startCheck, Exited: true, ExitCode: k.ExitCode, Log: path.Join(hostlayout.ContainerLogDir, name+".log")}
 	}
 	return nil, &NotRunningError{Node: p.Node, App: app.Name, Within: c.startCheck, Problem: cmp.Or(k.Problem, "the node can't tell whether it runs")}
+}
+
+// containers are the connections to the cluster's nodes, sorted by
+// name, and the containers each node says it runs, by its name. It fails
+// as askable does; with a *NodeError, as nothing may change, if a node's
+// agent doesn't say; and if ctx ended meanwhile, as what the nodes said
+// then says nothing of them.
+func (c *Cluster) containers(ctx context.Context) ([]*namedConn, map[string][]*nodev1.ContainerStatus, error) {
+	if err := c.askable(ctx); err != nil {
+		return nil, nil, err
+	}
+	conns := c.sortedConns()
+	reported := make([]nodeclient.Status, len(conns))
+	var wg sync.WaitGroup
+	for i, n := range conns {
+		wg.Go(func() { reported[i] = c.status(ctx, n) })
+	}
+	wg.Wait()
+	if err := stoppedBeforeAnyChange(ctx); err != nil {
+		return nil, nil, err
+	}
+	containers := map[string][]*nodev1.ContainerStatus{}
+	for i, n := range conns {
+		if err := reported[i].AgentErr; err != nil {
+			return nil, nil, &NodeError{Node: n.name, Err: fmt.Errorf("its agent doesn't say which containers it runs, so nothing changed: %w", err)}
+		}
+		containers[n.name] = reported[i].Containers
+	}
+	return conns, containers, nil
+}
+
+// askable fails, before any node is asked about apps, if the latest
+// generation lists nodes the cluster has no connection to, as --force
+// goes on past, since what they run is no one's to tell, and if ctx
+// ended.
+func (c *Cluster) askable(ctx context.Context) error {
+	if len(c.Unlisted) > 0 {
+		return fmt.Errorf("generation %d lists %s, which this cluster directory doesn't, so mooctl can't ask them which apps they run; pull the latest cluster directory; nothing changed", c.Latest, strings.Join(c.Unlisted, ", "))
+	}
+	return stoppedBeforeAnyChange(ctx)
+}
+
+// stoppedBeforeAnyChange fails if the operation of ctx was stopped, or
+// lost the lock, before it changed anything.
+func stoppedBeforeAnyChange(ctx context.Context) error {
+	if cause := stopped(ctx); cause != nil {
+		return fmt.Errorf("mooctl stopped before it changed anything: %w", cause)
+	}
+	return nil
+}
+
+// sortedConns are the connections to the cluster's nodes, sorted by name.
+func (c *Cluster) sortedConns() []*namedConn {
+	c.mu.Lock()
+	conns := slices.Clone(c.conns)
+	c.mu.Unlock()
+	slices.SortFunc(conns, func(a, b *namedConn) int { return strings.Compare(a.name, b.name) })
+	return conns
+}
+
+// RemoveError says the node called Node failed to remove the app called
+// App, as Err says. Stopped says the removal was stopped, or lost the
+// lock, as Err then says, before the node answered, so that the node's
+// removal may or may not go on.
+type RemoveError struct {
+	Node, App string
+	Err       error
+	Stopped   bool
+}
+
+func (e *RemoveError) Error() string {
+	return fmt.Sprintf("%s failed to remove %s: %v", e.Node, e.App, e.Err)
+}
+
+func (e *RemoveError) Unwrap() error { return e.Err }
+
+// RemoveApp has every node the cluster has a connection to remove the
+// app called app, one node after another in order of their names,
+// telling told each node that kept the app's container as it removes
+// it. Every node is asked, not only those whose status lists the app, as
+// a node answers once a run under way ended, such as one a deploy stopped
+// before its answer left going on: what the node says it removed
+// decides. The node deletes the container, its image unless another
+// container uses it, and its log. It returns the nodes the app was
+// removed from, none if no node kept it. It fails, before any node is
+// asked, as askable does; with a *RemoveError if a node's removal fails,
+// asking no node after it; and before a node's removal once the
+// operation can't be sure it holds the lock, or was stopped.
+//
+// Temporary: the nodes are the only record of where an app runs, as
+// Place says.
+func (c *Cluster) RemoveApp(ctx context.Context, app string, told func(node string)) ([]string, error) {
+	if err := c.askable(ctx); err != nil {
+		return nil, err
+	}
+	name := appfile.ContainerName(app)
+	var removedFrom []string
+	for _, n := range c.sortedConns() {
+		if err := c.CheckLock(); err != nil {
+			if len(removedFrom) == 0 {
+				return nil, fmt.Errorf("%w, before mooctl removed %s from any node; nothing changed", err, app)
+			}
+			return removedFrom, fmt.Errorf("%w, so mooctl removed %s from no more nodes", err, app)
+		}
+		if cause := stopped(ctx); cause != nil {
+			return removedFrom, fmt.Errorf("mooctl stopped before it removed %s from %s: %w; nothing changed there", app, n.name, cause)
+		}
+		removed, err := n.conn.Remove(ctx, name, c.lease.Lease)
+		if err != nil {
+			if cause := stopped(ctx); cause != nil {
+				// A removal goes on once the agent has the call.
+				return removedFrom, &RemoveError{Node: n.name, App: app, Err: cause, Stopped: true}
+			}
+			return removedFrom, &RemoveError{Node: n.name, App: app, Err: err}
+		}
+		if removed {
+			removedFrom = append(removedFrom, n.name)
+			told(n.name)
+		}
+	}
+	return removedFrom, nil
 }
 
 // run has n run app's container, from the image pulled, as p placed it,

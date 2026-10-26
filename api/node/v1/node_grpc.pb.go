@@ -109,10 +109,12 @@ type AgentClient interface {
 	// image, or if a container of another name serves its API.
 	Run(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*RunResponse, error)
 	// Remove stops and deletes the container of the request's name, and
-	// empties its log; removing one the node doesn't keep succeeds. Once
-	// the agent has the call, it goes on even if the call ends. It is
-	// refused with FAILED_PRECONDITION, changing nothing, unless the
-	// request's lease holds the operation lock.
+	// empties its log; removing one the node doesn't keep succeeds. It
+	// answers whether the node kept one. It waits for a run or a removal
+	// under way to end, and answers as that left the node. Once the agent
+	// has the call, it goes on even if the call ends. It is refused with
+	// FAILED_PRECONDITION, changing nothing, unless the request's lease
+	// holds the operation lock.
 	Remove(ctx context.Context, in *RemoveRequest, opts ...grpc.CallOption) (*RemoveResponse, error)
 	// RemoveIdentities adds node identities, by their fingerprints, to
 	// those the node holds as removed from the cluster, and refuses peers
@@ -380,10 +382,12 @@ type AgentServer interface {
 	// image, or if a container of another name serves its API.
 	Run(context.Context, *RunRequest) (*RunResponse, error)
 	// Remove stops and deletes the container of the request's name, and
-	// empties its log; removing one the node doesn't keep succeeds. Once
-	// the agent has the call, it goes on even if the call ends. It is
-	// refused with FAILED_PRECONDITION, changing nothing, unless the
-	// request's lease holds the operation lock.
+	// empties its log; removing one the node doesn't keep succeeds. It
+	// answers whether the node kept one. It waits for a run or a removal
+	// under way to end, and answers as that left the node. Once the agent
+	// has the call, it goes on even if the call ends. It is refused with
+	// FAILED_PRECONDITION, changing nothing, unless the request's lease
+	// holds the operation lock.
 	Remove(context.Context, *RemoveRequest) (*RemoveResponse, error)
 	// RemoveIdentities adds node identities, by their fingerprints, to
 	// those the node holds as removed from the cluster, and refuses peers

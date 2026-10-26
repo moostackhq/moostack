@@ -851,7 +851,7 @@ func (n unreachedNode) Run(context.Context, *nodev1.Container, string) (bool, er
 	return false, n.err
 }
 
-func (n unreachedNode) Remove(context.Context, string, string) error { return n.err }
+func (n unreachedNode) Remove(context.Context, string, string) (bool, error) { return false, n.err }
 
 func (n unreachedNode) Close() error { return nil }
 

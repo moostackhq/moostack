@@ -87,7 +87,7 @@ type stopDuringRemove struct {
 	stop func()
 }
 
-func (s stopDuringRemove) Remove(ctx context.Context, name, lease string) error {
+func (s stopDuringRemove) Remove(ctx context.Context, name, lease string) (bool, error) {
 	go func() { time.Sleep(20 * time.Millisecond); s.stop() }()
 	return s.fixtureNode.Remove(ctx, name, lease)
 }

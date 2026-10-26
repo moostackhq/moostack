@@ -234,10 +234,11 @@ func (r *serviceRecorder) ImportImage(_ context.Context, archive []byte, _ strin
 	return []string{string(archive)}, nil
 }
 
-func (r *serviceRecorder) Remove(_ context.Context, name, _ string) error {
+func (r *serviceRecorder) Remove(_ context.Context, name, _ string) (bool, error) {
 	r.steps = append(r.steps, "remove "+name)
+	removed := slices.ContainsFunc(r.containers, func(c *nodev1.ContainerStatus) bool { return c.Name == name })
 	r.containers = slices.DeleteFunc(r.containers, func(c *nodev1.ContainerStatus) bool { return c.Name == name })
-	return nil
+	return removed, nil
 }
 
 func (r *serviceRecorder) Run(_ context.Context, c *nodev1.Container, _ string) (bool, error) {

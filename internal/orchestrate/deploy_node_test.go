@@ -5,10 +5,15 @@ package orchestrate_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/hostlayout"
@@ -28,6 +33,15 @@ func TestMain(m *testing.M) {
 // what the deploy left.
 func deployOn(t *testing.T, n *nodetest.Node, name, ref string) (*orchestrate.Deployed, error) {
 	t.Helper()
+	cl := operateOn(t, n)
+	defer cl.Close()
+	return cl.Deploy(cl.Context(), orchestrate.App{Name: name, Image: ref}, func(orchestrate.DeployStep) {})
+}
+
+// operateOn is n's agent as a cluster of one node, node1, past its
+// preflight.
+func operateOn(t *testing.T, n *nodetest.Node) *orchestrate.Cluster {
+	t.Helper()
 	dial := func(_ context.Context, _ string) (orchestrate.Node, error) {
 		return fixtureNode{&nodeclient.Node{Agent: n.Agent, Updater: n.Updater}}, nil
 	}
@@ -35,8 +49,116 @@ func deployOn(t *testing.T, n *nodetest.Node, name, ref string) (*orchestrate.De
 	if err != nil {
 		t.Fatal(err)
 	}
+	return cl
+}
+
+// removeOn removes the app called name from the agent of n, a cluster of
+// one node, and returns the nodes it was removed from.
+func removeOn(t *testing.T, n *nodetest.Node, name string) []string {
+	t.Helper()
+	cl := operateOn(t, n)
 	defer cl.Close()
-	return cl.Deploy(cl.Context(), orchestrate.App{Name: name, Image: ref}, func(orchestrate.DeployStep) {})
+	removed, err := cl.RemoveApp(cl.Context(), name, func(string) {})
+	if err != nil {
+		t.Fatalf("removing %s: %v", name, err)
+	}
+	return removed
+}
+
+// A deployed app removed from a real agent is gone from its status, and
+// its log is empty; its image stays while another app runs from it, and
+// goes with the last. Removing it again removes it from no node.
+func TestRemoveAppOnANodeDeletesTheAppItsLogAndItsLastImage(t *testing.T) {
+	n := nodetest.Start(t)
+	r := nodetest.StartRegistry(t, n)
+	n.EventuallyHealthy(t)
+	ref, _ := r.Push(t, "web", "1", nodetest.Image{Name: "registry.test/web:1"})
+	for _, app := range []string{"web", "api"} {
+		if _, err := deployOn(t, n, app, ref); err != nil {
+			t.Fatalf("deploying %s: %v", app, err)
+		}
+	}
+	webLog := hostlayout.ContainerLogDir + "/app-web.log"
+	nodetest.Eventually(t, 30*time.Second, func() error {
+		if out, err := n.Output("root", "cat", webLog); err != nil || out == "" {
+			return fmt.Errorf("web's log holds %q, %v, once deployed, so an empty one would prove nothing", out, err)
+		}
+		return nil
+	})
+	if got := removeOn(t, n, "web"); !slices.Equal(got, []string{"node1"}) {
+		t.Errorf("web was removed from %v, want node1", got)
+	}
+	if appListed(t, n, "app-web") || !appListed(t, n, "app-api") {
+		t.Error("once web was removed, the node keeps app-web, or app-api no more")
+	}
+	if out, err := n.Output("root", "cat", webLog); err != nil || out != "" {
+		t.Errorf("the removed app's log holds %q, %v, want it there and empty", out, err)
+	}
+	if !nodeHasImage(t, n, ref) {
+		t.Errorf("%s is gone, although api runs from it", ref)
+	}
+	removeOn(t, n, "api")
+	if nodeHasImage(t, n, ref) {
+		t.Errorf("%s is kept, although no app runs from it", ref)
+	}
+	if got := removeOn(t, n, "web"); len(got) != 0 {
+		t.Errorf("removing web again removed it from %v, want none", got)
+	}
+}
+
+// mooctl stopped while a real agent removes the app, once the agent has
+// the call, hears that the removal may go on, which the agent finishes:
+// the app goes, and its image with it.
+func TestRemoveAppStoppedDuringARemovalOnANodeGoesOnThere(t *testing.T) {
+	n := nodetest.Start(t)
+	r := nodetest.StartRegistry(t, n)
+	n.EventuallyHealthy(t)
+	ref, _ := r.Push(t, "web", "1", nodetest.Image{Name: "registry.test/web:1"})
+	if _, err := deployOn(t, n, "web", ref); err != nil {
+		t.Fatal(err)
+	}
+	opCtx, stop := context.WithCancel(t.Context())
+	defer stop()
+	dial := func(context.Context, string) (orchestrate.Node, error) {
+		return stopDuringRemove{fixtureNode{&nodeclient.Node{Agent: n.Agent, Updater: n.Updater}}, stop}, nil
+	}
+	cl, err := orchestrate.Preflight(opCtx, orchestrate.Nodes{Names: []string{"node1"}, Dial: dial}, 0, true, holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	_, err = cl.RemoveApp(cl.Context(), "web", func(string) {})
+	var re *orchestrate.RemoveError
+	if !errors.As(err, &re) || !re.Stopped || !errors.Is(err, context.Canceled) {
+		t.Fatalf("RemoveApp stopped during the agent's removal: %v, want a stopped *RemoveError", err)
+	}
+	nodetest.Eventually(t, 30*time.Second, func() error {
+		if appListed(t, n, "app-web") || nodeHasImage(t, n, ref) {
+			return fmt.Errorf("once mooctl stopped, the agent still keeps app-web or %s", ref)
+		}
+		return nil
+	})
+}
+
+// appListed reports whether n's status lists the container called name.
+func appListed(t *testing.T, n *nodetest.Node, name string) bool {
+	t.Helper()
+	s, err := n.Status(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return slices.ContainsFunc(s.Containers, func(c *nodev1.ContainerStatus) bool { return c.Name == name })
+}
+
+// nodeHasImage reports whether n keeps the image called name.
+func nodeHasImage(t *testing.T, n *nodetest.Node, name string) bool {
+	t.Helper()
+	ctx := namespaces.WithNamespace(t.Context(), hostlayout.ContainerdNamespace)
+	_, err := n.Containerd(t).ImageService().Get(ctx, name)
+	if err != nil && !errdefs.IsNotFound(err) {
+		t.Fatal(err)
+	}
+	return err == nil
 }
 
 // A deploy on a real agent pulls the image from a registry the node

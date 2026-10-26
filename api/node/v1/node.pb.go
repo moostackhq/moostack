@@ -1485,7 +1485,10 @@ func (x *RemoveRequest) GetLease() string {
 }
 
 type RemoveResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Removed says the node kept a container of the request's name, which
+	// it removed.
+	Removed       bool `protobuf:"varint,1,opt,name=removed,proto3" json:"removed,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1518,6 +1521,13 @@ func (x *RemoveResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use RemoveResponse.ProtoReflect.Descriptor instead.
 func (*RemoveResponse) Descriptor() ([]byte, []int) {
 	return file_api_node_v1_node_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *RemoveResponse) GetRemoved() bool {
+	if x != nil {
+		return x.Removed
+	}
+	return false
 }
 
 type RemoveIdentitiesRequest struct {
@@ -2478,8 +2488,9 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"\astarted\x18\x01 \x01(\bR\astarted\"9\n" +
 	"\rRemoveRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
-	"\x05lease\x18\x02 \x01(\tR\x05lease\"\x10\n" +
-	"\x0eRemoveResponse\"O\n" +
+	"\x05lease\x18\x02 \x01(\tR\x05lease\"*\n" +
+	"\x0eRemoveResponse\x12\x18\n" +
+	"\aremoved\x18\x01 \x01(\bR\aremoved\"O\n" +
 	"\x17RemoveIdentitiesRequest\x12\x1e\n" +
 	"\n" +
 	"identities\x18\x01 \x03(\tR\n" +

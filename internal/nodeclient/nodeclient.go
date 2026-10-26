@@ -408,10 +408,14 @@ func (n *Node) PullImage(ctx context.Context, ref, lease string) (PulledImage, e
 }
 
 // Remove has the agent stop and delete the container called name, for
-// the operation whose lease holds the node's operation lock.
-func (n *Node) Remove(ctx context.Context, name, lease string) error {
-	_, err := n.Agent.Remove(ctx, &nodev1.RemoveRequest{Name: name, Lease: lease})
-	return err
+// the operation whose lease holds the node's operation lock, and says
+// whether it removed one.
+func (n *Node) Remove(ctx context.Context, name, lease string) (bool, error) {
+	res, err := n.Agent.Remove(ctx, &nodev1.RemoveRequest{Name: name, Lease: lease})
+	if err != nil {
+		return false, err
+	}
+	return res.Removed, nil
 }
 
 // Run has the agent run c from its image, replacing the container of its

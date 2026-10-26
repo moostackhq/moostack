@@ -59,6 +59,13 @@ type appFake struct {
 	// held.
 	statusErr error
 	afterRun  func()
+	// onRun, if set, is called as an app's run starts, holding the runner,
+	// and runDelay is how long the run takes before it makes the
+	// container; waiting, if set, is called as a run is about to wait for
+	// the runner.
+	onRun    func()
+	runDelay time.Duration
+	waiting  func()
 }
 
 // PullImage pulls ref from the node's registry, keeping it as an image
@@ -106,6 +113,45 @@ func (n *node) PullImage(ctx context.Context, ref, lease string) (nodeclient.Pul
 		n.mu.Lock()
 	}
 	return nodeclient.PulledImage{Name: ref, Digest: digest}, nil
+}
+
+// runAppCall runs the app's container c, as runApp does, holding the
+// runner, as the agent's run does, which checks the lease once it no
+// longer waits for it. Like the agent's, it goes on if its call ends,
+// its caller told at once that the call ended.
+func (n *node) runAppCall(ctx context.Context, c *nodev1.Container, lease string) error {
+	ran := make(chan error, 1)
+	n.mu.Lock()
+	waiting := n.app.waiting
+	n.mu.Unlock()
+	go func() {
+		if waiting != nil {
+			waiting()
+		}
+		n.runner.Lock()
+		defer n.runner.Unlock()
+		if err := n.fence(lease); err != nil {
+			ran <- err
+			return
+		}
+		n.mu.Lock()
+		onRun, delay := n.app.onRun, n.app.runDelay
+		n.mu.Unlock()
+		if onRun != nil {
+			onRun()
+		}
+		time.Sleep(delay)
+		ran <- n.runApp(c)
+	}()
+	select {
+	case err := <-ran:
+		if err != nil {
+			return err
+		}
+		return ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // runApp runs the app's container c, as the agent does, from an image

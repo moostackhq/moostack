@@ -44,10 +44,12 @@ type apps struct {
 	leaves *nodev1.ContainerStatus
 	// started says whether the last run started its container's process.
 	started bool
-	// pulling and running, if set, are called with the call's context as
-	// a pull or an app's run starts, and ran once an app's run is done.
-	pulling, running func(ctx context.Context)
-	ran              func()
+	// pulling, running and removing, if set, are called with the call's
+	// context as a pull, an app's run or a removal starts, and ran once an
+	// app's run is done; removed, with the call's context, once a removal
+	// is done.
+	pulling, running, removing, removed func(ctx context.Context)
+	ran                                 func()
 }
 
 // PullImage pulls ref from the node's registry, as the agent does,
@@ -353,7 +355,7 @@ func TestDeployChecksTheAppThreeSecondsAfterItStarted(t *testing.T) {
 func TestADeployOfAnAppOnTwoNodesChangesNothing(t *testing.T) {
 	wantDeploy(t, func() map[string]*fakeNode {
 		return map[string]*fakeNode{"node1": pulling(nginxBuild, appRunning("web", nginx, nginxBuild)), "node2": pulling(nginxBuild, appRunning("web", nginx, nginxBuild))}
-	}, web(t), "", "web runs on node1 and node2, more than one node, so mooctl can't tell which to replace; nothing changed")
+	}, web(t), "", "web runs on node1 and node2, more than one node, so mooctl can't tell which to replace; nothing changed\nRun mooctl deploy --remove, which removes web from every node it runs on, then deploy it again")
 }
 
 func TestABadAppFileIsRefusedBeforeAnyNodeIsContacted(t *testing.T) {
@@ -536,6 +538,23 @@ func TestDeployForcedPastALaterGenerationRunsTheAppAndRecordsNoGeneration(t *tes
 	}
 	if len(n.generations()) != 0 {
 		t.Errorf("deploy --force recorded generations %v", n.generations())
+	}
+}
+
+// --force past a node that applied a generation listing a node this
+// cluster directory doesn't has deploy refuse, rather than place the app
+// without asking that node what it runs.
+func TestDeployForcedPastAnUnlistedNodeChangesNothing(t *testing.T) {
+	o := newOperator(t, "op")
+	n := pulling(nginxBuild)
+	n.status.Generation, n.status.Nodes = 2, []string{"node1", "node2"}
+	deployCluster(t, o, map[string]*fakeNode{"node1": n})
+	r := o.run("deploy", "--force", web(t))
+	if want := "generation 2 lists node2, which this cluster directory doesn't, so mooctl can't ask them which apps they run; pull the latest cluster directory; nothing changed"; r.err == nil || r.err.Error() != want || r.stdout != "" {
+		t.Errorf("deploy --force past an unlisted node printed\n%s\nand says %v, want\n%s", r.stdout, r.err, want)
+	}
+	if len(n.pulls()) != 0 || len(n.asked) != 0 {
+		t.Errorf("the node pulled %v and was asked to run %v", n.pulls(), n.asked)
 	}
 }
 

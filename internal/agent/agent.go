@@ -192,6 +192,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		servers[tunnel] = agent.tunnel
 	}
 	go containers.StartAll(ctx)
+	go containers.KeepDeletingUnused(ctx, unusedRetry, changeTimeout)
 	go recoverUpdater(ctx, updater)
 	return serveAll(ctx, servers)
 }
@@ -550,10 +551,11 @@ func (s *agentServer) Run(ctx context.Context, req *nodev1.RunRequest) (*nodev1.
 func (s *agentServer) Remove(ctx context.Context, req *nodev1.RemoveRequest) (*nodev1.RemoveResponse, error) {
 	// The removal goes on if the call ends, as a run does.
 	ctx = context.WithoutCancel(ctx)
-	if err := s.containers.Remove(ctx, req.Name, s.fence(req.Lease)); err != nil {
+	removed, err := s.containers.Remove(ctx, req.Name, s.fence(req.Lease))
+	if err != nil {
 		return nil, asStatus(err, "removing "+req.Name)
 	}
-	return &nodev1.RemoveResponse{}, nil
+	return &nodev1.RemoveResponse{Removed: removed}, nil
 }
 
 // asStatus is err as a call answers it: as it is if it has a code, and

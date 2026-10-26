@@ -777,19 +777,54 @@ func TestTheFakeNodeRefusesAsTheAgentDoes(t *testing.T) {
 	if _, err := n.ImportImage(ended, []byte("image moostack.local/dns:1.0.0"), "ours"); err == nil {
 		t.Error("the fake imported for an ended call")
 	}
-	if err := n.Remove(ended, "dns", "ours"); err == nil || !slices.Contains(n.containerNames(), "dns") {
+	if _, err := n.Remove(ended, "dns", "ours"); err == nil || !slices.Contains(n.containerNames(), "dns") {
 		t.Errorf("the fake removed dns for an ended call: %v", err)
 	}
 	ending, stop := context.WithCancel(ctx)
 	n.onUpdateOf = map[string]func(){"remove dns": stop}
-	if err := n.Remove(ending, "dns", "ours"); err == nil || slices.Contains(n.containerNames(), "dns") {
+	if _, err := n.Remove(ending, "dns", "ours"); err == nil || slices.Contains(n.containerNames(), "dns") {
 		t.Errorf("the fake's removal whose call ended meanwhile: %v, with %q left; want it told the call ended, and dns removed", err, n.containerNames())
+	}
+	// An app's run waits for the runner, and its lease is checked once it
+	// no longer waits, as the agent's is: one whose lease no longer holds
+	// the lock by then is refused.
+	n = fresh()
+	n.images = map[string]bool{"docker.io/library/nginx:1.27": true}
+	n.runner.Lock()
+	waits := make(chan struct{})
+	n.app.waiting = func() { close(waits) }
+	ran := make(chan error, 1)
+	go func() {
+		_, err := n.Run(ctx, &nodev1.Container{Name: "app-web", Image: "docker.io/library/nginx:1.27"}, "ours")
+		ran <- err
+	}()
+	<-waits
+	n.lockFor("theirs", time.Hour)
+	n.runner.Unlock()
+	if err := <-ran; err == nil || slices.Contains(n.containerNames(), "app-web") {
+		t.Errorf("the fake ran app-web for a lease that lost the lock while the run waited: %v", err)
+	}
+	// An app's container goes from what the node reports, its image with
+	// it unless another container runs from it.
+	n = fresh()
+	n.others = []*nodev1.ContainerStatus{{Name: "app-web", Image: "docker.io/library/nginx:1.27"}, {Name: "app-api", Image: "docker.io/library/nginx:1.27"}}
+	n.images = map[string]bool{"docker.io/library/nginx:1.27": true}
+	for _, app := range []string{"app-web", "app-api"} {
+		if _, err := n.Remove(ctx, app, "ours"); err != nil {
+			t.Fatal(err)
+		}
+		if slices.Contains(n.containerNames(), app) {
+			t.Errorf("the fake reports %s once removed", app)
+		}
+		if kept := n.images["docker.io/library/nginx:1.27"]; kept != (app == "app-web") {
+			t.Errorf("once %s was removed, the fake keeps its image: %v", app, kept)
+		}
 	}
 	n = fresh()
 	if _, err := n.ImportImage(ctx, []byte("image moostack.local/dns:1.0.0"), "theirs"); err == nil {
 		t.Error("the fake imported for another lease")
 	}
-	if err := n.Remove(ctx, "dns", "theirs"); err == nil {
+	if _, err := n.Remove(ctx, "dns", "theirs"); err == nil {
 		t.Error("the fake removed for another lease")
 	}
 	if _, err := n.ImportImage(ctx, []byte("image moostack.local/dns:1.0.0"), "ours"); err != nil {
@@ -798,7 +833,7 @@ func TestTheFakeNodeRefusesAsTheAgentDoes(t *testing.T) {
 	if _, err := n.Run(ctx, dns, "ours"); err == nil {
 		t.Error("the fake ran service-dns while dns runs")
 	}
-	if err := n.Remove(ctx, "dns", "ours"); err != nil {
+	if _, err := n.Remove(ctx, "dns", "ours"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := n.Run(ctx, dns, "ours"); err == nil {

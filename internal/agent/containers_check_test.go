@@ -153,7 +153,7 @@ func FuzzCheckContainer(f *testing.F) {
 
 func TestRemoveRefusesAnInvalidName(t *testing.T) {
 	for _, name := range []string{"", "App", "1app", "app.web", "a/../b", "app-", "app--web", "a" + strings.Repeat("b", 63)} {
-		if err := (&containers{}).Remove(t.Context(), name, nil); status.Code(err) != codes.InvalidArgument {
+		if _, err := (&containers{}).Remove(t.Context(), name, nil); status.Code(err) != codes.InvalidArgument {
 			t.Errorf("removing %q: %v, want it refused as an invalid argument", name, err)
 		}
 	}

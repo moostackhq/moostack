@@ -42,7 +42,7 @@ func (a *recordingAgent) Remove(_ context.Context, req *nodev1.RemoveRequest) (*
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.removes = append(a.removes, req)
-	return &nodev1.RemoveResponse{}, nil
+	return &nodev1.RemoveResponse{Removed: req.Name == "dns"}, nil
 }
 
 // serveRecording serves a over a socket, and returns a client of it.
@@ -104,10 +104,13 @@ func TestImportImageSendsTheLeaseInTheFirstRequestAlone(t *testing.T) {
 func TestRemoveSendsTheNameAndTheLease(t *testing.T) {
 	a := &recordingAgent{}
 	n := &Node{Agent: serveRecording(t, a)}
-	if err := n.Remove(t.Context(), "dns", "the-lease"); err != nil {
-		t.Fatal(err)
+	if removed, err := n.Remove(t.Context(), "dns", "the-lease"); err != nil || !removed {
+		t.Fatalf("Remove = %v, %v, want the agent's answer that it removed dns", removed, err)
 	}
-	if len(a.removes) != 1 || a.removes[0].Name != "dns" || a.removes[0].Lease != "the-lease" {
+	if removed, err := n.Remove(t.Context(), "web", "the-lease"); err != nil || removed {
+		t.Fatalf("Remove of web = %v, %v, want the agent's answer that it kept no web", removed, err)
+	}
+	if len(a.removes) != 2 || a.removes[0].Name != "dns" || a.removes[0].Lease != "the-lease" {
 		t.Errorf("Remove sent %v, want dns for the-lease", a.removes)
 	}
 }

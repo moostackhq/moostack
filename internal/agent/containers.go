@@ -478,10 +478,48 @@ func (s *containers) store(list []*container, unused []unusedImage) error {
 	return writeFile(s.file, append(data, '\n'))
 }
 
+// unusedRetry is how often the agent tries again to delete the images left
+// to delete, as one whose deletion failed.
+const unusedRetry = time.Minute
+
+// KeepDeletingUnused tries again every interval, until ctx ends, to
+// delete the images left to delete. An image whose deletion failed is
+// then deleted without waiting for a change or a restart of the agent.
+// Each try gives up after within, so that a containerd that doesn't
+// answer holds the changes waiting for the runner no longer.
+func (s *containers) KeepDeletingUnused(ctx context.Context, interval, within time.Duration) {
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		s.deleteAllUnusedWithin(ctx, within)
+	}
+}
+
+// deleteAllUnusedWithin deletes the unused images, as deleteAllUnused
+// does, holding the runner, and giving up after within. Those it can't
+// delete, or can't store as left, the next try or the next change
+// deletes.
+func (s *containers) deleteAllUnusedWithin(ctx context.Context, within time.Duration) {
+	s.running.Lock()
+	defer s.running.Unlock()
+	ctx, cancel := context.WithTimeout(namespaced(ctx), within)
+	defer cancel()
+	_ = s.deleteAllUnused(ctx)
+}
+
 // StartAll starts every stored container that isn't running, as after the
 // node boots, trying again every few seconds for those that fail, until
 // all run or ctx ends. Each try starts the container as it is stored
-// then, so that a try never undoes a Run in between.
+// then, so that a try never undoes a Run in between. After each try it
+// deletes the unused images. A crash can leave one: after a removal
+// stored the list without its container, or after a replacement stored
+// the list with its new image. No change would come to delete it, as
+// nothing is left to change.
 func (s *containers) StartAll(ctx context.Context) {
 	var pending []string
 	s.mu.Lock()
@@ -489,7 +527,7 @@ func (s *containers) StartAll(ctx context.Context) {
 		pending = append(pending, c.Name)
 	}
 	s.mu.Unlock()
-	for len(pending) > 0 {
+	for {
 		var failed []string
 		for _, name := range pending {
 			s.running.Lock()
@@ -502,6 +540,10 @@ func (s *containers) StartAll(ctx context.Context) {
 			if err != nil {
 				failed = append(failed, name)
 			}
+		}
+		s.deleteAllUnusedWithin(ctx, changeTimeout)
+		if len(failed) == 0 {
+			return
 		}
 		pending = failed
 		select {
@@ -1019,19 +1061,23 @@ func truncate(path string) error {
 // other unused images unless a container runs from them, as a change,
 // which fence lets happen. It deletes the container before it stores the
 // list without it, so that a crash in between leaves it kept, for a
-// Remove again to finish.
-func (s *containers) Remove(ctx context.Context, name string, fence func() error) error {
+// Remove again to finish. It says whether the node kept the container,
+// as it was once a run or a removal under way ended.
+func (s *containers) Remove(ctx context.Context, name string, fence func() error) (bool, error) {
 	if err := nodev1.CheckName(name); err != nil {
-		return err
+		return false, err
 	}
-	return s.change(ctx, fence, func(ctx context.Context) error {
+	var removed bool
+	err := s.change(ctx, fence, func(ctx context.Context) error {
 		if c := s.stored(name); c != nil {
 			if err := s.remove(ctx, c); err != nil {
 				return err
 			}
+			removed = true
 		}
 		return s.deleteAllUnused(ctx)
 	})
+	return removed, err
 }
 
 // remove removes the stored container c, as Remove says, but for the
@@ -1081,16 +1127,21 @@ func (s *containers) remove(ctx context.Context, c *container) error {
 }
 
 // deleteContainer kills c's task, if it has one, and deletes c with its
-// snapshot.
+// snapshot. A task or a container gone meanwhile is deleted, as when
+// containerd finished a deletion that an agent which crashed had asked
+// for.
 func deleteContainer(ctx context.Context, c containerd.Container) error {
 	if task, err := c.Task(ctx, nil); err == nil {
-		if _, err := task.Delete(ctx, containerd.WithProcessKill); err != nil {
+		if _, err := task.Delete(ctx, containerd.WithProcessKill); err != nil && !errdefs.IsNotFound(err) {
 			return err
 		}
 	} else if !errdefs.IsNotFound(err) {
 		return err
 	}
-	return c.Delete(ctx, containerd.WithSnapshotCleanup)
+	if err := c.Delete(ctx, containerd.WithSnapshotCleanup); err != nil && !errdefs.IsNotFound(err) {
+		return err
+	}
+	return nil
 }
 
 // route routes the API that c's container was made for to c's socket, so

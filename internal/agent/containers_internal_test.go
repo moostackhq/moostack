@@ -5,9 +5,14 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -16,6 +21,7 @@ import (
 	imagesapi "github.com/containerd/containerd/api/services/images/v1"
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
 	containerd "github.com/containerd/containerd/v2/client"
+	containerdcontainers "github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/defaults"
@@ -25,6 +31,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/gateway"
@@ -119,26 +126,419 @@ func TestAnImageWhoseDeletionFailedIsDeletedByTheNextChange(t *testing.T) {
 			n.Import(t, nodetest.Image{Name: "example.test/app:1"})
 			deleting := true
 			s := takeOver(t, n, "app-web", "example.test/app:1", failing(t, n, "/containerd.services.images.v1.Images/Delete", &deleting))
-			if err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
+			if _, err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
 				t.Fatalf("removing app-web while images can't be deleted: %v, want it removed all the same", err)
 			}
 			deleting = false
 			fail := true
 			again := loadAgain(t, s, failing(t, n, method, &fail))
-			if err := again.Remove(t.Context(), "app-other", unfenced); err != nil {
+			if _, err := again.Remove(t.Context(), "app-other", unfenced); err != nil {
 				t.Fatalf("a change while %s fails: %v", what, err)
 			}
 			if !hasImageIn(t, n, "example.test/app:1") {
 				t.Fatalf("app-web's image went while %s fails", what)
 			}
 			fail = false
-			if err := loadAgain(t, s, s.client).Remove(t.Context(), "app-other", unfenced); err != nil {
+			if _, err := loadAgain(t, s, s.client).Remove(t.Context(), "app-other", unfenced); err != nil {
 				t.Fatal(err)
 			}
 			if hasImageIn(t, n, "example.test/app:1") {
 				t.Errorf("app-web's image is kept after the next change, once %s works", what)
 			}
 		})
+	}
+}
+
+// An image kept to delete, as a removal whose deletion failed keeps it,
+// or one a crash cut off once it stored the list without its container,
+// goes when the agent starts, without another change: no removal again
+// would see the container, which the node keeps no more.
+func TestAnImageKeptToDeleteIsDeletedWhenTheAgentStarts(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.Import(t, nodetest.Image{Name: "example.test/app:1"})
+	deleting := true
+	s := takeOver(t, n, "app-web", "example.test/app:1", failing(t, n, "/containerd.services.images.v1.Images/Delete", &deleting))
+	if _, err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
+		t.Fatalf("removing app-web while images can't be deleted: %v, want it removed all the same", err)
+	}
+	if !hasImageIn(t, n, "example.test/app:1") {
+		t.Fatal("app-web's image went, though images can't be deleted")
+	}
+	deleting = false
+	loadAgain(t, s, s.client).StartAll(t.Context())
+	if hasImageIn(t, n, "example.test/app:1") {
+		t.Error("app-web's image, kept to delete, is kept after the agent started")
+	}
+}
+
+// A replacement cut off once it stored the list with the new image, the
+// old container still there, is finished when the agent starts, and the
+// image it replaced goes then too: a deploy run again sees the new build
+// run and sends no run that would delete it.
+func TestAReplacementFinishedByTheAgentsStartDeletesTheImageItReplaced(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.Import(t, nodetest.Image{Name: "example.test/app:1"})
+	n.Import(t, nodetest.Image{Name: "example.test/other:1", Rebuild: 1})
+	s := takeOver(t, n, "app-web", "example.test/app:1", nil)
+	unused, err := s.markUnused(namespaced(t.Context()), nil, "example.test/app:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The agent's list says what a replacement cut off once it stored the
+	// list leaves: app-web from the new image, and the old one unused.
+	data, err := json.Marshal(listFile{Containers: []*container{{Name: "app-web", Image: "example.test/other:1"}}, Unused: unused})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.Exec(t, "root", "sh", "-c", `printf '%s\n' "$1" > `+hostlayout.ContainersFile, "-", string(data))
+	// The real agent starts from the state the crash left.
+	n.Restart(t, "agent")
+	n.EventuallyHealthy(t)
+	runs := func() string {
+		s, err := n.Status(t)
+		if err != nil {
+			return ""
+		}
+		for _, c := range s.Containers {
+			if c.Name == "app-web" && c.State == nodev1.TaskState_TASK_STATE_RUNNING {
+				return c.Image
+			}
+		}
+		return ""
+	}
+	nodetest.Eventually(t, time.Minute, func() error {
+		if got := runs(); got != "example.test/other:1" {
+			return fmt.Errorf("app-web runs from %q after the agent's start, want example.test/other:1", got)
+		}
+		if hasImageIn(t, n, "example.test/app:1") {
+			return errors.New("example.test/app:1, which the replacement replaced, is kept after the agent's start")
+		}
+		return nil
+	})
+}
+
+// An image kept to delete goes at the agent's first try of its starts,
+// though another container fails every try, as one whose image the node
+// lacks.
+func TestAnImageKeptToDeleteGoesWhileAnotherContainerFailsToStart(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.Import(t, nodetest.Image{Name: "example.test/app:1"})
+	deleting := true
+	s := takeOver(t, n, "app-web", "example.test/app:1", failing(t, n, "/containerd.services.images.v1.Images/Delete", &deleting))
+	if _, err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
+		t.Fatal(err)
+	}
+	deleting = false
+	again := loadAgain(t, s, s.client)
+	if err := again.store([]*container{{Name: "app-bad", Image: "example.test/missing:1"}}, again.unused); err != nil {
+		t.Fatal(err)
+	}
+	// Less than a second try's wait, so that the first try decides.
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	loadAgain(t, again, s.client).StartAll(ctx)
+	if hasImageIn(t, n, "example.test/app:1") {
+		t.Error("app-web's image, kept to delete, is kept while app-bad fails to start")
+	}
+}
+
+// An image whose deletion failed goes on a later try, with no change or
+// start of the agent, while one that still can't be deleted stays kept.
+func TestAnImageWhoseDeletionFailedGoesOnALaterTry(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.Import(t, nodetest.Image{Name: "example.test/app:1"})
+	// Deletions fail while deleting says so, and each that fails is told
+	// on failed, so that the test sees the tries go on failing.
+	var mu sync.Mutex
+	deleting := true
+	failed := make(chan struct{}, 16)
+	client := clientThrough(t, n, func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		mu.Lock()
+		fail := deleting && method == "/containerd.services.images.v1.Images/Delete"
+		mu.Unlock()
+		if fail {
+			select {
+			case failed <- struct{}{}:
+			default:
+			}
+			return status.Error(codes.Unavailable, "failed for the test")
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	})
+	s := takeOver(t, n, "app-web", "example.test/app:1", client)
+	if _, err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
+		t.Fatal(err)
+	}
+	<-failed
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.KeepDeletingUnused(ctx, 50*time.Millisecond, 50*time.Millisecond)
+	}()
+	defer func() { cancel(); <-done }()
+	// Two tries fail before deletions work again.
+	for range 2 {
+		select {
+		case <-failed:
+		case <-time.After(10 * time.Second):
+			t.Fatal("no try deleted the image left to delete")
+		}
+	}
+	if !hasImageIn(t, n, "example.test/app:1") {
+		t.Fatal("app-web's image went while it can't be deleted")
+	}
+	mu.Lock()
+	deleting = false
+	mu.Unlock()
+	nodetest.Eventually(t, 10*time.Second, func() error {
+		if hasImageIn(t, n, "example.test/app:1") {
+			return errors.New("app-web's image is kept once it can be deleted, with no change to delete it")
+		}
+		return nil
+	})
+}
+
+// A try to delete the images left to delete, while containerd doesn't
+// answer, gives up within its bound, so that a removal waiting for the
+// runner meanwhile goes on.
+func TestATryToDeleteUnusedImagesGivesUpWhileContainerdDoesntAnswer(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.Import(t, nodetest.Image{Name: "example.test/app:1"})
+	var mu sync.Mutex
+	deleting, hang := false, false
+	hung := make(chan struct{}, 1)
+	client := clientThrough(t, n, func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		mu.Lock()
+		failDelete, hangGet := deleting && method == "/containerd.services.images.v1.Images/Delete", hang && method == "/containerd.services.images.v1.Images/Get"
+		if hangGet {
+			hang = false
+		}
+		mu.Unlock()
+		switch {
+		case failDelete:
+			return status.Error(codes.Unavailable, "failed for the test")
+		case hangGet:
+			hung <- struct{}{}
+			<-ctx.Done()
+			return status.FromContextError(ctx.Err()).Err()
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	})
+	mu.Lock()
+	deleting = true
+	mu.Unlock()
+	s := takeOver(t, n, "app-web", "example.test/app:1", client)
+	if _, err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	deleting, hang = false, true
+	mu.Unlock()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.KeepDeletingUnused(ctx, 500*time.Millisecond, 500*time.Millisecond)
+	}()
+	defer func() { cancel(); <-done }()
+	select {
+	case <-hung:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no try read the image left to delete")
+	}
+	removed := make(chan error, 1)
+	go func() { _, err := s.Remove(t.Context(), "app-other", unfenced); removed <- err }()
+	select {
+	case err := <-removed:
+		if err != nil {
+			t.Errorf("a removal once the try gave up: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a removal still waits for the runner 5s after a try that should give up within 500ms")
+	}
+}
+
+// The agent tries again, every unusedRetry, to delete an image left to
+// delete, with no change or restart: one a removal kept while a container
+// the agent doesn't keep ran from it goes once that container goes.
+func TestTheAgentDeletesAnImageLeftToDeleteOnALaterTry(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.Import(t, nodetest.Image{Name: "example.test/app:1"})
+	n.HoldLock(t)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	if _, err := n.Agent.Run(ctx, &nodev1.RunRequest{Container: &nodev1.Container{Name: "app-web", Image: "example.test/app:1"}, Lease: nodetest.Lease}); err != nil {
+		t.Fatal(err)
+	}
+	client := n.Containerd(t)
+	nsCtx := namespaced(t.Context())
+	other, err := client.ContainerService().Create(nsCtx, containerdcontainers.Container{ID: "not-kept",
+		Labels: map[string]string{imageLabel: "example.test/app:1"}, Runtime: containerdcontainers.RuntimeInfo{Name: "io.containerd.runc.v2"}, Spec: &anypb.Any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Agent.Remove(ctx, &nodev1.RemoveRequest{Name: "app-web", Lease: nodetest.Lease}); err != nil {
+		t.Fatal(err)
+	}
+	if !hasImageIn(t, n, "example.test/app:1") {
+		t.Fatal("app-web's image went, though a container the agent doesn't keep runs from it")
+	}
+	if err := client.ContainerService().Delete(nsCtx, other.ID); err != nil {
+		t.Fatal(err)
+	}
+	nodetest.Eventually(t, unusedRetry+30*time.Second, func() error {
+		if hasImageIn(t, n, "example.test/app:1") {
+			return errors.New("app-web's image is kept after nothing runs from it, with no change to delete it")
+		}
+		return nil
+	})
+}
+
+// A removal that waits for the runner, as while a run of the same name is
+// under way, judges whether the node keeps the container once it holds
+// the runner: it removes what the run stored meanwhile, and says so.
+func TestARemovalWaitingForARunRemovesWhatTheRunStored(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	s := containersThrough(t, n, nil)
+	s.running.Lock()
+	type answer struct {
+		removed bool
+		err     error
+	}
+	answered := make(chan answer, 1)
+	go func() {
+		removed, err := s.Remove(t.Context(), "app-web", unfenced)
+		answered <- answer{removed, err}
+	}()
+	// The run, holding the runner, stores the container it makes once the
+	// removal waits for the runner.
+	waitingForTheRunner(t, 1)
+	if err := s.store([]*container{{Name: "app-web", Image: "example.test/app:1"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.list = []*container{{Name: "app-web", Image: "example.test/app:1"}}
+	s.mu.Unlock()
+	s.running.Unlock()
+	a := <-answered
+	if a.err != nil || !a.removed {
+		t.Errorf("the removal that waited for the run = %v, %v, want it removed app-web", a.removed, a.err)
+	}
+	if s.stored("app-web") != nil {
+		t.Error("the node keeps app-web once the removal that waited for the run ended")
+	}
+}
+
+// A container that goes once the agent loaded it, as when containerd
+// finishes a deletion that an agent which crashed had asked for, is
+// deleted all the same.
+func TestDeletingAContainerGoneMeanwhileSucceeds(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	client := n.Containerd(t)
+	ctx := namespaced(t.Context())
+	if _, err := client.ContainerService().Create(ctx, containerdcontainers.Container{ID: "gone",
+		Runtime: containerdcontainers.RuntimeInfo{Name: "io.containerd.runc.v2"}, Spec: &anypb.Any{}}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := client.LoadContainer(ctx, "gone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ContainerService().Delete(ctx, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteContainer(ctx, c); err != nil {
+		t.Errorf("deleting a container gone meanwhile: %v, want it deleted", err)
+	}
+}
+
+// waitingForTheRunner waits until n removals wait for the runner, as the
+// goroutines' stacks show them, failing t after 10 seconds.
+func waitingForTheRunner(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		buf := make([]byte, 1<<20)
+		buf = buf[:runtime.Stack(buf, true)]
+		waiting := 0
+		for _, g := range strings.Split(string(buf), "\n\n") {
+			if strings.Contains(g, "sync.(*Mutex).Lock") && strings.Contains(g, "(*containers).Remove") {
+				waiting++
+			}
+		}
+		if waiting >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d removals wait for the runner, want %d", waiting, n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Two removals of one container, the second waiting for the first, as the
+// runner has it, answer of what the first left: one says it removed the
+// container, and the other that the node kept none.
+func TestARemovalWaitingForARemovalSaysItRemovedNone(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	s := containersThrough(t, n, nil)
+	if err := s.store([]*container{{Name: "app-web", Image: "example.test/app:1"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.list = []*container{{Name: "app-web", Image: "example.test/app:1"}}
+	s.mu.Unlock()
+	s.running.Lock()
+	answers := make(chan bool, 2)
+	for range 2 {
+		go func() {
+			removed, err := s.Remove(t.Context(), "app-web", unfenced)
+			if err != nil {
+				t.Error(err)
+			}
+			answers <- removed
+		}()
+	}
+	waitingForTheRunner(t, 2)
+	s.running.Unlock()
+	if first, second := <-answers, <-answers; first == second {
+		t.Errorf("two removals of app-web said removed %v and %v, want one of each", first, second)
+	}
+}
+
+// An image kept to delete while containerd can't list its containers at
+// the agent's start stays kept, and the next change deletes it.
+func TestAnImageTheAgentsStartCantDeleteIsKeptForTheNextChange(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	n.Import(t, nodetest.Image{Name: "example.test/app:1"})
+	deleting := true
+	s := takeOver(t, n, "app-web", "example.test/app:1", failing(t, n, "/containerd.services.images.v1.Images/Delete", &deleting))
+	if _, err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
+		t.Fatal(err)
+	}
+	deleting = false
+	listing := true
+	loadAgain(t, s, failing(t, n, "/containerd.services.containers.v1.Containers/List", &listing)).StartAll(t.Context())
+	if !hasImageIn(t, n, "example.test/app:1") {
+		t.Fatal("app-web's image went while containerd couldn't list its containers")
+	}
+	listing = false
+	if _, err := loadAgain(t, s, s.client).Remove(t.Context(), "app-other", unfenced); err != nil {
+		t.Fatal(err)
+	}
+	if hasImageIn(t, n, "example.test/app:1") {
+		t.Error("app-web's image is kept after the next change")
 	}
 }
 
@@ -152,7 +552,7 @@ func TestARemovalThatCantReadTheImageChangesNothingAndFinishesWhenRemovedAgain(t
 	n.Import(t, nodetest.Image{Name: "example.test/app:1"})
 	fail := true
 	s := takeOver(t, n, "app-web", "example.test/app:1", failing(t, n, "/containerd.services.images.v1.Images/Get", &fail))
-	if err := s.Remove(t.Context(), "app-web", unfenced); status.Code(err) != codes.Unavailable {
+	if _, err := s.Remove(t.Context(), "app-web", unfenced); status.Code(err) != codes.Unavailable {
 		t.Fatalf("removing app-web while its image can't be read: %v, want it refused as unavailable", err)
 	}
 	if made, _, err := s.load(namespaced(t.Context()), "app-web"); err != nil || made == nil {
@@ -162,7 +562,7 @@ func TestARemovalThatCantReadTheImageChangesNothingAndFinishesWhenRemovedAgain(t
 		t.Error("app-web is no longer stored after its removal failed")
 	}
 	fail = false
-	if err := loadAgain(t, s, s.client).Remove(t.Context(), "app-web", unfenced); err != nil {
+	if _, err := loadAgain(t, s, s.client).Remove(t.Context(), "app-web", unfenced); err != nil {
 		t.Fatal(err)
 	}
 	if hasImageIn(t, n, "example.test/app:1") {
@@ -213,7 +613,7 @@ func TestARemovalOfAContainerWhoseImageIsGoneFinishes(t *testing.T) {
 	n.Import(t, nodetest.Image{Name: "example.test/app:1"})
 	s := takeOver(t, n, "app-web", "example.test/app:1", nil)
 	n.DeleteImage(t, "example.test/app:1")
-	if err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
+	if _, err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
 		t.Fatal(err)
 	}
 	if again := loadAgain(t, s, s.client); again.stored("app-web") != nil || len(again.unused) != 0 {
@@ -258,7 +658,7 @@ func TestARunWhoseImageFailsToUnpackLeavesTheOldContainerRunning(t *testing.T) {
 	// The old container's image, which it runs from, stays while it does,
 	// whatever the next change deletes.
 	fail = false
-	if err := s.Remove(t.Context(), "app-other", unfenced); err != nil {
+	if _, err := s.Remove(t.Context(), "app-other", unfenced); err != nil {
 		t.Fatal(err)
 	}
 	if !hasImageIn(t, n, "example.test/app:1") {
@@ -274,7 +674,7 @@ func TestAnImageImportedAgainIsKept(t *testing.T) {
 	n.Import(t, nodetest.Image{Name: "example.test/app:1"})
 	fail := true
 	s := takeOver(t, n, "app-web", "example.test/app:1", failing(t, n, "/containerd.services.images.v1.Images/Delete", &fail))
-	if err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
+	if _, err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
 		t.Fatal(err)
 	}
 	if !hasImageIn(t, n, "example.test/app:1") {
@@ -284,7 +684,7 @@ func TestAnImageImportedAgainIsKept(t *testing.T) {
 		t.Fatal(err)
 	}
 	fail = false
-	if err := loadAgain(t, s, s.client).Remove(t.Context(), "app-other", unfenced); err != nil {
+	if _, err := loadAgain(t, s, s.client).Remove(t.Context(), "app-other", unfenced); err != nil {
 		t.Fatal(err)
 	}
 	if !hasImageIn(t, n, "example.test/app:1") {
@@ -303,7 +703,7 @@ func TestAnImageUpdatedSinceItBecameUnusedIsKeptWhateverTheClock(t *testing.T) {
 			n.Import(t, nodetest.Image{Name: "example.test/app:1"})
 			fail := true
 			s := takeOver(t, n, "app-web", "example.test/app:1", failing(t, n, "/containerd.services.images.v1.Images/Delete", &fail))
-			if err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
+			if _, err := s.Remove(t.Context(), "app-web", unfenced); err != nil {
 				t.Fatal(err)
 			}
 			fail = false
@@ -315,7 +715,7 @@ func TestAnImageUpdatedSinceItBecameUnusedIsKeptWhateverTheClock(t *testing.T) {
 			if err := s.store(nil, []unusedImage{{Image: "example.test/app:1", Updated: img.UpdatedAt.Add(-shift)}}); err != nil {
 				t.Fatal(err)
 			}
-			if err := loadAgain(t, s, s.client).Remove(t.Context(), "app-other", unfenced); err != nil {
+			if _, err := loadAgain(t, s, s.client).Remove(t.Context(), "app-other", unfenced); err != nil {
 				t.Fatal(err)
 			}
 			if !hasImageIn(t, n, "example.test/app:1") {
@@ -325,7 +725,7 @@ func TestAnImageUpdatedSinceItBecameUnusedIsKeptWhateverTheClock(t *testing.T) {
 			if err := s.store(nil, []unusedImage{{Image: "example.test/app:1", Updated: img.UpdatedAt}}); err != nil {
 				t.Fatal(err)
 			}
-			if err := loadAgain(t, s, s.client).Remove(t.Context(), "app-other", unfenced); err != nil {
+			if _, err := loadAgain(t, s, s.client).Remove(t.Context(), "app-other", unfenced); err != nil {
 				t.Fatal(err)
 			}
 			if hasImageIn(t, n, "example.test/app:1") {
@@ -355,7 +755,7 @@ func TestAnImportWaitsForAChangeUnderWay(t *testing.T) {
 	}
 	s := takeOver(t, n, "app-web", "example.test/app:1", client)
 	removed := make(chan error, 1)
-	go func() { removed <- s.Remove(t.Context(), "app-web", unfenced) }()
+	go func() { _, err := s.Remove(t.Context(), "app-web", unfenced); removed <- err }()
 	select {
 	case <-entered:
 	case <-time.After(time.Minute):

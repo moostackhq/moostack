@@ -44,6 +44,9 @@ type operator struct {
 	// startCheck is how long deploy waits before it checks an app, its
 	// own default if zero.
 	startCheck time.Duration
+	// leaseTTL, if set, is how long the nodes hold the operation lock after
+	// mooctl last renewed it.
+	leaseTTL time.Duration
 
 	mu sync.Mutex
 	// exits are the codes mooctl exited with after an interrupt.
@@ -150,6 +153,7 @@ func (o *operator) runWith(args []string) result {
 		HTTPClient: o.client,
 		Cache:      o.cache(),
 		StartCheck: o.startCheck,
+		LeaseTTL:   o.leaseTTL,
 		Terminal: func(func(int)) (terminal.Terminal, io.Closer) {
 			if o.terminal == nil {
 				return nil, nil

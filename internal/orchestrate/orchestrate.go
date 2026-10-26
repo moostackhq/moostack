@@ -69,8 +69,9 @@ type Node interface {
 	// and says whether it started the container's process.
 	Run(ctx context.Context, c *nodev1.Container, lease string) (bool, error)
 	// Remove has the node's agent stop and delete the container called
-	// name, for the operation whose lease holds the node's operation lock.
-	Remove(ctx context.Context, name, lease string) error
+	// name, for the operation whose lease holds the node's operation lock,
+	// and says whether it removed one.
+	Remove(ctx context.Context, name, lease string) (bool, error)
 	// Close closes the connection.
 	Close() error
 }
@@ -199,10 +200,11 @@ type Cluster struct {
 	// Forced are the generation problems that force let the preflight
 	// pass, one error per node, which names it.
 	Forced []error
-	// Unlisted are the names of the nodes that the latest generation any
-	// node applied lists, but the cluster directory doesn't, when force
-	// let the preflight pass. The operation can't reach them, so they
-	// keep the generation they have applied.
+	// Unlisted are the names of the nodes that the cluster directory
+	// doesn't list, but the latest generation any node applied does, when
+	// force let the preflight pass and that generation is no older than
+	// the directory's. The operation can't reach them, so they keep the
+	// generation they have applied.
 	Unlisted []string
 	// Latest is the latest generation any node has applied.
 	Latest         int64
@@ -326,7 +328,8 @@ func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, h
 	if problems := c.check(reached, generation, force); len(problems) > 0 {
 		return fail(&PreflightError{Problems: problems})
 	}
-	if force {
+	// A node that only an older generation lists, the directory removed.
+	if force && c.Latest >= generation {
 		c.Unlisted = unlisted(reached, nodes.Names, c.Latest)
 	}
 	// A grant that took long to arrive may have run out already.
