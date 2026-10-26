@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"github.com/moostackhq/moostack/internal/clusterdir"
+	"github.com/moostackhq/moostack/internal/gitrepo"
 	"github.com/moostackhq/moostack/internal/secretstore"
 	"github.com/moostackhq/moostack/internal/terminal"
 )
@@ -88,6 +90,7 @@ func New(env Env) *cli.Command {
 		},
 		Commands: []*cli.Command{
 			clusterCommand(env),
+			secretCommand(env),
 		},
 	}
 }
@@ -153,6 +156,36 @@ func dirFlag(cmd *cli.Command) (string, error) {
 	return "", nil
 }
 
+// clusterPath is the cluster directory a command acts on: the one -C or
+// MOOCTL_DIR names, or else that of the ref -c gives, or else that of
+// the cluster the deploy file in the current directory names, or else
+// that of the default cluster.
+func clusterPath(env Env, cmd *cli.Command) (string, error) {
+	d, err := dirFlag(cmd)
+	if err != nil {
+		return "", err
+	}
+	if d != "" {
+		return d, nil
+	}
+	ref := cmd.String("cluster")
+	if cmd.IsSet("cluster") && ref == "" {
+		return "", errors.New("-c is empty; give a cluster ref")
+	}
+	if ref == "" {
+		def, err := defaultCluster(env)
+		if err != nil {
+			return "", err
+		}
+		if def == "" {
+			return "", errors.New("which cluster? pass -c <cluster ref>, set a default with mooctl cluster use <cluster ref>, or run mooctl in an app's directory, whose deploy.yaml names its cluster")
+		}
+		ref = def
+	}
+	_, dir, err := refDir(env, cmd, ref)
+	return dir, err
+}
+
 // defaultFile is the file that holds the default cluster's ref, beside the
 // directory of cluster directories.
 func defaultFile(env Env) (string, error) {
@@ -193,6 +226,39 @@ func setDefaultCluster(env Env, ref clusterdir.Ref) error {
 		return err
 	}
 	return clusterdir.WriteFile(path, []byte(ref.String()+"\n"))
+}
+
+// openCluster opens the cluster directory the command acts on.
+func openCluster(env Env, cmd *cli.Command) (*clusterdir.Dir, error) {
+	path, err := clusterPath(env, cmd)
+	if err != nil {
+		return nil, err
+	}
+	d, err := clusterdir.Open(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("there is no cluster directory at %s; create one with mooctl cluster init, or get one with mooctl cluster clone", path)
+	}
+	return d, err
+}
+
+// updateFromRemote fetches the cluster directory at dir from its remote,
+// if it has one, and fast-forwards to it.
+func updateFromRemote(ctx context.Context, dir string) error {
+	repo, err := gitrepo.Open(ctx, dir)
+	if err != nil {
+		return err
+	}
+	remote, err := repo.HasRemote(ctx)
+	if err != nil || !remote {
+		return err
+	}
+	if err := repo.Update(ctx); err != nil {
+		if errors.Is(err, gitrepo.ErrDiverged) {
+			return fmt.Errorf("%w; merge the remote's commits into %s with git pull --no-rebase, then run again", err, dir)
+		}
+		return err
+	}
+	return nil
 }
 
 // openTerminal opens the operator's terminal, and returns it with the
