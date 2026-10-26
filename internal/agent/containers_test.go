@@ -83,7 +83,7 @@ func importImage(t *testing.T, n *nodetest.Node, lease string, data []byte) erro
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	_, err := nodeclient.ImportImage(ctx, n.Agent, data, lease)
+	_, err := nodeclient.ImportImage(ctx, n.Agent, bytes.NewReader(data), lease)
 	return err
 }
 

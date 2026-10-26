@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net"
 	"slices"
@@ -349,10 +350,16 @@ func HealthName(h nodev1.Health) string {
 // importChunk is how much of an image archive each request carries.
 const importChunk = 1 << 20
 
-// ImportImage has agent import the OCI image layout archive data into
-// the node's containerd, for the operation whose lease holds the node's
-// operation lock, and returns the names of the images imported.
-func ImportImage(ctx context.Context, agent nodev1.AgentClient, data []byte, lease string) ([]string, error) {
+// ImportImage has agent import the OCI image layout archive that archive
+// reads into the node's containerd, for the operation whose lease holds
+// the node's operation lock, and returns the names of the images
+// imported. It streams the archive as it reads it, holding a chunk of it
+// at a time. An archive that can't be read fails the import, with what
+// failed, and the agent imports nothing of it.
+func ImportImage(ctx context.Context, agent nodev1.AgentClient, archive io.Reader, lease string) ([]string, error) {
+	// A read that fails ends the call, so that the agent imports nothing.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	stream, err := agent.ImportImage(ctx)
 	if err != nil {
 		return nil, err
@@ -360,14 +367,19 @@ func ImportImage(ctx context.Context, agent nodev1.AgentClient, data []byte, lea
 	// The first request carries the lease, even for an empty archive.
 	req := &nodev1.ImportImageRequest{Lease: lease}
 	for {
-		n := min(len(data), importChunk)
-		req.Chunk = data[:n]
+		// A message isn't to be changed once sent, so each chunk has its
+		// own buffer.
+		buf := make([]byte, importChunk)
+		n, readErr := io.ReadFull(archive, buf)
+		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+			return nil, fmt.Errorf("reading the image's archive: %w", readErr)
+		}
+		req.Chunk = buf[:n]
 		if err := stream.Send(req); err != nil {
 			// The agent ended the call; CloseAndRecv says why.
 			break
 		}
-		data = data[n:]
-		if len(data) == 0 {
+		if readErr != nil {
 			break
 		}
 		req = &nodev1.ImportImageRequest{}
@@ -386,7 +398,7 @@ func ImportImage(ctx context.Context, agent nodev1.AgentClient, data []byte, lea
 // ImportImage has the agent import the OCI image layout archive into
 // the node's containerd, for the operation whose lease holds the node's
 // operation lock, and returns the names of the images imported.
-func (n *Node) ImportImage(ctx context.Context, archive []byte, lease string) ([]string, error) {
+func (n *Node) ImportImage(ctx context.Context, archive io.Reader, lease string) ([]string, error) {
 	return ImportImage(ctx, n.Agent, archive, lease)
 }
 

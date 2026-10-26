@@ -68,6 +68,11 @@ type Env struct {
 	// before it checks that the container still runs. Zero means
 	// orchestrate.DefaultStartCheck.
 	StartCheck time.Duration
+	// Docker is the docker command that deploy builds an app's image
+	// with, docker on the PATH if empty.
+	Docker string
+	// Now is the time, which names a build of an app; time.Now if nil.
+	Now func() time.Time
 	// LeaseTTL is how long a node holds the operation lock after an
 	// operation last renewed it. Zero means orchestrate.DefaultLeaseTTL, or
 	// MOOSTACK_DEV_LEASE_TTL in a dev build.

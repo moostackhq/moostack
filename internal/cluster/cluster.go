@@ -102,6 +102,8 @@ func (n Node) check() error {
 		return errors.New("no private address")
 	case n.Architecture == "":
 		return errors.New("no architecture")
+	case !slices.Contains(release.Architectures, n.Architecture):
+		return fmt.Errorf("architecture %q isn't one Moostack runs on, %s", n.Architecture, strings.Join(release.Architectures, " or "))
 	}
 	return nil
 }

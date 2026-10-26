@@ -424,7 +424,7 @@ func startServices(ctx context.Context, node *nodeclient.Node, h Host, rel *rele
 			return err
 		}
 		c := s.Container()
-		images, err := nodeclient.ImportImage(ctx, node.Agent, data, lease)
+		images, err := nodeclient.ImportImage(ctx, node.Agent, bytes.NewReader(data), lease)
 		if err != nil {
 			return fmt.Errorf("seeding %s's image: %w", s.Name, err)
 		}

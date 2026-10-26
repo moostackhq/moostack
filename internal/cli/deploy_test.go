@@ -26,9 +26,13 @@ type apps struct {
 	registry map[string]string
 	pullErr  error
 	// pulled are the references the node pulled, in order, and digests the
-	// digests of the builds it pulled, by name.
+	// digests of the builds it pulled or imported, by name.
 	pulled  []string
 	digests map[string]string
+	// importErr, if set, is why an import fails; imported are the names
+	// of the images the node imported, in order.
+	importErr error
+	imported  []string
 	// exits has an app's container run from the image it names exit at
 	// once with the code it gives, and fails one fail with the problem it
 	// gives.
@@ -44,12 +48,13 @@ type apps struct {
 	leaves *nodev1.ContainerStatus
 	// started says whether the last run started its container's process.
 	started bool
-	// pulling, running and removing, if set, are called with the call's
-	// context as a pull, an app's run or a removal starts, and ran once an
+	// pulling, importing, running and removing, if set, are called with
+	// the call's context as a pull, an import, an app's run or a removal
+	// starts, and ran once an
 	// app's run is done; removed, with the call's context, once a removal
 	// is done.
-	pulling, running, removing, removed func(ctx context.Context)
-	ran                                 func()
+	pulling, importing, running, removing, removed func(ctx context.Context)
+	ran                                            func()
 }
 
 // PullImage pulls ref from the node's registry, as the agent does,
@@ -361,7 +366,7 @@ func TestADeployOfAnAppOnTwoNodesChangesNothing(t *testing.T) {
 func TestABadAppFileIsRefusedBeforeAnyNodeIsContacted(t *testing.T) {
 	for data, want := range map[string]string{
 		"name: Web\nimage: nginx:1.27\n":           `name: "Web" isn't lowercase letters, digits and single hyphens between them, starting with a letter, at most 59; nothing was contacted`,
-		"name: web\nbuild: .\n":                    "build: isn't supported yet; name a public image in image; nothing was contacted",
+		"name: web\nbuild: .\n":                    "build: . has no Dockerfile at its root, which mooctl builds the app with; nothing was contacted",
 		"name: web\nimage: nginx:1.27\nport: 80\n": "port: isn't a field of an app file, which has name, image, build; nothing was contacted",
 		"name: web\nimage: NGINX\n":                "image: \"NGINX\" isn't an image's reference: invalid reference format: repository name (library/NGINX) must be lowercase; nothing was contacted",
 	} {

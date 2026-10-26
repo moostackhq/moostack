@@ -488,7 +488,7 @@ func (s *agentServer) ImportImage(stream nodev1.Agent_ImportImageServer) error {
 		return refused
 	}
 	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "importing the image: %v", err)
+		return err
 	}
 	return stream.SendAndClose(&nodev1.ImportImageResponse{Images: images})
 }

@@ -242,3 +242,99 @@ func TestAnImagesConfigNamesItsUserIfItHasOne(t *testing.T) {
 		}
 	}
 }
+
+// ReadDigest takes the archive's index.json as containerd's import does:
+// by its cleaned path, a regular file. It refuses an archive of two,
+// whose import takes another than the first, and one without any.
+func TestReadDigestTakesTheIndexAsContainerdsImportDoes(t *testing.T) {
+	var archive bytes.Buffer
+	if err := ociimage.Write(&archive, image); err != nil {
+		t.Fatal(err)
+	}
+	want, err := ociimage.Digest(archive.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []tarFile
+	r := tar.NewReader(bytes.NewReader(archive.Bytes()))
+	for {
+		h, err := r.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, tarFile{h.Name, data})
+	}
+	rename := func(from, to string) []tarFile {
+		var out []tarFile
+		for _, f := range files {
+			if f.name == from {
+				f.name = to
+			}
+			out = append(out, f)
+		}
+		return out
+	}
+	index := rename("", "")[slicesIndex(files, "index.json")]
+	for name, c := range map[string]struct {
+		files []tarFile
+		want  string
+	}{
+		"./index.json":         {rename("index.json", "./index.json"), want},
+		"two index.json":       {append(rename("", ""), index), "more than one index.json"},
+		"no index.json":        {rename("index.json", "other.json"), "has no index.json"},
+		"index.json/ dir":      {append(rename("index.json", "other.json"), tarFile{"index.json/", nil}), "has no index.json"},
+		"no oci-layout":        {rename("oci-layout", "other"), "isn't an OCI image layout of version 1.0.0"},
+		"oci-layout 2.0.0":     {append(rename("", ""), tarFile{"oci-layout", []byte(`{"imageLayoutVersion":"2.0.0"}`)}), "its oci-layout says \"2.0.0\""},
+		"a later empty layout": {append(rename("", ""), tarFile{"oci-layout", []byte(`{}`)}), want},
+	} {
+		got, err := ociimage.ReadDigest(bytes.NewReader(writeTar(t, c.files)))
+		if err != nil && !strings.Contains(err.Error(), c.want) || err == nil && got != c.want {
+			t.Errorf("ReadDigest of an archive with %s = %q, %v, want %q", name, got, err, c.want)
+		}
+	}
+}
+
+type tarFile struct {
+	name string
+	data []byte
+}
+
+func slicesIndex(files []tarFile, name string) int {
+	for i, f := range files {
+		if f.name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// writeTar is the tar of files, in order; a name ending in / is a
+// directory.
+func writeTar(t *testing.T, files []tarFile) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	w := tar.NewWriter(&out)
+	for _, f := range files {
+		h := &tar.Header{Name: f.name, Mode: 0o644, Size: int64(len(f.data)), Typeflag: tar.TypeReg}
+		if strings.HasSuffix(f.name, "/") {
+			h.Typeflag, h.Mode = tar.TypeDir, 0o755
+		}
+		if err := w.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(f.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}

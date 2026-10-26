@@ -774,7 +774,7 @@ func TestTheFakeNodeRefusesAsTheAgentDoes(t *testing.T) {
 	ended, cancel := context.WithCancel(ctx)
 	cancel()
 	n := fresh()
-	if _, err := n.ImportImage(ended, []byte("image moostack.local/dns:1.0.0"), "ours"); err == nil {
+	if _, err := n.ImportImage(ended, strings.NewReader("image moostack.local/dns:1.0.0"), "ours"); err == nil {
 		t.Error("the fake imported for an ended call")
 	}
 	if _, err := n.Remove(ended, "dns", "ours"); err == nil || !slices.Contains(n.containerNames(), "dns") {
@@ -821,13 +821,13 @@ func TestTheFakeNodeRefusesAsTheAgentDoes(t *testing.T) {
 		}
 	}
 	n = fresh()
-	if _, err := n.ImportImage(ctx, []byte("image moostack.local/dns:1.0.0"), "theirs"); err == nil {
+	if _, err := n.ImportImage(ctx, strings.NewReader("image moostack.local/dns:1.0.0"), "theirs"); err == nil {
 		t.Error("the fake imported for another lease")
 	}
 	if _, err := n.Remove(ctx, "dns", "theirs"); err == nil {
 		t.Error("the fake removed for another lease")
 	}
-	if _, err := n.ImportImage(ctx, []byte("image moostack.local/dns:1.0.0"), "ours"); err != nil {
+	if _, err := n.ImportImage(ctx, strings.NewReader("image moostack.local/dns:1.0.0"), "ours"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := n.Run(ctx, dns, "ours"); err == nil {
@@ -839,7 +839,7 @@ func TestTheFakeNodeRefusesAsTheAgentDoes(t *testing.T) {
 	if _, err := n.Run(ctx, dns, "ours"); err == nil {
 		t.Error("the fake ran service-dns from the image the removal of dns deleted")
 	}
-	if _, err := n.ImportImage(ctx, []byte("image moostack.local/dns:1.0.0"), "ours"); err != nil {
+	if _, err := n.ImportImage(ctx, strings.NewReader("image moostack.local/dns:1.0.0"), "ours"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := n.Run(ctx, dns, "theirs"); err == nil {

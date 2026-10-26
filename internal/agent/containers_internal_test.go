@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -27,6 +28,7 @@ import (
 	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/errdefs"
 	"github.com/opencontainers/image-spec/identity"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -988,6 +990,11 @@ func TestASnapshotLeftUnderAServicesNameGivesWayToItsContainers(t *testing.T) {
 	}
 }
 
+// unseekable is a reader that can't seek.
+type unseekable struct{ io.Reader }
+
+func (unseekable) Seek(int64, int) (int64, error) { return 0, errors.New("can't seek") }
+
 // An import that fails once it has written content, or whose call ends
 // partway through the archive, as when mooctl is cut off, leaves no
 // lease, and nothing it wrote once garbage is collected.
@@ -1002,18 +1009,29 @@ func TestAnImportThatFailsLeavesNothing(t *testing.T) {
 				}
 				return invoker(ctx, method, req, reply, cc, opts...)
 			})
-			if _, err := s.Import(t.Context(), bytes.NewReader(archive), unfenced); err == nil || !made {
-				t.Fatalf("the import with its images failing to be made: %v (tried: %v), want it failed", err, made)
+			// containerd's failure may pass, so it isn't the archive's.
+			if _, err := s.Import(t.Context(), bytes.NewReader(archive), unfenced); status.Code(err) != codes.Unavailable || !made {
+				t.Fatalf("the import with its images failing to be made: %v (tried: %v), want it failed as UNAVAILABLE", err, made)
+			}
+		},
+		"is refused for its platform": func(t *testing.T, n *nodetest.Node, s *containers, _ []byte) {
+			arch := "arm64"
+			if runtime.GOARCH == "arm64" {
+				arch = "amd64"
+			}
+			other := nodetest.Image{Name: "example.test/other:1", Architecture: arch}.Archive(t)
+			if _, err := s.Import(t.Context(), bytes.NewReader(other), unfenced); status.Code(err) != codes.FailedPrecondition {
+				t.Fatalf("the import of an image for %s: %v, want it refused", arch, err)
 			}
 		},
 		"is cut off": func(t *testing.T, n *nodetest.Node, s *containers, archive []byte) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			// The archive's first half, then the call ends.
-			r := io.MultiReader(bytes.NewReader(archive[:len(archive)/2]), readerFunc(func([]byte) (int, error) {
+			r := unseekable{io.MultiReader(bytes.NewReader(archive[:len(archive)/2]), readerFunc(func([]byte) (int, error) {
 				cancel()
 				return 0, io.ErrUnexpectedEOF
-			}))
+			}))}
 			if _, err := s.Import(ctx, r, unfenced); err == nil {
 				t.Fatal("the import cut off succeeded")
 			}
@@ -1115,4 +1133,141 @@ func clientThrough(t *testing.T, n *nodetest.Node, interceptor grpc.UnaryClientI
 		t.Fatal(err)
 	}
 	return client
+}
+
+// An import writes each of the archive's blobs to containerd once: its
+// platform check reads the archive itself, not containerd's copy of it.
+func TestAnImportWritesEachBlobOnce(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	var mu sync.Mutex
+	writes := 0
+	count := func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		if method == "/containerd.services.content.v1.Content/Write" {
+			mu.Lock()
+			writes++
+			mu.Unlock()
+		}
+		return streamer(ctx, desc, cc, method, opts...)
+	}
+	client, err := containerd.NewWithConn(n.ContainerdConn(t, grpc.WithStreamInterceptor(count)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	s, err := loadContainers(t.Context(), client, gateway.New(), Config{ContainersFile: filepath.Join(dir, "containers"), ContainersDir: dir, ContainerLogDir: dir, Runc: "runc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := nodetest.Image{Name: "example.test/once:1", Rebuild: 7}.Archive(t)
+	if _, err := s.Import(t.Context(), bytes.NewReader(archive), unfenced); err != nil {
+		t.Fatal(err)
+	}
+	// The archive's layer, config and manifest, and its index, which
+	// containerd keeps too.
+	if writes != 4 {
+		t.Errorf("the import wrote to containerd %d times, want once for each of the archive's 3 blobs and its index", writes)
+	}
+}
+
+// A failure containerd reports that the archive causes, of the class of
+// an invalid argument, is the archive's, which no rerun passes; one of
+// another class, as containerd not answering, may pass.
+func TestAnImportFailingInContainerdIsTheArchivesOrMayPassByItsClass(t *testing.T) {
+	for code, want := range map[codes.Code]codes.Code{
+		codes.InvalidArgument:    codes.InvalidArgument,
+		codes.NotFound:           codes.InvalidArgument,
+		codes.FailedPrecondition: codes.InvalidArgument,
+		codes.Unavailable:        codes.Unavailable,
+		codes.ResourceExhausted:  codes.Unavailable,
+		codes.Internal:           codes.Unavailable,
+	} {
+		t.Run(code.String(), func(t *testing.T) {
+			n := nodetest.Start(t)
+			n.EventuallyHealthy(t)
+			s := containersThrough(t, n, nil)
+			s.client = clientThrough(t, n, func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+				if method == "/containerd.services.images.v1.Images/Create" {
+					return status.Error(code, "refused by containerd")
+				}
+				return invoker(ctx, method, req, reply, cc, opts...)
+			})
+			_, err := s.Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/class:1"}.Archive(t)), unfenced)
+			if status.Code(err) != want {
+				t.Errorf("an import that containerd fails with %s = %v, want %s", code, err, want)
+			}
+		})
+	}
+}
+
+// An import cut while containerd wrote the archive's index.json, as a
+// crash or a stop leaves it, doesn't spoil the next import, of another
+// build whose index.json is of the same size.
+func TestAnImportCutShortLeavesNoIngestForTheNext(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	index := func(archive []byte) []byte {
+		tr := tar.NewReader(bytes.NewReader(archive))
+		for {
+			h, err := tr.Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h.Name == "index.json" {
+				b, _ := io.ReadAll(tr)
+				return b
+			}
+		}
+	}
+	a := index(nodetest.Image{Name: "example.test/a:1"}.Archive(t))
+	b := nodetest.Image{Name: "example.test/b:1"}.Archive(t)
+	if len(a) != len(index(b)) {
+		t.Fatalf("the two builds' index.json are of %d and %d bytes, not the same size the test needs", len(a), len(index(b)))
+	}
+	client := n.Containerd(t)
+	ctx := namespaced(t.Context())
+	lease, err := client.LeasesService().Create(ctx, leases.WithRandomID(), leases.WithExpiration(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What containerd's import wrote of a's index.json before it was cut.
+	w, err := content.OpenWriter(leases.WithLease(ctx, lease.ID), client.ContentStore(), content.WithRef("tar-index.json"), content.WithDescriptor(ocispec.Descriptor{Size: int64(len(a))}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(a[:len(a)-10]); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	if _, err := containersThrough(t, n, nil).Import(t.Context(), bytes.NewReader(b), unfenced); err != nil {
+		t.Errorf("an import after one cut short: %v", err)
+	}
+}
+
+// An import aborts only what an earlier import left: a pull's ingest cut
+// short stays, for a pull again to take up.
+func TestAnImportKeepsAPullsIngest(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	client := n.Containerd(t)
+	ctx := namespaced(t.Context())
+	lease, err := client.LeasesService().Create(ctx, leases.WithRandomID(), leases.WithExpiration(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := "layer-sha256:" + strings.Repeat("0", 64)
+	w, err := content.OpenWriter(leases.WithLease(ctx, lease.ID), client.ContentStore(), content.WithRef(ref), content.WithDescriptor(ocispec.Descriptor{Size: 100}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(make([]byte, 50)); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	if _, err := containersThrough(t, n, nil).Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/b:1"}.Archive(t)), unfenced); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := client.ContentStore().Status(ctx, ref); err != nil || st.Offset != 50 {
+		t.Errorf("the pull's ingest after an import: %+v, %v, want it as it was, at 50 bytes", st, err)
+	}
 }

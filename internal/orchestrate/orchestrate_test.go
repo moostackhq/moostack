@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"slices"
 	"strings"
@@ -332,9 +333,15 @@ func (n *node) UpdateContainerd(ctx context.Context, version string, files map[s
 }
 
 // ImportImage imports the image whose archive is "image " and its name,
-// failing it if failing names the image's service. It refuses the import
-// unless lease holds the node's operation lock.
-func (n *node) ImportImage(ctx context.Context, archive []byte, lease string) ([]string, error) {
+// failing it if failing names the image's service, or else an app's OCI
+// image layout archive, as the agent does, failing it if the app's
+// importErr says why. It refuses the import unless lease holds the
+// node's operation lock.
+func (n *node) ImportImage(ctx context.Context, r io.Reader, lease string) ([]string, error) {
+	archive, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
 	// A call whose context ended is never sent.
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -346,6 +353,9 @@ func (n *node) ImportImage(ctx context.Context, archive []byte, lease string) ([
 	case <-time.After(n.importDelay):
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+	if !strings.HasPrefix(string(archive), "image ") {
+		return n.importApp(archive)
 	}
 	image := strings.TrimPrefix(string(archive), "image ")
 	if service, _, _ := strings.Cut(strings.TrimPrefix(image, "moostack.local/"), ":"); n.failing == "import "+service {

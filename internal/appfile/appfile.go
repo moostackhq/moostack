@@ -1,5 +1,6 @@
 // Package appfile reads an app file: the app.yml in an app's own
-// directory, which names the app and the image it runs.
+// directory, which names the app and the image it runs, or the build
+// context its image is built from.
 package appfile
 
 import (
@@ -31,8 +32,13 @@ type App struct {
 	// already replaces it.
 	Name string
 	// Image is the reference of the public image the app runs,
-	// normalized, as nodev1.NormalizeReference makes it.
+	// normalized, as nodev1.NormalizeReference makes it, empty if the app
+	// is built.
 	Image string
+	// Build is the directory of the build context the app's image is
+	// built from, with a Dockerfile at its root, the app directory joined
+	// with the file's build, empty if the app runs a public image.
+	Build string
 }
 
 // fields are the fields an app file has, in the order an error lists
@@ -64,10 +70,10 @@ func (e *Error) Error() string {
 // Read reads and checks the app file in dir: one YAML document, a
 // mapping of the fields name, required, and image, each a string, and no
 // other field. name must be a name as the name pattern says, at most
-// maxName, and image a reference that nodev1.NormalizeReference takes,
-// which App holds normalized. build, which names a build context in
-// place of image, isn't supported yet. Every refusal is an *Error, but
-// for a file that can't be read.
+// maxName, and either image, a reference that nodev1.NormalizeReference
+// takes, which App holds normalized, or build, a path relative to dir,
+// which may lead outside it, to a directory with a Dockerfile at its
+// root. Every refusal is an *Error, but for a file that can't be read.
 func Read(dir string) (*App, error) {
 	file, values, err := read(dir)
 	if err != nil {
@@ -87,8 +93,11 @@ func Read(dir string) (*App, error) {
 	case hasImage && hasBuild:
 		return refuse("image", "is given with build; give one of them")
 	case hasBuild:
-		// Temporary: build is refused until local builds are deployed.
-		return refuse("build", "isn't supported yet; name a public image in image")
+		build, reason := buildContext(dir, values["build"].Value)
+		if reason != "" {
+			return refuse("build", "%s", reason)
+		}
+		return &App{Name: values["name"].Value, Build: build}, nil
 	case !hasImage:
 		return refuse("image", "is missing; name a public image, such as nginx:1.27")
 	}
@@ -98,6 +107,72 @@ func Read(dir string) (*App, error) {
 	}
 	return &App{Name: values["name"].Value, Image: normalized}, nil
 }
+
+// buildContext is the build context's directory that build, a build
+// field's value, names relative to dir, the app directory, or else why
+// it doesn't name one.
+func buildContext(dir, build string) (string, string) {
+	shown := printable(build)
+	switch {
+	case build == "":
+		return "", "is empty; give the build context's directory, such as ., relative to the app directory"
+	case filepath.IsAbs(build):
+		return "", shown + " is an absolute path; give the build context relative to the app directory, so that the app file works wherever the app is"
+	}
+	path := filepath.Join(dir, build)
+	info, err := os.Stat(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return "", shown + " doesn't exist; give the build context's directory, relative to the app directory"
+	case err != nil:
+		return "", fmt.Sprintf("%s can't be read: %v", shown, errors.Unwrap(err))
+	case !info.IsDir():
+		return "", shown + " isn't a directory; give the build context's directory, relative to the app directory"
+	}
+	// buildx reads the Dockerfile within the build context, where the
+	// links it follows aren't the host's: one that is a link is refused,
+	// rather than followed as buildx may not.
+	switch info, err := os.Lstat(filepath.Join(path, dockerfile)); {
+	case errors.Is(err, fs.ErrNotExist) || err == nil && info.IsDir():
+		return "", shown + " has no " + dockerfile + " at its root, which mooctl builds the app with"
+	case err != nil:
+		return "", fmt.Sprintf("%s's %s can't be read: %v", shown, dockerfile, unwrapPath(err))
+	case info.Mode()&fs.ModeSymlink != 0:
+		return "", shown + "'s " + dockerfile + " is a link, which mooctl doesn't follow, as buildx follows it within the build context and not as this machine does; put the Dockerfile itself at the build context's root"
+	case !info.Mode().IsRegular():
+		return "", shown + "'s " + dockerfile + " isn't a file; put the Dockerfile itself at the build context's root"
+	}
+	// buildx must read it, not only find it, and list the context it
+	// sends.
+	f, err := os.Open(filepath.Join(path, dockerfile))
+	if err != nil {
+		return "", fmt.Sprintf("%s's %s can't be read: %v", shown, dockerfile, unwrapPath(err))
+	}
+	f.Close()
+	// One name is enough to tell, however large the context.
+	d, err := os.Open(path)
+	if err == nil {
+		_, err = d.Readdirnames(1)
+		d.Close()
+	}
+	if err != nil {
+		return "", fmt.Sprintf("%s can't be listed, as buildx lists the build context: %v", shown, unwrapPath(err))
+	}
+	return path, ""
+}
+
+// unwrapPath is err without the path an *fs.PathError names.
+func unwrapPath(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	return err
+}
+
+// dockerfile is the name of the file at a build context's root that the
+// app's image is built with.
+const dockerfile = "Dockerfile"
 
 // ReadName reads the app file in dir for the app's name alone, as Read
 // checks the file but for image and build, which it doesn't check: what

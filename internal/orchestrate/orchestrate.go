@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -55,10 +56,11 @@ type Node interface {
 	// with files, by name, containerd at version, which must answer
 	// within healthTimeout, or the agent puts the old ones back.
 	UpdateContainerd(ctx context.Context, version string, files map[string][]byte, healthTimeout time.Duration) error
-	// ImportImage has the node's agent import the image in archive, an OCI
-	// image layout archive, for the operation whose lease holds the node's
-	// operation lock, and returns the names of the images imported.
-	ImportImage(ctx context.Context, archive []byte, lease string) ([]string, error)
+	// ImportImage has the node's agent import the image in the OCI image
+	// layout archive that archive reads, as it reads it, for the operation
+	// whose lease holds the node's operation lock, and returns the names of
+	// the images imported.
+	ImportImage(ctx context.Context, archive io.Reader, lease string) ([]string, error)
 	// PullImage has the node's agent pull the public image ref, a
 	// normalized reference, for the operation whose lease holds the node's
 	// operation lock, and returns the image pulled.

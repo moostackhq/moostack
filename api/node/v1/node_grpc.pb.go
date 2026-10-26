@@ -78,7 +78,9 @@ type AgentClient interface {
 	// answers with the names of the images it imported. Importing an image
 	// the node has changes nothing. It is refused with FAILED_PRECONDITION,
 	// importing nothing, unless the first request's lease holds the
-	// operation lock.
+	// operation lock, and for an image for another platform than the
+	// node's, by its config or by what the archive's index says of it,
+	// which leaves an image of its name as it was.
 	ImportImage(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportImageRequest, ImportImageResponse], error)
 	// PullImage pulls a public image into the node's containerd, by a
 	// reference normalized as Docker normalizes one, such as
@@ -351,7 +353,9 @@ type AgentServer interface {
 	// answers with the names of the images it imported. Importing an image
 	// the node has changes nothing. It is refused with FAILED_PRECONDITION,
 	// importing nothing, unless the first request's lease holds the
-	// operation lock.
+	// operation lock, and for an image for another platform than the
+	// node's, by its config or by what the archive's index says of it,
+	// which leaves an image of its name as it was.
 	ImportImage(grpc.ClientStreamingServer[ImportImageRequest, ImportImageResponse]) error
 	// PullImage pulls a public image into the node's containerd, by a
 	// reference normalized as Docker normalizes one, such as

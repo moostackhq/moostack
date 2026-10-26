@@ -5,12 +5,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
 
 	"github.com/urfave/cli/v3"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/moostackhq/moostack/internal/appfile"
+	"github.com/moostackhq/moostack/internal/buildx"
+	"github.com/moostackhq/moostack/internal/cluster"
 	"github.com/moostackhq/moostack/internal/interrupt"
 	"github.com/moostackhq/moostack/internal/orchestrate"
 )
@@ -23,6 +32,10 @@ func deployCommand(env Env) *cli.Command {
 		ArgsUsage: "[dir]",
 		Description: "The app runs on the node that runs it already, or else on the node that runs the fewest apps. " +
 			"The node pulls the app's image itself, and deploy checks a few seconds after the app's container started that it still runs. " +
+			"An app file with build in place of image names the build context, relative to the app's directory, with a Dockerfile at its root: " +
+			"deploy builds it first with docker buildx, which must be on Docker's containerd image store, for each architecture the cluster's nodes have, " +
+			"before it contacts a node, and the node imports the build for its architecture. " +
+			"Builds are reproducible: SOURCE_DATE_EPOCH is 0 for the build, so the same source builds the same image, its files dated 1970, on any machine. " +
 			"Deploying an app that runs already replaces it, unless it runs the same build of its image, which changes nothing. " +
 			"--remove removes the app from every node that runs it, with its image unless another container runs from it, and its log; it needs only the app file's name. " +
 			"Where an app runs is kept on the nodes alone, so deploy doesn't change the cluster directory.",
@@ -120,19 +133,40 @@ func deploy(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	target := orchestrate.App{Name: app.Name, Image: app.Image}
+	exit := env.Exit
+	if app.Build != "" {
+		// The builds' archives are kept until the deploy ends, however it
+		// ends, a second signal included.
+		dir, err := os.MkdirTemp("", "mooctl-build-")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(dir)
+		exit = func(code int) {
+			os.RemoveAll(dir)
+			env.Exit(code)
+		}
+		target, err = buildApp(ctx, env, exit, d, app, dir)
+		if err != nil {
+			return err
+		}
+	}
 	// A signal ends the preflight, the pull or the wait for the app, and
 	// the deploy gives the lock back, rather than ending mooctl.
-	ctx, stop := interrupt.Context(ctx, env.Exit)
+	ctx, stop := interrupt.Context(ctx, exit)
 	defer stop()
 	c, err := preflight(ctx, env, cmd, d, "", nil)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	deployed, err := c.Deploy(c.Context(), orchestrate.App{Name: app.Name, Image: app.Image}, func(s orchestrate.DeployStep) {
+	deployed, err := c.Deploy(c.Context(), target, func(s orchestrate.DeployStep) {
 		switch {
-		case s.Pulling:
-			fmt.Fprintf(env.Stdout, "Pulling %s on %s\n", app.Image, s.Node)
+		case s.Fetching && target.Archive != nil:
+			fmt.Fprintf(env.Stdout, "Importing %s on %s\n", target.Image, s.Node)
+		case s.Fetching:
+			fmt.Fprintf(env.Stdout, "Pulling %s on %s\n", target.Image, s.Node)
 		case s.RunsThere:
 			fmt.Fprintf(env.Stdout, "%s: %s (runs there)\n", app.Name, s.Node)
 		default:
@@ -150,17 +184,100 @@ func deploy(ctx context.Context, env Env, cmd *cli.Command) error {
 	return nil
 }
 
+// buildApp builds app's image, from its build context, into dir, before
+// any node is contacted, once for each architecture the nodes of d
+// have, and returns the app as a deploy runs it, which imports the build
+// for a node's architecture. A signal ends the build, and a second one
+// calls exit.
+func buildApp(ctx context.Context, env Env, exit func(int), d *cluster.Dir, app *appfile.App, dir string) (orchestrate.App, error) {
+	nodes, err := d.Nodes()
+	if err != nil {
+		return orchestrate.App{}, err
+	}
+	var arches []string
+	for _, n := range nodes {
+		arches = append(arches, n.Architecture)
+	}
+	docker := buildx.Docker{Path: env.Docker, Output: env.Stderr}
+	ctx, stop := interrupt.Context(ctx, exit)
+	defer stop()
+	daemon, err := docker.Check(ctx)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return orchestrate.App{}, fmt.Errorf("mooctl stopped checking Docker, before it built %s; nothing changed on the cluster", app.Name)
+		}
+		return orchestrate.App{}, fmt.Errorf("mooctl can't build %s: %v\nmooctl installs nothing; nothing was built, and nothing changed on the cluster", app.Name, err)
+	}
+	docker.Builder = daemon.Builder
+	now := time.Now
+	if env.Now != nil {
+		now = env.Now
+	}
+	tag := "moostack.local/" + app.Name + ":" + now().UTC().Format("20060102T150405Z")
+	archive := func(arch string) string { return filepath.Join(dir, arch+".tar") }
+	for _, a := range slices.Compact(slices.Sorted(slices.Values(arches))) {
+		fmt.Fprintf(env.Stdout, "Building %s as %s for linux/%s\n", app.Name, tag, a)
+		if err := docker.Build(ctx, app.Build, tag, a, archive(a)); err != nil {
+			return orchestrate.App{}, buildError(app.Name, a, daemon.Arch, err)
+		}
+	}
+	return orchestrate.App{Name: app.Name, Image: tag, Archive: func(node string) (io.ReadSeekCloser, error) {
+		// The cluster directory is read again, as the preflight read it:
+		// a node may have joined it while the app was built.
+		nodes, err := d.Nodes()
+		if err != nil {
+			return nil, err
+		}
+		i := slices.IndexFunc(nodes, func(n cluster.Node) bool { return n.Name == node })
+		if i < 0 {
+			return nil, fmt.Errorf("the cluster directory no longer lists %s; deploy again", node)
+		}
+		a := nodes[i].Architecture
+		if !slices.Contains(arches, a) {
+			return nil, fmt.Errorf("%s, of linux/%s, joined the cluster directory while %s was built, so mooctl built nothing for it; deploy again", node, a, app.Name)
+		}
+		return os.Open(archive(a))
+	}}, nil
+}
+
+// buildError is err, why the build of the app called app for linux on
+// arch failed, on a Docker whose machine is of dockerArch, as the
+// operator reads it, below buildx's own output: that nothing changed;
+// for "exec format error" in a build for another architecture than
+// Docker's machine's, how to build for it; and why buildx ended, if it
+// didn't end as a failed build does, saying why itself.
+func buildError(app, arch, dockerArch string, err error) error {
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("mooctl stopped the build of %s; nothing changed on the cluster", app)
+	}
+	msg := fmt.Sprintf("the build of %s failed; nothing changed on the cluster", app)
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		msg += fmt.Sprintf("\ndocker buildx ended: %v", errors.Unwrap(err))
+	}
+	var be *buildx.BuildError
+	if errors.As(err, &be) && be.ExecFormat && arch != dockerArch {
+		msg += fmt.Sprintf("\nThe build said \"exec format error\": a step ran a program this machine can't run, as one for linux/%s is without emulation. "+
+			"On Linux, register QEMU for it once with docker run --privileged --rm tonistiigi/binfmt --install %s, or install your distribution's qemu-user-static with its binfmt entries; "+
+			"Docker Desktop has it already. Or build the program for linux/%s in a stage that runs on this machine's platform, FROM --platform=$BUILDPLATFORM.", arch, arch, arch)
+	}
+	return errors.New(msg)
+}
+
 // deployError is err, why the deploy of the app called app failed, as
 // the operator reads it: what failed, and what it means for the cluster.
 func deployError(app string, err error) error {
 	var (
 		pull      *orchestrate.PullError
+		imported  *orchestrate.ImportError
 		run       *orchestrate.RunError
 		unchecked *orchestrate.UncheckedError
 	)
 	switch {
 	case errors.As(err, &pull):
 		return pullError(pull)
+	case errors.As(err, &imported):
+		return importError(imported)
 	case errors.As(err, new(*orchestrate.DuplicateAppError)):
 		return fmt.Errorf("%w\nRun mooctl deploy --remove, which removes %s from every node it runs on, then deploy it again", err, app)
 	case errors.As(err, &run):
@@ -185,6 +302,28 @@ func deployError(app string, err error) error {
 		return fmt.Errorf("%w\nRun mooctl deploy again: it says whether %s runs", err, app)
 	}
 	return err
+}
+
+// importError is why the import e failed, as the operator reads it:
+// what the node said, and that nothing changed.
+func importError(e *orchestrate.ImportError) error {
+	if errors.Is(e.Err, orchestrate.ErrLockLost) || errors.Is(e.Err, context.Canceled) {
+		return fmt.Errorf("mooctl stopped the import of %s on %s: %v; nothing changed", e.Image, e.Node, e.Err)
+	}
+	msg := status.Convert(e.Err).Message()
+	if status.Code(e.Err) == codes.FailedPrecondition {
+		// A build for another architecture than the node's: the cluster
+		// directory says the node is of the architecture built for.
+		if strings.Contains(msg, "for this node's") {
+			return fmt.Errorf("%s refused %s: %s; nothing changed\nCheck the architecture that %s's node file in the cluster directory gives it", e.Node, e.Image, msg, e.Node)
+		}
+		return fmt.Errorf("%s refused %s: %s; nothing changed\nRun mooctl deploy again", e.Node, e.Image, msg)
+	}
+	// An archive the node can't read is so whenever it is sent.
+	if status.Code(e.Err) == codes.InvalidArgument {
+		return fmt.Errorf("%s couldn't import %s: %s; nothing changed", e.Node, e.Image, msg)
+	}
+	return fmt.Errorf("%s couldn't import %s: %s; nothing changed\nRun mooctl deploy again", e.Node, e.Image, msg)
 }
 
 // pullError is why the pull e failed, as the operator reads it: what it

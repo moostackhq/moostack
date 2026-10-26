@@ -47,6 +47,10 @@ type operator struct {
 	// leaseTTL, if set, is how long the nodes hold the operation lock after
 	// mooctl last renewed it.
 	leaseTTL time.Duration
+	// docker, if set, is the docker command deploy builds with, and now,
+	// if set, the time it names builds by.
+	docker string
+	now    time.Time
 
 	mu sync.Mutex
 	// exits are the codes mooctl exited with after an interrupt.
@@ -154,6 +158,13 @@ func (o *operator) runWith(args []string) result {
 		Cache:      o.cache(),
 		StartCheck: o.startCheck,
 		LeaseTTL:   o.leaseTTL,
+		Docker:     o.docker,
+		Now: func() time.Time {
+			if o.now.IsZero() {
+				return time.Now()
+			}
+			return o.now
+		},
 		Terminal: func(func(int)) (terminal.Terminal, io.Closer) {
 			if o.terminal == nil {
 				return nil, nil

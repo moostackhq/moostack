@@ -75,7 +75,6 @@ func TestReadRefusesEachKindOfInvalidAppFileNamingTheFieldAndWhy(t *testing.T) {
 		"name: web\nimage: \"nginx:\"\n":                             {"image", "isn't an image's reference"},
 		"name: web\nimage: 1.27\n":                                   {"image", "is a number, not a string"},
 		"name: web\nimage: nginx:1.27\nbuild: .\n":                   {"image", "is given with build; give one of them"},
-		"name: web\nbuild: .\n":                                      {"build", "isn't supported yet"},
 		"name: web\nimage: nginx:1.27\nimage: nginx:1.28\n":          {"image", "is given twice"},
 		"name: web\nimage: nginx:1.27\nports: [80]\n":                {"ports", "isn't a field of an app file, which has name, image, build"},
 		"name: web\nimage: nginx:1.27\nNAME: web\n":                  {"NAME", "isn't a field"},
@@ -99,6 +98,108 @@ func TestReadRefusesEachKindOfInvalidAppFileNamingTheFieldAndWhy(t *testing.T) {
 		if want.field != "" && !strings.Contains(err.Error(), e.File+": "+want.field+": ") {
 			t.Errorf("Read of\n%s= %q, which doesn't name the file and the field", data, err)
 		}
+	}
+}
+
+// buildTree makes an app directory, app, in a new directory, with what
+// files says, by its path from that directory: a Dockerfile, a directory
+// for a path ending in /, and a file otherwise. It returns the app
+// directory.
+func buildTree(t *testing.T, appData string, files ...string) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, f := range append([]string{"app/"}, files...) {
+		path := filepath.Join(root, f)
+		var err error
+		if strings.HasSuffix(f, "/") {
+			err = os.MkdirAll(path, 0o755)
+		} else if err = os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
+			err = os.WriteFile(path, []byte("FROM scratch\n"), 0o644)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	app := filepath.Join(root, "app")
+	if err := os.WriteFile(filepath.Join(app, appfile.FileName), []byte(appData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return app
+}
+
+func TestReadTakesABuildContextRelativeToTheAppDirectoryAndOutsideIt(t *testing.T) {
+	for _, c := range []struct {
+		build string
+		files []string
+		want  string
+	}{
+		{".", []string{"app/Dockerfile"}, "app"},
+		{"./", []string{"app/Dockerfile"}, "app"},
+		{"src", []string{"app/src/Dockerfile"}, "app/src"},
+		{"src/web/", []string{"app/src/web/Dockerfile"}, "app/src/web"},
+		{"..", []string{"Dockerfile"}, "."},
+		{"../other/ctx", []string{"other/ctx/Dockerfile"}, "other/ctx"},
+		{"'with space'", []string{"app/with space/Dockerfile"}, "app/with space"},
+	} {
+		app := buildTree(t, "name: web\nbuild: "+c.build+"\n", c.files...)
+		got, err := appfile.Read(app)
+		want := filepath.Join(filepath.Dir(app), c.want)
+		if err != nil || got.Name != "web" || got.Build != want || got.Image != "" {
+			t.Errorf("Read of build %s = %+v, %v, want the build context %s", c.build, got, err, want)
+		}
+	}
+}
+
+func TestReadTakesTheBuildContextOfTheAppDirectoryNotOfTheWorkingDirectory(t *testing.T) {
+	app := buildTree(t, "name: web\nbuild: ctx\n", "app/ctx/Dockerfile")
+	// The test's working directory has no ctx.
+	got, err := appfile.Read(app)
+	if err != nil || got.Build != filepath.Join(app, "ctx") {
+		t.Errorf("Read = %+v, %v, want the build context in the app directory", got, err)
+	}
+}
+
+func TestReadRefusesABuildContextThatIsntADirectoryWithADockerfile(t *testing.T) {
+	for _, c := range []struct {
+		build  string
+		files  []string
+		reason string
+	}{
+		{"missing", nil, "missing doesn't exist; give the build context's directory, relative to the app directory"},
+		{"../missing", nil, "../missing doesn't exist"},
+		{"file", []string{"app/file"}, "file isn't a directory"},
+		{".", nil, ". has no Dockerfile at its root, which mooctl builds the app with"},
+		{"ctx", []string{"app/ctx/sub/Dockerfile"}, "ctx has no Dockerfile at its root"},
+		{"ctx", []string{"app/ctx/Dockerfile/"}, "ctx has no Dockerfile at its root"},
+		{"ctx", []string{"app/ctx/dockerfile"}, "ctx has no Dockerfile at its root"},
+		{"/abs", nil, "/abs is an absolute path; give the build context relative to the app directory"},
+		{"''", nil, "is empty; give the build context's directory, such as ."},
+		{"7", nil, "is a number, not a string"},
+		{"[.]", nil, "is a list, not a string"},
+	} {
+		app := buildTree(t, "name: web\nbuild: "+c.build+"\n", c.files...)
+		_, err := appfile.Read(app)
+		var e *appfile.Error
+		if !errors.As(err, &e) || e.File != filepath.Join(app, appfile.FileName) || e.Field != "build" || !strings.Contains(e.Reason, c.reason) {
+			t.Errorf("Read of build %s = %v, want the file, the field build and %q", c.build, err, c.reason)
+		}
+	}
+}
+
+func TestReadSaysWhyItCantReadTheBuildContext(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Fatal("run as root, the test can't make a directory unreadable")
+	}
+	app := buildTree(t, "name: web\nbuild: locked/ctx\n", "app/locked/ctx/Dockerfile")
+	locked := filepath.Join(app, "locked")
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+	_, err := appfile.Read(app)
+	var e *appfile.Error
+	if !errors.As(err, &e) || e.Field != "build" || !strings.Contains(e.Reason, "permission denied") {
+		t.Errorf("Read of an unreadable build context = %v, want the field build and why", err)
 	}
 }
 
@@ -159,8 +260,18 @@ func FuzzRead(f *testing.F) {
 	} {
 		f.Add(seed)
 	}
+	f.Add("name: web\nbuild: ctx\n")
 	f.Fuzz(func(t *testing.T, data string) {
 		dir := write(t, data)
+		// A build context, at the app directory and in ctx below it.
+		for _, ctx := range []string{".", "ctx"} {
+			if err := os.MkdirAll(filepath.Join(dir, ctx), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, ctx, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
 		app, err := appfile.Read(dir)
 		if err != nil {
 			var e *appfile.Error
@@ -182,6 +293,15 @@ func FuzzRead(f *testing.F) {
 		}
 		if !allowed.MatchString(app.Name) || strings.HasSuffix(app.Name, "-") {
 			t.Fatalf("Read of %q took the name %q, which isn't an app's name", data, app.Name)
+		}
+		if (app.Image == "") == (app.Build == "") {
+			t.Fatalf("Read of %q took %+v, not one of an image and a build", data, app)
+		}
+		if app.Build != "" {
+			if info, err := os.Stat(filepath.Join(app.Build, "Dockerfile")); err != nil || !info.Mode().IsRegular() {
+				t.Fatalf("Read of %q took the build context %s, without a Dockerfile: %v", data, app.Build, err)
+			}
+			return
 		}
 		if err := nodev1.CheckReference(app.Image); err != nil {
 			t.Fatalf("Read of %q took the image %q, which the agent refuses: %v", data, app.Image, err)
@@ -277,5 +397,93 @@ func TestReadNameRefusesABadNameOrFileNamingTheFieldAndWhy(t *testing.T) {
 	}
 	if _, err := appfile.ReadName(t.TempDir()); err == nil || !strings.Contains(err.Error(), "there is no app file") {
 		t.Errorf("ReadName of a directory without an app file: %v, want it to say there is none", err)
+	}
+}
+
+// A Dockerfile in a context that can be listed but not searched can't be
+// read, and Read says so.
+func TestReadSaysWhyItCantReadTheDockerfile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Fatal("run as root, the test can't make a directory unsearchable")
+	}
+	app := buildTree(t, "name: web\nbuild: ctx\n", "app/ctx/Dockerfile")
+	ctx := filepath.Join(app, "ctx")
+	if err := os.Chmod(ctx, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(ctx, 0o755) })
+	_, err := appfile.Read(app)
+	var e *appfile.Error
+	if !errors.As(err, &e) || e.Field != "build" || !strings.Contains(e.Reason, "ctx's Dockerfile can't be read: permission denied") {
+		t.Errorf("Read of an unsearchable context = %v", err)
+	}
+}
+
+// A Dockerfile that is there but can't be read says so.
+func TestReadSaysADockerfileItCantOpenCantBeRead(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Fatal("run as root, the test can't make a file unreadable")
+	}
+	app := buildTree(t, "name: web\nbuild: .\n", "app/Dockerfile")
+	if err := os.Chmod(filepath.Join(app, "Dockerfile"), 0); err != nil {
+		t.Fatal(err)
+	}
+	_, err := appfile.Read(app)
+	var e *appfile.Error
+	if !errors.As(err, &e) || e.Field != "build" || !strings.Contains(e.Reason, ".'s Dockerfile can't be read: permission denied") {
+		t.Errorf("Read of an unreadable Dockerfile = %v", err)
+	}
+}
+
+// A Dockerfile that is a link is refused, wherever it links to, as buildx
+// follows it within the build context and not as this machine does; a
+// build context that is a link, to a directory with a Dockerfile, is
+// taken.
+func TestReadRefusesADockerfileThatIsALink(t *testing.T) {
+	link := func(t *testing.T, target, name string) {
+		t.Helper()
+		if err := os.Symlink(target, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	app := buildTree(t, "name: web\nbuild: ctx\n", "elsewhere/Dockerfile")
+	link(t, filepath.Join(filepath.Dir(app), "elsewhere"), filepath.Join(app, "ctx"))
+	if got, err := appfile.Read(app); err != nil || got.Build != filepath.Join(app, "ctx") {
+		t.Errorf("Read of a context linked to a directory = %+v, %v", got, err)
+	}
+	for name, target := range map[string]string{
+		"within the context":  "sub/real",
+		"absolute in it":      "/sub/real",
+		"outside":             "../../outside/Dockerfile",
+		"out and back":        "../ctx/sub/real",
+		"to nothing":          "missing",
+		"the host's absolute": "HOST/ctx/sub/real",
+	} {
+		app := buildTree(t, "name: web\nbuild: ctx\n", "app/ctx/sub/real", "outside/Dockerfile")
+		link(t, strings.Replace(target, "HOST", app, 1), filepath.Join(app, "ctx", "Dockerfile"))
+		_, err := appfile.Read(app)
+		var e *appfile.Error
+		if !errors.As(err, &e) || e.Field != "build" || !strings.Contains(e.Reason, "ctx's Dockerfile is a link, which mooctl doesn't follow") {
+			t.Errorf("Read of a Dockerfile linked %s = %v, want it refused as a link", name, err)
+		}
+	}
+}
+
+// A build context that can be searched but not listed is refused, as
+// buildx, which lists it, finds no Dockerfile in it.
+func TestReadRefusesABuildContextItCantList(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Fatal("run as root, the test can't make a directory unlistable")
+	}
+	app := buildTree(t, "name: web\nbuild: ctx\n", "app/ctx/Dockerfile")
+	ctx := filepath.Join(app, "ctx")
+	if err := os.Chmod(ctx, 0o311); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(ctx, 0o755) })
+	_, err := appfile.Read(app)
+	var e *appfile.Error
+	if !errors.As(err, &e) || e.Field != "build" || !strings.Contains(e.Reason, "ctx can't be listed, as buildx lists the build context: permission denied") {
+		t.Errorf("Read of an unlistable build context = %v", err)
 	}
 }

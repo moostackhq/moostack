@@ -3,9 +3,12 @@ package nodeclient
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"math/rand/v2"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,12 +24,22 @@ type recordingAgent struct {
 	mu      sync.Mutex
 	imports []*nodev1.ImportImageRequest
 	removes []*nodev1.RemoveRequest
+	// ended says an import's stream ended as one that sent it all does,
+	// and ends is told how each import's stream ended.
+	ended bool
+	ends  chan error
 }
 
 func (a *recordingAgent) ImportImage(stream grpc.ClientStreamingServer[nodev1.ImportImageRequest, nodev1.ImportImageResponse]) error {
 	for {
 		req, err := stream.Recv()
+		if a.ends != nil && err != nil {
+			a.ends <- err
+		}
 		if err == io.EOF {
+			a.mu.Lock()
+			a.ended = true
+			a.mu.Unlock()
 			return stream.SendAndClose(&nodev1.ImportImageResponse{})
 		}
 		if err != nil {
@@ -73,9 +86,12 @@ func serveRecording(t *testing.T, a *recordingAgent) nodev1.AgentClient {
 func TestImportImageSendsTheLeaseInTheFirstRequestAlone(t *testing.T) {
 	for _, size := range []int{0, 1, importChunk, importChunk + 1, 3*importChunk + 7} {
 		a := &recordingAgent{}
-		data := bytes.Repeat([]byte{'x'}, size)
+		// Bytes of their own in each place, so that a chunk sent out of
+		// order, or overwritten, shows.
+		data := make([]byte, size)
+		rand.NewChaCha8([32]byte{byte(size), byte(size >> 8), byte(size >> 16)}).Read(data)
 		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-		_, err := ImportImage(ctx, serveRecording(t, a), data, "the-lease")
+		_, err := ImportImage(ctx, serveRecording(t, a), bytes.NewReader(data), "the-lease")
 		cancel()
 		if err != nil {
 			t.Fatal(err)
@@ -112,5 +128,91 @@ func TestRemoveSendsTheNameAndTheLease(t *testing.T) {
 	}
 	if len(a.removes) != 2 || a.removes[0].Name != "dns" || a.removes[0].Lease != "the-lease" {
 		t.Errorf("Remove sent %v, want dns for the-lease", a.removes)
+	}
+}
+
+// failingReader reads n bytes, then fails with err.
+type failingReader struct {
+	n   int
+	err error
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if r.n == 0 {
+		return 0, r.err
+	}
+	n := min(len(p), r.n)
+	clear(p[:n])
+	r.n -= n
+	return n, nil
+}
+
+// An archive that fails to be read partway fails the import, saying
+// why, and ends the call as one cut off, so that the agent imports
+// nothing of it.
+func TestAnArchiveThatCantBeReadEndsTheImport(t *testing.T) {
+	a := &recordingAgent{ends: make(chan error, 1)}
+	broken := errors.New("disk read error")
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err := ImportImage(ctx, serveRecording(t, a), &failingReader{n: 2*importChunk + 5, err: broken}, "the-lease")
+	if !errors.Is(err, broken) || !strings.Contains(err.Error(), "reading the image's archive") {
+		t.Errorf("ImportImage of an archive that fails to be read = %v, want why", err)
+	}
+	select {
+	case end := <-a.ends:
+		if end == io.EOF {
+			t.Error("the agent's stream ended as one that sent the whole archive")
+		}
+	case <-ctx.Done():
+		t.Fatal("the agent's stream didn't end")
+	}
+}
+
+// gatedReader reads chunks of a chunk each, the first at once and each
+// after only once the agent got the one before, so that a client that
+// read the whole archive before it sent any would wait for ever.
+type gatedReader struct {
+	a      *recordingAgent
+	chunks int
+	read   int
+}
+
+func (r *gatedReader) Read(p []byte) (int, error) {
+	if r.read == r.chunks {
+		return 0, io.EOF
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		r.a.mu.Lock()
+		got := len(r.a.imports)
+		r.a.mu.Unlock()
+		if got >= r.read {
+			break
+		}
+		if time.Now().After(deadline) {
+			return 0, errors.New("the agent got nothing of what was read before")
+		}
+	}
+	n := min(len(p), importChunk)
+	clear(p[:n])
+	r.read++
+	return n, nil
+}
+
+// An import streams the archive as it reads it, a chunk at a time,
+// rather than holding it whole first.
+func TestAnImportStreamsTheArchiveAsItReadsIt(t *testing.T) {
+	a := &recordingAgent{}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if _, err := ImportImage(ctx, serveRecording(t, a), &gatedReader{a: a, chunks: 8}, "the-lease"); err != nil {
+		t.Fatalf("ImportImage of an archive read a chunk at a time: %v", err)
+	}
+	var size int
+	for _, r := range a.imports {
+		size += len(r.Chunk)
+	}
+	if size != 8*importChunk || !a.ended {
+		t.Errorf("the agent got %d bytes, ended: %v, want the whole archive", size, a.ended)
 	}
 }

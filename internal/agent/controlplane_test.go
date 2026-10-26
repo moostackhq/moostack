@@ -3,6 +3,7 @@
 package agent_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -112,7 +113,7 @@ func TestAJoinedNodeServesTheNodeAPIOverItsTunnels(t *testing.T) {
 
 	// The control plane runs a cluster service, and calls it. An import
 	// without the lease is refused over the tunnel too.
-	if _, err := nodeclient.ImportImage(ctx, agent, nodetest.ImageArchive(t, "dns"), "other"); status.Code(err) != codes.FailedPrecondition {
+	if _, err := nodeclient.ImportImage(ctx, agent, bytes.NewReader(nodetest.ImageArchive(t, "dns")), "other"); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("importing dns's image over the tunnel without the lock: %v, want failed precondition", err)
 	}
 	images, err := importOver(ctx, agent, nodetest.ImageArchive(t, "dns"))
@@ -557,7 +558,7 @@ func TestTheControlPlaneRunsAndRemovesContainersOverTheTunnel(t *testing.T) {
 	if _, err := agent.AcquireLock(ctx, &nodev1.AcquireLockRequest{Lock: &nodev1.Lock{Lease: "cp", Holder: "control plane"}, Ttl: durationpb.New(time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := nodeclient.ImportImage(ctx, agent, nodetest.ImageArchive(t, "dns"), "cp"); err != nil {
+	if _, err := nodeclient.ImportImage(ctx, agent, bytes.NewReader(nodetest.ImageArchive(t, "dns")), "cp"); err != nil {
 		t.Fatal(err)
 	}
 	dns := nodetest.Service("dns")
@@ -597,7 +598,7 @@ func importOver(ctx context.Context, agent nodev1.AgentClient, data []byte) ([]s
 	if _, err := agent.AcquireLock(ctx, &nodev1.AcquireLockRequest{Lock: &nodev1.Lock{Lease: "cp", Holder: "control plane"}, Ttl: durationpb.New(time.Minute)}); err != nil {
 		return nil, err
 	}
-	images, err := nodeclient.ImportImage(ctx, agent, data, "cp")
+	images, err := nodeclient.ImportImage(ctx, agent, bytes.NewReader(data), "cp")
 	if err != nil {
 		return nil, err
 	}

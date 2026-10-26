@@ -1,7 +1,10 @@
 package orchestrate_test
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -33,6 +36,15 @@ type appFake struct {
 	afterPull func()
 	// pulled are the references the node pulled, in order.
 	pulled []string
+	// importErr, if set, is why an import of an app's image fails, and
+	// importNames, if set, the names an import answers with in place of
+	// the image's; imported are the names of the images the node
+	// imported, in order. afterImport, if set, is called once an import
+	// is done, before it answers.
+	importErr   error
+	importNames []string
+	imported    []string
+	afterImport func()
 	// digests are the digests of the builds of the images the node
 	// pulled, by name.
 	digests map[string]string
@@ -113,6 +125,70 @@ func (n *node) PullImage(ctx context.Context, ref, lease string) (nodeclient.Pul
 		n.mu.Lock()
 	}
 	return nodeclient.PulledImage{Name: ref, Digest: digest}, nil
+}
+
+// importApp imports the app's image in the OCI image layout archive, as
+// the name its index gives it, with its digest, unless importErr says
+// why it fails.
+func (n *node) importApp(archive []byte) ([]string, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.app.importErr != nil {
+		return nil, n.app.importErr
+	}
+	name, digest := archiveImage(archive)
+	if name == "" {
+		return nil, status.Error(codes.InvalidArgument, "importing the image: not an image's archive")
+	}
+	if n.images == nil {
+		n.images = map[string]bool{}
+	}
+	if n.app.digests == nil {
+		n.app.digests = map[string]string{}
+	}
+	n.images[name], n.app.digests[name] = true, digest
+	n.app.imported = append(n.app.imported, name)
+	if n.app.afterImport != nil {
+		n.mu.Unlock()
+		n.app.afterImport()
+		n.mu.Lock()
+	}
+	if n.app.importNames != nil {
+		return n.app.importNames, nil
+	}
+	return []string{name}, nil
+}
+
+// archiveImage is the name and the digest of the image in the OCI image
+// layout archive, as its index gives them, empty if it isn't one.
+func archiveImage(archive []byte) (string, string) {
+	r := tar.NewReader(bytes.NewReader(archive))
+	for {
+		h, err := r.Next()
+		if err != nil {
+			return "", ""
+		}
+		if h.Name != "index.json" {
+			continue
+		}
+		var index struct {
+			Manifests []struct {
+				Digest      string
+				Annotations map[string]string
+			}
+		}
+		if err := json.NewDecoder(r).Decode(&index); err != nil || len(index.Manifests) != 1 {
+			return "", ""
+		}
+		return index.Manifests[0].Annotations["io.containerd.image.name"], index.Manifests[0].Digest
+	}
+}
+
+// imports are the names of the apps' images the node imported so far.
+func (n *node) imports() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.app.imported)
 }
 
 // runAppCall runs the app's container c, as runApp does, holding the
@@ -337,7 +413,7 @@ func TestDeployRunsANewAppOnTheNodeWithTheFewestApps(t *testing.T) {
 	if *d != (orchestrate.Deployed{Node: "node2", Image: nginx}) {
 		t.Errorf("Deploy = %+v, want web on node2, changed", d)
 	}
-	want := []orchestrate.DeployStep{{Placement: orchestrate.Placement{Node: "node2"}}, {Placement: orchestrate.Placement{Node: "node2"}, Pulling: true}}
+	want := []orchestrate.DeployStep{{Placement: orchestrate.Placement{Node: "node2"}}, {Placement: orchestrate.Placement{Node: "node2"}, Fetching: true}}
 	if !slices.Equal(steps, want) {
 		t.Errorf("Deploy told %+v, want %+v", steps, want)
 	}

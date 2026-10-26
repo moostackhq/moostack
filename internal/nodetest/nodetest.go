@@ -694,7 +694,7 @@ func (n *Node) importArchive(t *testing.T, what string, data []byte, want string
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	images, err := nodeclient.ImportImage(ctx, n.Agent, data, Lease)
+	images, err := nodeclient.ImportImage(ctx, n.Agent, bytes.NewReader(data), Lease)
 	if err != nil {
 		t.Fatalf("importing %s: %v", what, err)
 	}

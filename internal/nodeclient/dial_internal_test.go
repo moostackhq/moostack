@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,7 +113,7 @@ func TestTheNodeAPIsErrorsAndImageNamesComeQuoted(t *testing.T) {
 		if status.Code(err) != codes.FailedPrecondition || status.Convert(err).Message() != strconv.Quote(forged) {
 			t.Errorf("RecordGeneration's error is %v, want its message quoted, with its code", err)
 		}
-		got, err := n.ImportImage(ctx, []byte("archive"), "lease")
+		got, err := n.ImportImage(ctx, strings.NewReader("archive"), "lease")
 		if images == nil {
 			if status.Code(err) != codes.InvalidArgument || status.Convert(err).Message() != strconv.Quote(forged) {
 				t.Errorf("ImportImage's error is %v, want its message quoted, with its code", err)

@@ -34,6 +34,7 @@ import (
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/platforms"
 	godigest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -250,8 +251,12 @@ func namespaced(ctx context.Context) context.Context {
 // container's other images doesn't take the one imported. An image
 // imported again, as to go back to it, is no longer unused, as its time
 // of update in containerd tells. It imports only if fence lets it once
-// no run waits.
-func (s *containers) Import(ctx context.Context, r io.Reader, fence func() error) ([]string, error) {
+// no run waits. It refuses, with FAILED_PRECONDITION, an archive with an
+// image for another platform than the node's, before it names any image,
+// so that an image of the same name stays as it was. It fails with
+// INVALID_ARGUMENT for an archive it can't read, which it can't whenever
+// it is sent, and with UNAVAILABLE where containerd fails, which may pass.
+func (s *containers) Import(ctx context.Context, r io.ReadSeeker, fence func() error) ([]string, error) {
 	s.running.Lock()
 	defer s.running.Unlock()
 	if err := fence(); err != nil {
@@ -260,18 +265,74 @@ func (s *containers) Import(ctx context.Context, r io.Reader, fence func() error
 	// A lease holds what the import writes until the images hold it.
 	ctx, _, release, err := s.ownLease(namespaced(ctx))
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Unavailable, "importing the image: %v", err)
 	}
 	defer release()
+	// The archive's images are checked from the archive itself, before
+	// containerd reads any of it.
+	if err := checkPlatforms(ctx, r, platforms.Default()); err != nil {
+		return nil, importError(ctx, err, true)
+	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return nil, status.Errorf(codes.Internal, "importing the image: %v", err)
+	}
+	if err := s.abortImportIngests(ctx); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "importing the image: %v", err)
+	}
 	images, err := s.client.Import(ctx, r)
 	if err != nil {
-		return nil, err
+		return nil, importError(ctx, err, false)
 	}
 	var names []string
 	for _, img := range images {
 		names = append(names, img.Name)
 	}
 	return names, nil
+}
+
+// abortImportIngests aborts what an import cut short left in containerd's
+// content store: containerd's import writes each file of an archive under
+// a ref of the file's name, tar- and its path, without the digest it
+// should have, and would take up what is left under that ref, as an
+// earlier build's index.json, as the start of another archive's file of
+// that name and size. No other import runs meanwhile, as s.running is
+// held.
+func (s *containers) abortImportIngests(ctx context.Context) error {
+	store := s.client.ContentStore()
+	statuses, err := store.ListStatuses(ctx)
+	if err != nil {
+		return err
+	}
+	for _, st := range statuses {
+		if !strings.HasPrefix(st.Ref, "tar-") {
+			continue
+		}
+		if err := store.Abort(ctx, st.Ref); err != nil && !errdefs.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// importError is err, why an import failed, as a status: as it is if it
+// has a code; CANCELED or DEADLINE_EXCEEDED once ctx ended; INVALID_ARGUMENT
+// for the archive, as every failure of the platform check, of archive,
+// is, and as containerd's are that its archive causes, of the classes of
+// an invalid argument, something not found, a failed precondition or
+// something there already, or of none, as its own reading of the archive
+// is; and UNAVAILABLE for containerd's others, which may pass.
+func importError(ctx context.Context, err error, archive bool) error {
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	if ctx.Err() != nil {
+		return status.FromContextError(ctx.Err()).Err()
+	}
+	if !archive && !errdefs.IsInvalidArgument(err) && !errdefs.IsNotFound(err) && !errdefs.IsFailedPrecondition(err) &&
+		!errdefs.IsAlreadyExists(err) && !errors.Is(errdefs.Resolve(err), errdefs.ErrUnknown) {
+		return status.Errorf(codes.Unavailable, "importing the image: %v", err)
+	}
+	return status.Errorf(codes.InvalidArgument, "importing the image: %v", err)
 }
 
 // checkContainer fails with INVALID_ARGUMENT unless c can be run, as

@@ -15,6 +15,9 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
+
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // Image is an image of one layer.
@@ -120,8 +123,8 @@ func Write(w io.Writer, img Image) error {
 		return err
 	}
 	files := []File{
-		{Name: "oci-layout", Mode: 0o644, Data: []byte(`{"imageLayoutVersion":"1.0.0"}`)},
-		{Name: "index.json", Mode: 0o644, Data: index},
+		{Name: ocispec.ImageLayoutFile, Mode: 0o644, Data: []byte(`{"imageLayoutVersion":"` + ocispec.ImageLayoutVersion + `"}`)},
+		{Name: ocispec.ImageIndexFile, Mode: 0o644, Data: index},
 	}
 	for _, b := range [][]byte{config, manifest, compressed.Bytes()} {
 		files = append(files, File{Name: "blobs/sha256/" + digest(b)[len("sha256:"):], Mode: 0o644, Data: b})
@@ -160,25 +163,58 @@ func digest(b []byte) string {
 // knows the image by once imported. Another build of an image, under the
 // same name, has another.
 func Digest(archive []byte) (string, error) {
-	r := tar.NewReader(bytes.NewReader(archive))
+	return ReadDigest(bytes.NewReader(archive))
+}
+
+// ReadDigest is Digest of the archive r reads, which it reads to its
+// end, seeking past the files' contents if r can seek. It takes the
+// archive's index.json as containerd's import does, by its cleaned
+// path, and refuses an archive with more than one, of which containerd
+// would take another than the first, and one that isn't an OCI image
+// layout, which containerd would read by its manifest.json instead.
+func ReadDigest(r io.Reader) (string, error) {
+	tr := tar.NewReader(r)
+	var manifests []descriptor
+	// containerd decodes each oci-layout in turn into one layout.
+	var layout ocispec.ImageLayout
+	found := false
 	for {
-		h, err := r.Next()
+		h, err := tr.Next()
 		if err == io.EOF {
-			return "", errors.New("the archive has no index.json")
+			break
 		}
 		if err != nil {
 			return "", err
 		}
-		if h.Name != "index.json" {
+		if h.Typeflag != tar.TypeReg {
 			continue
 		}
+		if path.Clean(h.Name) == ocispec.ImageLayoutFile {
+			if err := json.NewDecoder(tr).Decode(&layout); err != nil {
+				return "", fmt.Errorf("oci-layout: %w", err)
+			}
+			continue
+		}
+		if path.Clean(h.Name) != ocispec.ImageIndexFile {
+			continue
+		}
+		if found {
+			return "", errors.New("the archive has more than one index.json")
+		}
+		found = true
 		var index struct{ Manifests []descriptor }
-		if err := json.NewDecoder(r).Decode(&index); err != nil {
+		if err := json.NewDecoder(tr).Decode(&index); err != nil {
 			return "", fmt.Errorf("index.json: %w", err)
 		}
-		if len(index.Manifests) != 1 {
-			return "", fmt.Errorf("index.json lists %d images, not one", len(index.Manifests))
-		}
-		return index.Manifests[0].Digest, nil
+		manifests = index.Manifests
 	}
+	switch {
+	case layout.Version != ocispec.ImageLayoutVersion:
+		return "", fmt.Errorf("the archive isn't an OCI image layout of version %s: its %s says %q", ocispec.ImageLayoutVersion, ocispec.ImageLayoutFile, layout.Version)
+	case !found:
+		return "", errors.New("the archive has no index.json")
+	case len(manifests) != 1:
+		return "", fmt.Errorf("index.json lists %d images, not one", len(manifests))
+	}
+	return manifests[0].Digest, nil
 }

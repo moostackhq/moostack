@@ -1,6 +1,7 @@
 package orchestrate
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -292,7 +293,7 @@ func (c *Cluster) updateService(ctx context.Context, n *namedConn, svc Service, 
 // importImage imports svc's image on n, and fails unless it imports as
 // the image svc's container runs.
 func (c *Cluster) importImage(ctx context.Context, n *namedConn, svc Service) error {
-	images, err := n.conn.ImportImage(ctx, svc.Archive, c.lease.Lease)
+	images, err := n.conn.ImportImage(ctx, bytes.NewReader(svc.Archive), c.lease.Lease)
 	if err != nil {
 		return err
 	}

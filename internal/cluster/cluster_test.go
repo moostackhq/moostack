@@ -377,8 +377,9 @@ func TestAddNodeRefusesIncompleteNodes(t *testing.T) {
 		"no host key":        func(n *cluster.Node) { n.HostKey = nil },
 		"no private address": func(n *cluster.Node) { n.PrivateAddress = netip.Addr{} },
 		"no architecture":    func(n *cluster.Node) { n.Architecture = "" },
-		"no identity":        func(n *cluster.Node) { n.Identity = "" },
-		"bad identity":       func(n *cluster.Node) { n.Identity = "sha256:abc" },
+		"an architecture Moostack doesn't run on": func(n *cluster.Node) { n.Architecture = "riscv64" },
+		"no identity":  func(n *cluster.Node) { n.Identity = "" },
+		"bad identity": func(n *cluster.Node) { n.Identity = "sha256:abc" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			d := newCluster(t)
@@ -402,8 +403,11 @@ func TestNodesRefusesBadNodeFiles(t *testing.T) {
 		"bad host key":    {"web-1.yml", strings.Replace(good, "ssh-ed25519", "ssh-nonsense", 1)},
 		"bad address":     {"web-1.yml", strings.Replace(good, "10.0.0.5", "10.0.0", 1)},
 		"no architecture": {"web-1.yml", strings.Replace(good, "architecture: amd64\n", "", 1)},
-		"bad identity":    {"web-1.yml", strings.Replace(good, "sha256:", "md5:", 1)},
-		"invalid name":    {"Web_1.yml", good},
+		// A path, which mooctl would name a build's archive by.
+		"an architecture that is a path": {"web-1.yml", strings.Replace(good, "architecture: amd64", "architecture: ../amd64", 1)},
+		"two architectures":              {"web-1.yml", strings.Replace(good, "architecture: amd64", "architecture: amd64,linux/arm64", 1)},
+		"bad identity":                   {"web-1.yml", strings.Replace(good, "sha256:", "md5:", 1)},
+		"invalid name":                   {"Web_1.yml", good},
 	} {
 		t.Run(name, func(t *testing.T) {
 			d := newCluster(t)

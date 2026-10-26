@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"slices"
 	"strings"
@@ -362,18 +363,26 @@ func (n *fakeNode) UpdateContainerd(_ context.Context, version string, files map
 }
 
 // ImportImage imports the image in the OCI image layout archive, as the
-// name its index gives it, unless its call ended, or lease doesn't hold
-// the node's operation lock.
-func (n *fakeNode) ImportImage(ctx context.Context, archive []byte, lease string) ([]string, error) {
+// name its index gives it, of the build its index gives, unless its call
+// ended, lease doesn't hold the node's operation lock, or the apps'
+// importErr says why it fails.
+func (n *fakeNode) ImportImage(ctx context.Context, r io.Reader, lease string) ([]string, error) {
+	if n.apps.importing != nil {
+		n.apps.importing(ctx)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if l := n.heldLock(); l == nil || l.Lease != lease {
 		return nil, status.Error(codes.FailedPrecondition, "the operation's lease doesn't hold the node's operation lock")
 	}
-	r := tar.NewReader(bytes.NewReader(archive))
+	archive, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	tr := tar.NewReader(bytes.NewReader(archive))
 	for {
-		h, err := r.Next()
+		h, err := tr.Next()
 		if err != nil {
 			return nil, fmt.Errorf("not an image: %v", err)
 		}
@@ -381,15 +390,27 @@ func (n *fakeNode) ImportImage(ctx context.Context, archive []byte, lease string
 			continue
 		}
 		var index struct {
-			Manifests []struct{ Annotations map[string]string }
+			Manifests []struct {
+				Digest      string
+				Annotations map[string]string
+			}
 		}
-		if err := json.NewDecoder(r).Decode(&index); err != nil || len(index.Manifests) != 1 {
+		if err := json.NewDecoder(tr).Decode(&index); err != nil || len(index.Manifests) != 1 {
 			return nil, fmt.Errorf("not an image: %v", err)
 		}
 		name := index.Manifests[0].Annotations["io.containerd.image.name"]
 		n.mu.Lock()
+		defer n.mu.Unlock()
+		if n.apps.importErr != nil {
+			return nil, n.apps.importErr
+		}
 		n.keep(name, archive)
-		n.mu.Unlock()
+		// An app's image runs as the build the archive holds.
+		if n.apps.digests == nil {
+			n.apps.digests = map[string]string{}
+		}
+		n.apps.digests[name] = index.Manifests[0].Digest
+		n.apps.imported = append(n.apps.imported, name)
 		return []string{name}, nil
 	}
 }
@@ -630,7 +651,7 @@ func TestTheFakeNodeRefusesAnImportAndARemovalAsTheAgentDoes(t *testing.T) {
 	if _, err := n.AcquireLock(t.Context(), nodeclient.Lock{Lease: "op"}, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := n.ImportImage(t.Context(), archive(t), "other"); err == nil {
+	if _, err := n.ImportImage(t.Context(), bytes.NewReader(archive(t)), "other"); err == nil {
 		t.Error("the fake imported for another lease")
 	}
 	if _, err := n.Remove(t.Context(), "dns", "other"); err == nil {
@@ -639,10 +660,10 @@ func TestTheFakeNodeRefusesAnImportAndARemovalAsTheAgentDoes(t *testing.T) {
 	if _, err := n.Remove(ended, "dns", "op"); err == nil {
 		t.Error("the fake removed once the call ended")
 	}
-	if _, err := n.ImportImage(ended, archive(t), "op"); err == nil {
+	if _, err := n.ImportImage(ended, bytes.NewReader(archive(t)), "op"); err == nil {
 		t.Error("the fake imported once the call ended")
 	}
-	if _, err := n.ImportImage(t.Context(), archive(t), "op"); err != nil {
+	if _, err := n.ImportImage(t.Context(), bytes.NewReader(archive(t)), "op"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := n.Remove(t.Context(), "dns", "op"); err != nil {
@@ -653,7 +674,7 @@ func TestTheFakeNodeRefusesAnImportAndARemovalAsTheAgentDoes(t *testing.T) {
 	if _, err := n.Run(t.Context(), dns, "op"); err == nil {
 		t.Error("the fake ran service-dns from the image the removal of dns deleted")
 	}
-	if _, err := n.ImportImage(t.Context(), archive(t), "op"); err != nil {
+	if _, err := n.ImportImage(t.Context(), bytes.NewReader(archive(t)), "op"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := n.Run(t.Context(), dns, "op"); err != nil {

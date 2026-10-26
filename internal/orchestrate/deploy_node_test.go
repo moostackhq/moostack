@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -236,4 +238,97 @@ func appPID(t *testing.T, n *nodetest.Node, name string) string {
 		t.Fatalf("%s's cgroup holds %q: %v", name, out, err)
 	}
 	return strings.TrimSpace(out)
+}
+
+// deployBuildOn deploys web, built locally as img, on the agent of n, a
+// cluster of one node, and returns what the deploy left.
+func deployBuildOn(t *testing.T, n *nodetest.Node, img nodetest.Image) (*orchestrate.Deployed, error) {
+	t.Helper()
+	cl := operateOn(t, n)
+	defer cl.Close()
+	archive := img.Archive(t)
+	app := orchestrate.App{Name: "web", Image: img.Name, Archive: func(string) (io.ReadSeekCloser, error) { return opened(archive), nil }}
+	return cl.Deploy(cl.Context(), app, func(orchestrate.DeployStep) {})
+}
+
+// A local build deployed to a real agent runs; the same build tagged
+// anew changes nothing, its process running on; another build replaces
+// it; and a build for another architecture is refused at its import,
+// the app running on as it ran.
+func TestDeployOfALocalBuildOnANode(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	first := nodetest.Image{Name: "moostack.local/web:20261026T120000Z"}
+	if d, err := deployBuildOn(t, n, first); err != nil || d.Unchanged || d.Image != first.Name {
+		t.Fatalf("deploying the first build: %+v, %v", d, err)
+	}
+	before := runningApp(t, n, "app-web")
+	pid := appPID(t, n, "app-web")
+	retagged := nodetest.Image{Name: "moostack.local/web:20261026T130000Z"}
+	if d, err := deployBuildOn(t, n, retagged); err != nil || !d.Unchanged || d.Image != retagged.Name {
+		t.Fatalf("deploying the same build, tagged anew: %+v, %v, want it unchanged", d, err)
+	}
+	if after := runningApp(t, n, "app-web"); after.Image != retagged.Name || after.Digest != before.Digest {
+		t.Errorf("once the same build was deployed tagged anew, the node runs %v, want %s of the same build", after, retagged.Name)
+	}
+	if now := appPID(t, n, "app-web"); now != pid {
+		t.Errorf("the same build tagged anew restarted the app: it ran as %s, and runs as %s", pid, now)
+	}
+	// Each deploy of a build is a new tag: the one before goes.
+	if nodeHasImage(t, n, first.Name) {
+		t.Errorf("%s is kept once the app runs as %s", first.Name, retagged.Name)
+	}
+	changed := nodetest.Image{Name: "moostack.local/web:20261026T140000Z", Rebuild: 1}
+	d, err := deployBuildOn(t, n, changed)
+	if err != nil || d.Unchanged {
+		t.Fatalf("deploying a changed build: %+v, %v, want it replaced", d, err)
+	}
+	replaced := runningApp(t, n, "app-web")
+	if replaced.Image != changed.Name || replaced.Digest == before.Digest {
+		t.Errorf("once a changed build was deployed, the node runs %v", replaced)
+	}
+	if nodeHasImage(t, n, retagged.Name) {
+		t.Errorf("%s is kept once a changed build replaced it", retagged.Name)
+	}
+	other := nodetest.Image{Name: "moostack.local/web:20261026T150000Z", Rebuild: 2, Architecture: otherArch()}
+	_, err = deployBuildOn(t, n, other)
+	var ie *orchestrate.ImportError
+	if !errors.As(err, &ie) || !strings.Contains(err.Error(), "the image is for linux/"+otherArch()) {
+		t.Fatalf("deploying a build for %s: %v, want an *ImportError saying the node refused it", otherArch(), err)
+	}
+	if after := runningApp(t, n, "app-web"); after.Image != replaced.Image || after.Digest != replaced.Digest {
+		t.Errorf("once a build for another architecture was refused, the node runs %v, want it as it ran", after)
+	}
+	if nodeHasImage(t, n, other.Name) {
+		t.Errorf("the refused build %s is on the node", other.Name)
+	}
+}
+
+// otherArch is an architecture other than this machine's.
+func otherArch() string {
+	if runtime.GOARCH == "arm64" {
+		return "amd64"
+	}
+	return "arm64"
+}
+
+// runningApp is the container called name, as n's agent reports it once
+// it runs.
+func runningApp(t *testing.T, n *nodetest.Node, name string) *nodev1.ContainerStatus {
+	t.Helper()
+	var k *nodev1.ContainerStatus
+	nodetest.Eventually(t, 30*time.Second, func() error {
+		s, err := n.Status(t)
+		if err != nil {
+			return err
+		}
+		for _, c := range s.Containers {
+			if c.Name == name && c.State == nodev1.TaskState_TASK_STATE_RUNNING {
+				k = c
+				return nil
+			}
+		}
+		return fmt.Errorf("%s doesn't run: %v", name, s.Containers)
+	})
+	return k
 }

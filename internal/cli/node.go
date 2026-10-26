@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"path/filepath"
 	"slices"
@@ -839,7 +840,7 @@ func (n unreachedNode) UpdateContainerd(context.Context, string, map[string][]by
 	return n.err
 }
 
-func (n unreachedNode) ImportImage(context.Context, []byte, string) ([]string, error) {
+func (n unreachedNode) ImportImage(context.Context, io.Reader, string) ([]string, error) {
 	return nil, n.err
 }
 

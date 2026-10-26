@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path"
 	"slices"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/moostackhq/moostack/internal/appfile"
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/nodeclient"
+	"github.com/moostackhq/moostack/internal/ociimage"
 )
 
 // DefaultStartCheck is how long a deploy waits once the app's container
@@ -23,9 +25,14 @@ import (
 const DefaultStartCheck = 3 * time.Second
 
 // App is an app as a deploy runs it: its name, as its app file gives
-// it, and the public image it runs, a normalized reference.
+// it, and the image it runs, a normalized reference: a public image, or
+// a local build, tagged with it, if Archive is set.
 type App struct {
 	Name, Image string
+	// Archive, if set, opens the OCI image layout archive of the local
+	// build of Image for the node called node, which a deploy imports
+	// there, in place of a pull, and closes once it read it.
+	Archive func(node string) (io.ReadSeekCloser, error)
 }
 
 // Placement is the node an app is deployed to, and whether it was picked
@@ -93,10 +100,11 @@ func (e *DuplicateAppError) Error() string {
 }
 
 // DeployStep is a step of a deploy, as Deploy tells it: the node it
-// picked, and then, with Pulling, that the node starts to pull the image.
+// picked, and then, with Fetching, that the node starts to get the image:
+// to pull it, or to import the local build.
 type DeployStep struct {
 	Placement
-	Pulling bool
+	Fetching bool
 }
 
 // Deployed is an app as a deploy left it: on Node, running Image.
@@ -121,6 +129,21 @@ func (e *PullError) Error() string {
 }
 
 func (e *PullError) Unwrap() error { return e.Err }
+
+// ImportError says the node called Node failed to import Image, the
+// app's local build, as Err says, so that nothing changed. If the deploy
+// was stopped, or lost the lock, meanwhile, Err is why, as the
+// operation's context's cause says.
+type ImportError struct {
+	Node, Image string
+	Err         error
+}
+
+func (e *ImportError) Error() string {
+	return fmt.Sprintf("%s failed to import %s: %v", e.Node, e.Image, e.Err)
+}
+
+func (e *ImportError) Unwrap() error { return e.Err }
 
 // RunError says the node called Node failed to run the app, as Err says.
 // Runs is what the node said ran of the app after the failure, and Image
@@ -196,12 +219,14 @@ func (e *UncheckedError) Unwrap() error { return e.Err }
 // Deploy deploys app to a node the cluster has a connection to, picked
 // as Place picks it from what every node says it runs: the node pulls
 // the app's image, and runs the app's container from it with only its
-// name and image, replacing the one that runs. Once the start check's
-// time has passed, the container must still run. An app that runs there
-// already from the same build of the image, which the pull tells, is
-// left as it runs, and so is one whose run starts no process, without
-// the start check. told is told the node picked, and then the pull as it
-// starts. A pull that fails fails with a *PullError, before anything
+// name and image, replacing the one that runs; for a local build, the
+// node imports the build's archive for it instead. Once the start
+// check's time has passed, the container must still run. An app that
+// runs there already from the same build of the image, which the pull or
+// the archive tells, is left as it runs, and so is one whose run starts
+// no process, without the start check. told is told the node picked,
+// and then the pull or the import as it starts. A pull that fails fails
+// with a *PullError, and an import with an *ImportError, before anything
 // changed; a run with a *RunError; and an app that doesn't run once the
 // start check's time has passed with a *NotRunningError. A deploy that
 // can't check that the app runs, as one stopped meanwhile, fails with an
@@ -223,33 +248,36 @@ func (c *Cluster) Deploy(ctx context.Context, app App, told func(DeployStep)) (*
 	n := conns[slices.IndexFunc(conns, func(n *namedConn) bool { return n.name == p.Node })]
 	name := appfile.ContainerName(app.Name)
 	before := containerNamed(containers[p.Node], name)
-	told(DeployStep{Placement: p, Pulling: true})
-	pulled, err := n.conn.PullImage(ctx, app.Image, c.lease.Lease)
+	image, err := c.fetch(ctx, n, p, app, told)
 	if err != nil {
-		return nil, &PullError{Node: p.Node, Image: app.Image, Err: cmp.Or(stopped(ctx), err)}
+		return nil, err
 	}
-	deployed := &Deployed{Node: p.Node, Image: pulled.Name}
-	// What runs once the pull ended decides, as the app may have exited
-	// while the node pulled; one the node can't tell of is run again. The
-	// build decides, not the name of its image: one that runs the same
-	// build under another name is run under the pulled name, which renames
+	deployed := &Deployed{Node: p.Node, Image: image.Name}
+	// What runs once the node got the image decides, as the app may have
+	// exited meanwhile; one the node can't tell of is run again. The build
+	// decides, not the name of its image: one that runs the same build
+	// under another name is run under the new name, which renames
 	// it on the node. A run that starts no process changes nothing.
 	if now := c.status(ctx, n); now.AgentErr == nil {
-		if k := containerNamed(now.Containers, name); runsBuild(k, pulled.Name, pulled.Digest) {
+		if k := containerNamed(now.Containers, name); runsBuild(k, image.Name, image.Digest) {
 			deployed.Unchanged = true
 			return deployed, nil
 		}
 	}
-	// The pull may have outlasted the lease, and the run replaces the app
-	// that runs.
+	// The pull or the import may have outlasted the lease, and the run
+	// replaces the app that runs.
+	got := "pulled"
+	if app.Archive != nil {
+		got = "imported"
+	}
 	if err := c.CheckLock(); err != nil {
-		return nil, fmt.Errorf("%w, once %s pulled %s, so mooctl ran nothing; nothing changed", err, p.Node, pulled.Name)
+		return nil, fmt.Errorf("%w, once %s %s %s, so mooctl ran nothing; nothing changed", err, p.Node, got, image.Name)
 	}
-	// A deploy stopped once the pull ended sends no run.
+	// A deploy stopped once the node got the image sends no run.
 	if cause := stopped(ctx); cause != nil {
-		return nil, fmt.Errorf("mooctl stopped once %s pulled %s, before it ran %s: %w; nothing changed", p.Node, pulled.Name, app.Name, cause)
+		return nil, fmt.Errorf("mooctl stopped once %s %s %s, before it ran %s: %w; nothing changed", p.Node, got, image.Name, app.Name, cause)
 	}
-	started, err := c.run(ctx, n, p, app, pulled, before)
+	started, err := c.run(ctx, n, p, app, image, before)
 	if err != nil {
 		return nil, err
 	}
@@ -276,6 +304,48 @@ func (c *Cluster) Deploy(ctx context.Context, app App, told func(DeployStep)) (*
 		return nil, &NotRunningError{Node: p.Node, App: app.Name, Within: c.startCheck, Exited: true, ExitCode: k.ExitCode, Log: path.Join(hostlayout.ContainerLogDir, name+".log")}
 	}
 	return nil, &NotRunningError{Node: p.Node, App: app.Name, Within: c.startCheck, Problem: cmp.Or(k.Problem, "the node can't tell whether it runs")}
+}
+
+// fetch has n get app's image, as p placed it there, telling told as it
+// starts: the node pulls a public image, and imports a local build's
+// archive for it. It returns the image's name and digest, and fails, as
+// nothing changed, with a *PullError or an *ImportError if the node
+// fails to.
+//
+// Temporary: a local build reaches a node through ImportImage, until
+// nodes pull images from the cluster's own registry.
+func (c *Cluster) fetch(ctx context.Context, n *namedConn, p Placement, app App, told func(DeployStep)) (nodeclient.PulledImage, error) {
+	if app.Archive == nil {
+		told(DeployStep{Placement: p, Fetching: true})
+		pulled, err := n.conn.PullImage(ctx, app.Image, c.lease.Lease)
+		if err != nil {
+			return pulled, &PullError{Node: p.Node, Image: app.Image, Err: cmp.Or(stopped(ctx), err)}
+		}
+		return pulled, nil
+	}
+	archive, err := app.Archive(p.Node)
+	if err != nil {
+		return nodeclient.PulledImage{}, fmt.Errorf("reading the build of %s for %s: %w; nothing changed", app.Name, p.Node, err)
+	}
+	defer archive.Close()
+	// The archive's own digest is the build's, as the node keeps it. The
+	// archive is read through, then streamed to the node from its start.
+	digest, err := ociimage.ReadDigest(archive)
+	if err == nil {
+		_, err = archive.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		return nodeclient.PulledImage{}, fmt.Errorf("reading the build of %s for %s: %w; nothing changed", app.Name, p.Node, err)
+	}
+	told(DeployStep{Placement: p, Fetching: true})
+	names, err := n.conn.ImportImage(ctx, archive, c.lease.Lease)
+	if err != nil {
+		return nodeclient.PulledImage{}, &ImportError{Node: p.Node, Image: app.Image, Err: cmp.Or(stopped(ctx), err)}
+	}
+	if !slices.Contains(names, app.Image) {
+		return nodeclient.PulledImage{}, &ImportError{Node: p.Node, Image: app.Image, Err: fmt.Errorf("the node imported %v, not the build", names)}
+	}
+	return nodeclient.PulledImage{Name: app.Image, Digest: digest}, nil
 }
 
 // containers are the connections to the cluster's nodes, sorted by
@@ -399,13 +469,13 @@ func (c *Cluster) RemoveApp(ctx context.Context, app string, told func(node stri
 	return removedFrom, nil
 }
 
-// run has n run app's container, from the image pulled, as p placed it,
+// run has n run app's container, from image, as p placed it,
 // and says whether the node started its process. It fails with a
 // *RunError if the node can't, saying what runs then, against before,
 // the container that ran before the deploy.
-func (c *Cluster) run(ctx context.Context, n *namedConn, p Placement, app App, pulled nodeclient.PulledImage, before *nodev1.ContainerStatus) (bool, error) {
+func (c *Cluster) run(ctx context.Context, n *namedConn, p Placement, app App, image nodeclient.PulledImage, before *nodev1.ContainerStatus) (bool, error) {
 	name := appfile.ContainerName(app.Name)
-	started, err := n.conn.Run(ctx, &nodev1.Container{Name: name, Image: pulled.Name}, c.lease.Lease)
+	started, err := n.conn.Run(ctx, &nodev1.Container{Name: name, Image: image.Name}, c.lease.Lease)
 	if err == nil {
 		return started, nil
 	}
@@ -416,22 +486,22 @@ func (c *Cluster) run(ctx context.Context, n *namedConn, p Placement, app App, p
 	}
 	runErr := &RunError{Node: p.Node, App: app.Name, Err: err}
 	if after := c.status(ctx, n); after.AgentErr == nil {
-		runErr.Runs, runErr.Image = runOutcome(containerNamed(after.Containers, name), before, pulled)
+		runErr.Runs, runErr.Image = runOutcome(containerNamed(after.Containers, name), before, image)
 	}
 	return false, runErr
 }
 
 // runOutcome is what runs of an app whose container is k, as a node says
-// once a run of the build pulled failed, and its image if it runs: a
+// once a run of the build image failed, and its image if it runs: a
 // container the node can't tell the state of is unknown, and one that runs
-// is the build it ran before, as before was, the one pulled, or another.
-func runOutcome(k, before *nodev1.ContainerStatus, pulled nodeclient.PulledImage) (RunOutcome, string) {
+// is the build it ran before, as before was, the one asked for, or another.
+func runOutcome(k, before *nodev1.ContainerStatus, image nodeclient.PulledImage) (RunOutcome, string) {
 	switch {
 	case k != nil && k.State == nodev1.TaskState_TASK_STATE_UNSPECIFIED:
 		return RunUnknown, ""
 	case !running(k):
 		return NotRunning, ""
-	case runsBuild(k, pulled.Name, pulled.Digest):
+	case runsBuild(k, image.Name, image.Digest):
 		return RunsAsAsked, k.Image
 	case before != nil && runsBuild(k, before.Image, before.Digest):
 		return RunsAsBefore, k.Image

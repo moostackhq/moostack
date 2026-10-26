@@ -3,6 +3,7 @@ package orchestrate
 import (
 	"context"
 	"errors"
+	"io"
 	"slices"
 	"strings"
 	"testing"
@@ -227,7 +228,11 @@ func (r *serviceRecorder) Status(context.Context) nodeclient.Status {
 	return nodeclient.Status{Containers: r.containers}
 }
 
-func (r *serviceRecorder) ImportImage(_ context.Context, archive []byte, _ string) ([]string, error) {
+func (r *serviceRecorder) ImportImage(_ context.Context, ar io.Reader, _ string) ([]string, error) {
+	archive, err := io.ReadAll(ar)
+	if err != nil {
+		return nil, err
+	}
 	if r.onImport != nil {
 		r.onImport()
 	}
