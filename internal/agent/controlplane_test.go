@@ -545,7 +545,8 @@ func TestADetachDuringAnUpdateOfTheAgentEndsInDirectMode(t *testing.T) {
 }
 
 // The control plane runs and removes containers over its tunnel, under
-// the operation lock, as mooctl does on the local socket.
+// the operation lock, as mooctl does on the local socket, and can't pull
+// without it.
 func TestTheControlPlaneRunsAndRemovesContainersOverTheTunnel(t *testing.T) {
 	peer := nodetest.NewTunnelPeer(t)
 	nodetest.StartJoined(t, peer)
@@ -562,6 +563,11 @@ func TestTheControlPlaneRunsAndRemovesContainersOverTheTunnel(t *testing.T) {
 	dns := nodetest.Service("dns")
 	nobody := "65534:65534"
 	c := &nodev1.Container{Name: "service-dns", Image: dns.Image, User: &nobody, ReadOnlyRoot: true, Capabilities: &nodev1.Capabilities{}, Api: dns.Api}
+	for _, lease := range []string{"", "other"} {
+		if _, err := agent.PullImage(ctx, &nodev1.PullImageRequest{Reference: "registry.test/web:1", Lease: lease}); status.Code(err) != codes.FailedPrecondition {
+			t.Errorf("pulling an image over the tunnel for the lease %q, which doesn't hold the lock: %v, want failed precondition", lease, err)
+		}
+	}
 	if _, err := agent.Run(ctx, &nodev1.RunRequest{Container: c, Lease: "other"}); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("running a container over the tunnel without the lock: %v, want failed precondition", err)
 	}

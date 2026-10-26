@@ -230,7 +230,7 @@ func TestThePreflightSuggestsForceForANodeThatCantTellItsGeneration(t *testing.T
 	o := newOperator(t, "op")
 	source := preflightCluster(t, o)
 	o.nodes["node3"] = generationUnknown("unreadable")
-	nodeAddRefused(t, o, source, "node3: it can't tell the generation", "pass --force to apply this cluster directory anyway, and have every node record its generation")
+	nodeAddRefused(t, o, source, "node3: it can't tell the generation", "pass --force to go on from it anyway; the next operation that writes it has every node record its generation")
 }
 
 func TestThePreflightSuggestsForceForEachKindOfRefusalItWouldPass(t *testing.T) {
@@ -239,8 +239,8 @@ func TestThePreflightSuggestsForceForEachKindOfRefusalItWouldPass(t *testing.T) 
 	o.nodes["node2"] = healthyNode(5)
 	o.nodes["node3"] = generationUnknown("unreadable")
 	nodeAddRefused(t, o, source,
-		"Pull the latest cluster directory, or pass --force to apply this one anyway",
-		"pass --force to apply this cluster directory anyway, and have every node record its generation")
+		"Pull the latest cluster directory, or pass --force to go on from this one anyway",
+		"pass --force to go on from it anyway; the next operation that writes it has every node record its generation")
 }
 
 func TestOnlyNodeAddTakesForce(t *testing.T) {

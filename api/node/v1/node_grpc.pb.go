@@ -29,6 +29,7 @@ const (
 	Agent_ReleaseLock_FullMethodName      = "/moostack.node.v1.Agent/ReleaseLock"
 	Agent_BreakLock_FullMethodName        = "/moostack.node.v1.Agent/BreakLock"
 	Agent_ImportImage_FullMethodName      = "/moostack.node.v1.Agent/ImportImage"
+	Agent_PullImage_FullMethodName        = "/moostack.node.v1.Agent/PullImage"
 	Agent_Run_FullMethodName              = "/moostack.node.v1.Agent/Run"
 	Agent_Remove_FullMethodName           = "/moostack.node.v1.Agent/Remove"
 	Agent_RemoveIdentities_FullMethodName = "/moostack.node.v1.Agent/RemoveIdentities"
@@ -79,14 +80,29 @@ type AgentClient interface {
 	// importing nothing, unless the first request's lease holds the
 	// operation lock.
 	ImportImage(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportImageRequest, ImportImageResponse], error)
+	// PullImage pulls a public image into the node's containerd, by a
+	// reference normalized as Docker normalizes one, such as
+	// docker.io/library/nginx:1.27, and unpacks it. A pull of an image the
+	// node has fetches only what it lacks. It refuses, with
+	// INVALID_ARGUMENT, a reference that isn't normalized, and, with
+	// FAILED_PRECONDITION, an image for another platform than the node's,
+	// and the pull unless the request's lease holds the operation lock,
+	// pulling nothing. A failed pull answers NOT_FOUND for an image the
+	// registry doesn't have, PERMISSION_DENIED for one it denies access to,
+	// RESOURCE_EXHAUSTED at the registry's first answer that the node is
+	// rate limited, with no retry, and UNAVAILABLE for a registry that
+	// can't be reached. The pull ends when its call ends.
+	PullImage(ctx context.Context, in *PullImageRequest, opts ...grpc.CallOption) (*PullImageResponse, error)
 	// Run runs a container from its image, which the node must have, and
 	// keeps it running across restarts of the agent, of containerd and of
 	// the node. The container gets no-new-privileges, a cgroup of its
 	// own, and a network namespace of its own with loopback alone. Its
 	// output goes to the node's log as <name>.log. Running a container as
 	// it runs already, from the same build of the same image with the same
-	// properties, changes nothing; otherwise the container of that name is
-	// replaced, and if the new one can't be made, the old one runs on.
+	// properties, changes nothing, and one that runs the same build under
+	// another name of its image takes the new name in place; otherwise the
+	// container of that name is replaced, and if the new one can't be made,
+	// the old one runs on.
 	// Once the agent has the call, it goes on even if the call ends. It is
 	// refused with FAILED_PRECONDITION, changing nothing, unless the
 	// request's lease holds the operation lock, if the node lacks the
@@ -217,6 +233,16 @@ func (c *agentClient) ImportImage(ctx context.Context, opts ...grpc.CallOption) 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Agent_ImportImageClient = grpc.ClientStreamingClient[ImportImageRequest, ImportImageResponse]
 
+func (c *agentClient) PullImage(ctx context.Context, in *PullImageRequest, opts ...grpc.CallOption) (*PullImageResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PullImageResponse)
+	err := c.cc.Invoke(ctx, Agent_PullImage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *agentClient) Run(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*RunResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RunResponse)
@@ -325,14 +351,29 @@ type AgentServer interface {
 	// importing nothing, unless the first request's lease holds the
 	// operation lock.
 	ImportImage(grpc.ClientStreamingServer[ImportImageRequest, ImportImageResponse]) error
+	// PullImage pulls a public image into the node's containerd, by a
+	// reference normalized as Docker normalizes one, such as
+	// docker.io/library/nginx:1.27, and unpacks it. A pull of an image the
+	// node has fetches only what it lacks. It refuses, with
+	// INVALID_ARGUMENT, a reference that isn't normalized, and, with
+	// FAILED_PRECONDITION, an image for another platform than the node's,
+	// and the pull unless the request's lease holds the operation lock,
+	// pulling nothing. A failed pull answers NOT_FOUND for an image the
+	// registry doesn't have, PERMISSION_DENIED for one it denies access to,
+	// RESOURCE_EXHAUSTED at the registry's first answer that the node is
+	// rate limited, with no retry, and UNAVAILABLE for a registry that
+	// can't be reached. The pull ends when its call ends.
+	PullImage(context.Context, *PullImageRequest) (*PullImageResponse, error)
 	// Run runs a container from its image, which the node must have, and
 	// keeps it running across restarts of the agent, of containerd and of
 	// the node. The container gets no-new-privileges, a cgroup of its
 	// own, and a network namespace of its own with loopback alone. Its
 	// output goes to the node's log as <name>.log. Running a container as
 	// it runs already, from the same build of the same image with the same
-	// properties, changes nothing; otherwise the container of that name is
-	// replaced, and if the new one can't be made, the old one runs on.
+	// properties, changes nothing, and one that runs the same build under
+	// another name of its image takes the new name in place; otherwise the
+	// container of that name is replaced, and if the new one can't be made,
+	// the old one runs on.
 	// Once the agent has the call, it goes on even if the call ends. It is
 	// refused with FAILED_PRECONDITION, changing nothing, unless the
 	// request's lease holds the operation lock, if the node lacks the
@@ -410,6 +451,9 @@ func (UnimplementedAgentServer) BreakLock(context.Context, *BreakLockRequest) (*
 }
 func (UnimplementedAgentServer) ImportImage(grpc.ClientStreamingServer[ImportImageRequest, ImportImageResponse]) error {
 	return status.Error(codes.Unimplemented, "method ImportImage not implemented")
+}
+func (UnimplementedAgentServer) PullImage(context.Context, *PullImageRequest) (*PullImageResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PullImage not implemented")
 }
 func (UnimplementedAgentServer) Run(context.Context, *RunRequest) (*RunResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Run not implemented")
@@ -565,6 +609,24 @@ func _Agent_ImportImage_Handler(srv interface{}, stream grpc.ServerStream) error
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Agent_ImportImageServer = grpc.ClientStreamingServer[ImportImageRequest, ImportImageResponse]
 
+func _Agent_PullImage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PullImageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).PullImage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_PullImage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).PullImage(ctx, req.(*PullImageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Agent_Run_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RunRequest)
 	if err := dec(in); err != nil {
@@ -681,6 +743,10 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "BreakLock",
 			Handler:    _Agent_BreakLock_Handler,
+		},
+		{
+			MethodName: "PullImage",
+			Handler:    _Agent_PullImage_Handler,
 		},
 		{
 			MethodName: "Run",

@@ -2,16 +2,19 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/urfave/cli/v3"
 	"golang.org/x/crypto/ssh"
@@ -61,6 +64,10 @@ type Env struct {
 	HTTPClient *http.Client
 	// Cache is the directory of releases downloaded from such a source.
 	Cache string
+	// StartCheck is how long deploy waits once an app's container started
+	// before it checks that the container still runs. Zero means
+	// orchestrate.DefaultStartCheck.
+	StartCheck time.Duration
 }
 
 // OSEnv is the Env of the running process.
@@ -106,7 +113,7 @@ func New(env Env) *cli.Command {
 			&cli.StringFlag{
 				Name:    "dir",
 				Aliases: []string{"C"},
-				Usage:   "the cluster directory",
+				Usage:   "the cluster directory; without it, the current directory if it has a cluster.yml, or else $MOOCTL_DIR",
 				Value:   ".",
 			},
 			&cli.StringFlag{
@@ -121,6 +128,7 @@ func New(env Env) *cli.Command {
 		},
 		Commands: []*cli.Command{
 			clusterCommand(env),
+			deployCommand(env),
 			nodeCommand(env),
 			secretCommand(env),
 		},
@@ -203,14 +211,59 @@ type sshNode struct {
 // connection ends when the node has stopped answering.
 func (n sshNode) Close() error { return errors.Join(n.ssh.Close(), n.Node.Close()) }
 
+// clusterDir is the cluster directory that cmd names with -C, or else
+// the current directory if it has a cluster file, or else the one
+// MOOCTL_DIR names: the current directory if none does, or if the one
+// that does is empty. With MOOCTL_DIR set and no -C, it says on stderr,
+// once, which directory it is, as an exported MOOCTL_DIR may be
+// forgotten.
+func clusterDir(cmd *cli.Command) string {
+	if cmd.IsSet("dir") {
+		return cmp.Or(cmd.String("dir"), ".")
+	}
+	env := os.Getenv("MOOCTL_DIR")
+	if env == "" {
+		return "."
+	}
+	dir, note := env, "Cluster directory: "+env+", from MOOCTL_DIR"
+	if here, err := os.Stat(cluster.FileName); err == nil {
+		if there, err := os.Stat(filepath.Join(env, cluster.FileName)); err != nil || !os.SameFile(here, there) {
+			dir, note = ".", "Cluster directory: the current directory, which has a "+cluster.FileName+", not MOOCTL_DIR's "+env
+		}
+	}
+	root := cmd.Root()
+	if root.Metadata == nil {
+		root.Metadata = map[string]any{}
+	}
+	if root.Metadata[dirToldKey] == nil {
+		root.Metadata[dirToldKey] = true
+		fmt.Fprintln(root.ErrWriter, note)
+	}
+	return dir
+}
+
+// dirToldKey marks, in the root command's metadata, that clusterDir said
+// which cluster directory it is.
+const dirToldKey = "clusterDirTold"
+
+// openCluster opens the cluster directory clusterDir names, and says to
+// name it if it has no cluster file.
+func openCluster(cmd *cli.Command) (*cluster.Dir, error) {
+	d, err := cluster.Open(clusterDir(cmd))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("%w\nPass -C <cluster dir>, or set MOOCTL_DIR to the cluster directory.", err)
+	}
+	return d, err
+}
+
 // forceFlag is --force, for every command that runs the preflight.
 var forceFlag = &cli.BoolFlag{
 	Name:  "force",
-	Usage: "apply this cluster directory even if a node has applied a later generation of it, or can't tell which generation it applied",
+	Usage: "go on from this cluster directory even if a node has applied a later generation of it, or can't tell which generation it applied",
 }
 
 // preflight runs the preflight on the nodes of d, apart from the node
-// called skip if one is, for an operation that writes d: it refuses a
+// called skip if one is, for an operation on them: it refuses a
 // node on a release this mooctl doesn't operate, and one that check, if
 // set, fails, takes the operation lock for the operator on this machine
 // and for cmd, and pushes d's removed identities to every node. The
@@ -232,6 +285,7 @@ func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir, s
 	}
 	toDial := nodesToDial(env, nodes)
 	toDial.LeaseTTL = ttl
+	toDial.StartCheck = env.StartCheck
 	toDial.Removed = cluster.Fingerprints(removed)
 	toDial.Check = func(s nodeclient.Status, all []nodeclient.Status) error {
 		if err := operated(env, s); err != nil {
@@ -250,10 +304,10 @@ func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir, s
 	if perr := (*orchestrate.PreflightError)(nil); errors.As(err, &perr) && perr.Forceable() {
 		var hints []string
 		if errors.As(err, new(*orchestrate.LaterGenerationError)) {
-			hints = append(hints, "Pull the latest cluster directory, or pass --force to apply this one anyway.")
+			hints = append(hints, "Pull the latest cluster directory, or pass --force to go on from this one anyway.")
 		}
 		if errors.As(err, new(*orchestrate.UnknownGenerationError)) {
-			hints = append(hints, "If this cluster directory is the latest, pass --force to apply this cluster directory anyway, and have every node record its generation.")
+			hints = append(hints, "If this cluster directory is the latest, pass --force to go on from it anyway; the next operation that writes it has every node record its generation.")
 		}
 		return nil, fmt.Errorf("%w\n%s", err, strings.Join(hints, "\n"))
 	}
@@ -261,7 +315,7 @@ func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir, s
 		return nil, err
 	}
 	if len(c.Forced) > 0 {
-		fmt.Fprintln(env.Stderr, "--force applies this cluster directory although:")
+		fmt.Fprintln(env.Stderr, "--force goes on from this cluster directory although:")
 		for _, f := range c.Forced {
 			fmt.Fprintf(env.Stderr, "  %v\n", f)
 		}

@@ -1,0 +1,12 @@
+HTTP/1.1 404 Not Found
+Content-Type: application/json
+Content-Length: 109
+Docker-Distribution-Api-Version: registry/2.0
+Docker-Ratelimit-Source: 192.0.2.1
+X-Ratelimit-Limit: 100;w=3600
+Ratelimit-Limit: 100;w=3600
+X-Ratelimit-Remaining: 100;w=3600
+Ratelimit-Remaining: 100;w=3600
+Strict-Transport-Security: max-age=31536000
+
+{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown","detail":"unknown tag=no-such-tag-xyz"}]}

@@ -524,6 +524,14 @@ func spool(dir string, first *nodev1.ImportImageRequest, stream nodev1.Agent_Imp
 	return f, nil
 }
 
+func (s *agentServer) PullImage(ctx context.Context, req *nodev1.PullImageRequest) (*nodev1.PullImageResponse, error) {
+	image, digest, err := s.containers.Pull(ctx, req.Reference, s.fence(req.Lease))
+	if err != nil {
+		return nil, asStatus(err, "pulling "+req.Reference)
+	}
+	return &nodev1.PullImageResponse{Image: image, Digest: digest}, nil
+}
+
 func (s *agentServer) Run(ctx context.Context, req *nodev1.RunRequest) (*nodev1.RunResponse, error) {
 	if req.Container == nil {
 		return nil, status.Error(codes.InvalidArgument, "no container")
@@ -532,10 +540,11 @@ func (s *agentServer) Run(ctx context.Context, req *nodev1.RunRequest) (*nodev1.
 	// The run goes on if the call ends, as when mooctl is stopped, since
 	// it may have removed the container's old one already.
 	ctx = context.WithoutCancel(ctx)
-	if err := s.containers.Run(ctx, c, s.fence(req.Lease)); err != nil {
+	started, err := s.containers.Run(ctx, c, s.fence(req.Lease))
+	if err != nil {
 		return nil, asStatus(err, "running "+c.Name)
 	}
-	return &nodev1.RunResponse{}, nil
+	return &nodev1.RunResponse{Started: started}, nil
 }
 
 func (s *agentServer) Remove(ctx context.Context, req *nodev1.RemoveRequest) (*nodev1.RemoveResponse, error) {

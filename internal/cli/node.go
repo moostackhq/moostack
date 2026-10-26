@@ -96,7 +96,7 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	d, err := cluster.Open(cmd.String("dir"))
+	d, err := openCluster(cmd)
 	if err != nil {
 		return err
 	}
@@ -614,7 +614,7 @@ func privateAddressFlag(cmd *cli.Command) (netip.Addr, error) {
 // pinnedRelease opens the cluster directory, and the release it pins,
 // which this mooctl must operate.
 func pinnedRelease(ctx context.Context, env Env, cmd *cli.Command) (*cluster.Dir, *release.Release, error) {
-	d, err := cluster.Open(cmd.String("dir"))
+	d, err := openCluster(cmd)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -685,7 +685,7 @@ func reachHost(ctx context.Context, env Env, target string, private netip.Addr, 
 func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {
 	name := cmd.Args().First()
 	unreachable := cmd.Bool("unreachable")
-	d, err := cluster.Open(cmd.String("dir"))
+	d, err := openCluster(cmd)
 	if err != nil {
 		return err
 	}
@@ -843,7 +843,13 @@ func (n unreachedNode) ImportImage(context.Context, []byte, string) ([]string, e
 	return nil, n.err
 }
 
-func (n unreachedNode) Run(context.Context, *nodev1.Container, string) error { return n.err }
+func (n unreachedNode) PullImage(context.Context, string, string) (nodeclient.PulledImage, error) {
+	return nodeclient.PulledImage{}, n.err
+}
+
+func (n unreachedNode) Run(context.Context, *nodev1.Container, string) (bool, error) {
+	return false, n.err
+}
 
 func (n unreachedNode) Remove(context.Context, string, string) error { return n.err }
 

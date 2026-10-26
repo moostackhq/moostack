@@ -2,6 +2,7 @@ package nodev1
 
 import (
 	"math"
+	"net/url"
 	"regexp"
 	"slices"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/distribution/reference"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -94,4 +96,41 @@ func idPart(part string) bool {
 	}
 	n, err := strconv.ParseUint(part, 10, 31)
 	return err == nil && n <= math.MaxInt32
+}
+
+// NormalizeReference is ref, an image's reference, normalized as Docker
+// normalizes one: with its registry, its repository's path and a tag,
+// latest if it has neither a tag nor a digest, so that nginx:1.27 is
+// docker.io/library/nginx:1.27. A reference with both a tag and a digest
+// keeps the digest alone. It fails with INVALID_ARGUMENT for a reference
+// that doesn't parse, whose registry isn't a host as a URL names one,
+// which containerd's resolver refuses, or that is longer than an image's
+// name may be once normalized.
+func NormalizeReference(ref string) (string, error) {
+	named, err := reference.ParseDockerRef(ref)
+	if err != nil {
+		return "", status.Errorf(codes.InvalidArgument, "%q isn't an image's reference: %v", ref, err)
+	}
+	if _, err := url.Parse("https://" + reference.Domain(named)); err != nil {
+		return "", status.Errorf(codes.InvalidArgument, "%q isn't an image's reference: its registry %q isn't a host: %v", ref, reference.Domain(named), err)
+	}
+	normalized := named.String()
+	if len(normalized) > maxImage {
+		return "", status.Errorf(codes.InvalidArgument, "the image's reference %q is longer than %d bytes once normalized", ref, maxImage)
+	}
+	return normalized, nil
+}
+
+// CheckReference fails with INVALID_ARGUMENT unless ref is a reference
+// as NormalizeReference makes it, so that the name a node stores and
+// reports is always the full one.
+func CheckReference(ref string) error {
+	normalized, err := NormalizeReference(ref)
+	if err != nil {
+		return err
+	}
+	if normalized != ref {
+		return status.Errorf(codes.InvalidArgument, "the image's reference %q isn't normalized: it is %q", ref, normalized)
+	}
+	return nil
 }

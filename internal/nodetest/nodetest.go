@@ -8,6 +8,7 @@ package nodetest
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -530,8 +531,14 @@ type Image struct {
 	User string
 	// Group is the image's /etc/group, none if empty.
 	Group string
-	// Exit has it exit at once with that code, unless it is nil.
-	Exit *int
+	// Exit has it exit with that code, unless it is nil: at once, or
+	// after ExitAfter.
+	Exit      *int
+	ExitAfter time.Duration
+	// Architecture is the architecture it is built for, this machine's
+	// if empty, though its program is built for this machine's either
+	// way.
+	Architecture string
 	// Rebuild tells builds of the image under the same name apart: each,
 	// from 1, has a file more.
 	Rebuild int
@@ -577,6 +584,9 @@ func (img Image) of(program []byte) ociimage.Image {
 	if img.Exit != nil {
 		command = append(command, "-exit", strconv.Itoa(*img.Exit))
 	}
+	if img.ExitAfter != 0 {
+		command = append(command, "-exit-after", img.ExitAfter.String())
+	}
 	if img.API != "" {
 		command = append(command, "-api", img.API)
 	}
@@ -593,8 +603,11 @@ func (img Image) of(program []byte) ociimage.Image {
 	if img.Group != "" {
 		files = append(files, ociimage.File{Name: "etc/group", Mode: 0o644, Data: []byte(img.Group)})
 	}
-	return ociimage.Image{Name: img.Name, Architecture: runtime.GOARCH, Entrypoint: command, User: img.User, Files: files}
+	return ociimage.Image{Name: img.Name, Architecture: img.architecture(), Entrypoint: command, User: img.User, Files: files}
 }
+
+// architecture is the architecture img is built for.
+func (img Image) architecture() string { return cmp.Or(img.Architecture, runtime.GOARCH) }
 
 // Containerd is a client of the node's containerd.
 func (n *Node) Containerd(t *testing.T) *containerd.Client {
@@ -921,7 +934,7 @@ const (
 // NextVersion in nextAgent and nextUpdater, and the release's containerd
 // binaries and runc for this machine's architecture, with the cluster
 // services' images in imagesDir, also built with Version, and Fixture's
-// and Broken's.
+// and Broken's, and the registry program in registryProgram.
 // Cleanup removes it.
 func binaries(t *testing.T) string {
 	t.Helper()
@@ -946,6 +959,12 @@ func binaries(t *testing.T) string {
 		}
 		binErr = writeFixtureImages(filepath.Join(binDir, imagesDir))
 		if binErr != nil {
+			return
+		}
+		cmd := exec.Command("go", "build", "-o", filepath.Join(binDir, registryProgram), "github.com/moostackhq/moostack/internal/nodetest/registry")
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			binErr = fmt.Errorf("building the registry: %v\n%s", err, out)
 			return
 		}
 		for _, b := range []struct{ program, version, out string }{

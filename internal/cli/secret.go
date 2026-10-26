@@ -100,7 +100,7 @@ func secretAction(env Env, nargs int, run func(*secretSession) error) cli.Action
 		s := &secretSession{
 			env:      env,
 			cmd:      cmd,
-			path:     filepath.Join(cmd.String("dir"), secretstore.FileName),
+			path:     filepath.Join(clusterDir(cmd), secretstore.FileName),
 			terminal: t,
 			args:     cmd.Args().Slice(),
 		}

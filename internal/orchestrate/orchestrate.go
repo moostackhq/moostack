@@ -59,10 +59,15 @@ type Node interface {
 	// image layout archive, for the operation whose lease holds the node's
 	// operation lock, and returns the names of the images imported.
 	ImportImage(ctx context.Context, archive []byte, lease string) ([]string, error)
+	// PullImage has the node's agent pull the public image ref, a
+	// normalized reference, for the operation whose lease holds the node's
+	// operation lock, and returns the image pulled.
+	PullImage(ctx context.Context, ref, lease string) (nodeclient.PulledImage, error)
 	// Run has the node's agent run the container c, from its image, which
-	// the node must have imported, replacing the one of its name, for the
-	// operation whose lease holds the node's operation lock.
-	Run(ctx context.Context, c *nodev1.Container, lease string) error
+	// the node must have imported or pulled, replacing the one of its
+	// name, for the operation whose lease holds the node's operation lock,
+	// and says whether it started the container's process.
+	Run(ctx context.Context, c *nodev1.Container, lease string) (bool, error)
 	// Remove has the node's agent stop and delete the container called
 	// name, for the operation whose lease holds the node's operation lock.
 	Remove(ctx context.Context, name, lease string) error
@@ -94,6 +99,10 @@ type Nodes struct {
 	// ServiceTimeout is how long a cluster service that an update ran has
 	// to answer its health call. Zero means DefaultServiceTimeout.
 	ServiceTimeout time.Duration
+	// StartCheck is how long a deploy waits once the app's container
+	// started before it checks that the container still runs. Zero means
+	// DefaultStartCheck.
+	StartCheck time.Duration
 	// LeaseTTL is how long a node holds the operation lock after the
 	// operation last renewed it. Zero means DefaultLeaseTTL.
 	LeaseTTL time.Duration
@@ -200,6 +209,7 @@ type Cluster struct {
 	recordTimeout  time.Duration
 	reachTimeout   time.Duration
 	serviceTimeout time.Duration
+	startCheck     time.Duration
 	// checkNode is Nodes.Check, nil if it isn't set.
 	checkNode func(s nodeclient.Status, all []nodeclient.Status) error
 	// lease is the operation's hold on the lock, which every node holds
@@ -284,6 +294,7 @@ func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, h
 		recordTimeout:  cmp.Or(nodes.RecordTimeout, DefaultTimeout),
 		reachTimeout:   cmp.Or(nodes.ReachTimeout, DefaultTimeout),
 		serviceTimeout: cmp.Or(nodes.ServiceTimeout, DefaultServiceTimeout),
+		startCheck:     cmp.Or(nodes.StartCheck, DefaultStartCheck),
 		checkNode:      nodes.Check,
 		lease:          nodeclient.Lock{Lease: newLease(), Holder: holder.Who, Machine: holder.Machine, Operation: holder.Operation},
 		ttl:            cmp.Or(nodes.LeaseTTL, DefaultLeaseTTL),

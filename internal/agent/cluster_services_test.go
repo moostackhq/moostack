@@ -776,14 +776,19 @@ func TestAServiceRunGoesOnWhenItsCallEnds(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
 	n.StartServices(t)
-	n.ImportFixtures(t)
+	// The fixture's image is slow to unpack, so that the call, which has
+	// time to reach the agent however busy the machine is, ends while the
+	// agent replaces the service.
+	slow := nodetest.ImageOf(nodetest.Fixture())
+	slow.Slow = true
+	n.Import(t, slow)
 	// The lock is taken first, so that taking it takes none of the
 	// call's time.
 	n.HoldLock(t)
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	if _, err := runService(ctx, t, n, nodetest.Fixture()); status.Code(err) != codes.DeadlineExceeded {
-		t.Fatalf("running dns from the fixture within 50ms: %v, want the call to end first", err)
+		t.Fatalf("running dns from the slow fixture within a second: %v, want the call to end first", err)
 	}
 	nodetest.Eventually(t, time.Minute, func() error {
 		s, err := n.Status(t)

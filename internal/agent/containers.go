@@ -79,6 +79,12 @@ const (
 type container struct {
 	Name  string `json:"name"`
 	Image string `json:"image"`
+	// Digest is the digest of the build of Image that its run asked for,
+	// as Image named it then, so that a pull or an import that moves the
+	// name to another build changes no container until a run asks for it.
+	// A list written before builds were kept has none; such a container
+	// runs the build that Image names now.
+	Digest string `json:"digest,omitempty"`
 	properties
 	// API is the gRPC service name of the API that the container serves
 	// on its socket, which the agent routes calls to it by, empty if it
@@ -158,6 +164,9 @@ type containers struct {
 	// last routed, so that the API each was made for isn't known, until
 	// each is routed. It changes under running.
 	unknown map[string]bool
+	// starts counts the containers' processes started, so that a run can
+	// tell whether it started one. It changes under running.
+	starts int
 }
 
 // loadContainers reads the containers the node runs from the file that
@@ -295,13 +304,16 @@ func (s *containers) change(ctx context.Context, fence func() error, f func(ctx 
 }
 
 // Run runs c, replacing the container of its name, stores it, and routes
-// its API to it once it runs, as a change, which fence lets happen.
-func (s *containers) Run(ctx context.Context, c *container, fence func() error) error {
+// its API to it once it runs, as a change, which fence lets happen. It
+// says whether it started the container's process.
+func (s *containers) Run(ctx context.Context, c *container, fence func() error) (bool, error) {
 	if err := checkContainer(c); err != nil {
-		return err
+		return false, err
 	}
-	return s.change(ctx, fence, func(ctx context.Context) error {
-		if _, err := s.client.GetImage(ctx, c.Image); errdefs.IsNotFound(err) {
+	var started bool
+	err := s.change(ctx, fence, func(ctx context.Context) error {
+		img, err := s.client.GetImage(ctx, c.Image)
+		if errdefs.IsNotFound(err) {
 			return status.Errorf(codes.FailedPrecondition, "the node has no image %s", c.Image)
 		} else if err != nil {
 			return status.Errorf(codes.Unavailable, "reading the image %s: %v", c.Image, err)
@@ -327,8 +339,9 @@ func (s *containers) Run(ctx context.Context, c *container, fence func() error) 
 				return status.Errorf(codes.FailedPrecondition, "the container %s serves %s already", other.Name, c.API)
 			}
 		}
-		// The list keeps a container of its own, rather than the caller's.
-		c = &container{Name: c.Name, Image: c.Image, properties: c.properties, API: c.API}
+		// The list keeps a container of its own, rather than the caller's,
+		// with the build its image names now.
+		c = &container{Name: c.Name, Image: c.Image, Digest: img.Target().Digest.String(), properties: c.properties, API: c.API}
 		list = append(list, c)
 		slices.SortFunc(list, func(a, b *container) int { return strings.Compare(a.Name, b.Name) })
 		// The image of the container it replaces is unused once the new one
@@ -347,7 +360,10 @@ func (s *containers) Run(ctx context.Context, c *container, fence func() error) 
 		s.list = list
 		s.mu.Unlock()
 		s.unused = unused
-		if err := s.start(ctx, c, true); err != nil {
+		before := s.starts
+		err = s.start(ctx, c, true)
+		started = s.starts != before
+		if err != nil {
 			return err
 		}
 		// The other tags of its image go too, which an update imported but
@@ -356,6 +372,7 @@ func (s *containers) Run(ctx context.Context, c *container, fence func() error) 
 		s.deleteUnused(ctx, otherTags(ctx, s.client, c.Image))
 		return s.deleteAllUnused(ctx)
 	})
+	return started, err
 }
 
 // without is the stored containers but the one called name, in a list
@@ -526,15 +543,18 @@ func (s *containers) start(ctx context.Context, c *container, repair bool) error
 }
 
 // ensure starts c's container, first making it anew from c's image if
-// there is none, or the one there is was made from another image, build
-// of the image, API or properties. One whose image is gone is taken to
-// run the image there was, which it can run without. The new image is
-// found and unpacked before the old container goes, so that a new image
-// the node lacks, or can't unpack, leaves the old container running,
-// started again if it isn't, as after the node rebooted. One that
-// unpacks but doesn't run doesn't. With repair, a container as c says
-// whose API doesn't answer its health check is made anew too, so that
-// running a container again repairs it.
+// there is none, or the one there is was made from another image, API
+// or properties, or from another build of the image than both the one
+// c's run asked for and the one the image's name is at now. One made
+// from the same build under another name of its image takes c's name
+// and runs on. One whose image is gone is taken to run the image there
+// was, which it can run without. The new image is found and unpacked
+// before the old container goes, so that a new image the node lacks, or
+// can't unpack, leaves the old container running, started again if it
+// isn't, as after the node rebooted. One that unpacks but doesn't run
+// doesn't. With repair, a container as c says whose API doesn't answer
+// its health check is made anew too, so that running a container again
+// repairs it.
 func (s *containers) ensure(ctx context.Context, c *container, repair bool) error {
 	existing, labels, err := s.load(ctx, c.Name)
 	if err != nil {
@@ -550,10 +570,32 @@ func (s *containers) ensure(ctx context.Context, c *container, repair bool) erro
 	} else if !errdefs.IsNotFound(imgErr) {
 		return imgErr
 	}
-	same := existing != nil && labels[imageLabel] == c.Image && labels[apiLabel] == c.API &&
-		labels[propertiesLabel] == c.properties.label() && (digest == "" || labels[digestLabel] == digest)
+	built := labels[digestLabel]
+	// matchesButImage is whether the container runs as c says, but maybe
+	// for its image's name and build, and current whether it runs the
+	// build c's image names now.
+	matchesButImage := existing != nil && labels[apiLabel] == c.API && labels[propertiesLabel] == c.properties.label()
+	current := digest != "" && built == digest
+	// A container of the build c's image names, made under another name of
+	// it, as an image retagged, takes c's name in place and runs on.
+	if matchesButImage && current && labels[imageLabel] != c.Image {
+		if _, err := existing.SetLabels(ctx, map[string]string{imageLabel: c.Image}); err != nil {
+			return err
+		}
+		labels[imageLabel] = c.Image
+	}
+	// The build c's run asked for keeps its container, though a pull or an
+	// import since moved its image's name to another; so does the build the
+	// name is at, which a container made anew runs, and which c adopts.
+	same := matchesButImage && labels[imageLabel] == c.Image && (digest == "" || current || built == c.Digest)
 	if same && (!repair || c.API == "" || s.gateway.Health(ctx, c.API) == nil) {
-		return s.startTask(ctx, existing, c)
+		if err := s.startTask(ctx, existing, c); err != nil {
+			return err
+		}
+		if current {
+			return s.adopt(c, digest)
+		}
+		return nil
 	}
 	// While the new container can't be made, the old one runs on, started
 	// again if it doesn't, as after the node rebooted.
@@ -613,12 +655,48 @@ func (s *containers) ensure(ctx context.Context, c *container, repair bool) erro
 	if err != nil {
 		return err
 	}
-	return s.startTask(leased, made, c)
+	// A container made from another build than its run asked for, as one
+	// made anew once that build was gone, runs this one as asked from now
+	// on.
+	if err := s.startTask(leased, made, c); err != nil {
+		return err
+	}
+	return s.adopt(c, digest)
+}
+
+// adopt records digest as the build the stored container c's run asked
+// for, since its container runs that build now, as one made anew once
+// the build it was asked for was gone does. A container that keeps no
+// build, as one of a list written before builds were kept, records
+// none. The list is stored before c changes, as a run stores it, so
+// that if the store fails, the next start adopts the build again. The
+// caller holds s.running.
+func (s *containers) adopt(c *container, digest string) error {
+	if c.Digest == "" || c.Digest == digest {
+		return nil
+	}
+	list := s.all()
+	for i, k := range list {
+		if k == c {
+			adopted := *c
+			adopted.Digest = digest
+			list[i] = &adopted
+		}
+	}
+	if err := s.store(list, s.unused); err != nil {
+		return fmt.Errorf("keeping the build it runs: %w", err)
+	}
+	s.mu.Lock()
+	c.Digest = digest
+	s.mu.Unlock()
+	return nil
 }
 
 // specOf is how c's container runs, from config, the image's config:
 // as c's properties say, always without new privileges, in a cgroup of
-// its own, and with its socket directory mounted if it serves an API.
+// its own, with a cgroup namespace of its own, so that it sees its own
+// cgroup and not the node's tree, as containerd's default spec doesn't
+// give it, and with its socket directory mounted if it serves an API.
 func (s *containers) specOf(c *container, config oci.Image) []oci.SpecOpts {
 	spec := []oci.SpecOpts{oci.WithImageConfig(config)}
 	if c.User != nil {
@@ -627,7 +705,8 @@ func (s *containers) specOf(c *container, config oci.Image) []oci.SpecOpts {
 	if c.Capabilities != nil {
 		spec = append(spec, oci.WithCapabilities(*c.Capabilities), withAmbientCapabilities(*c.Capabilities))
 	}
-	spec = append(spec, oci.WithNoNewPrivileges, oci.WithCgroup(hostlayout.CgroupParent+"/"+c.Name))
+	spec = append(spec, oci.WithNoNewPrivileges, oci.WithCgroup(hostlayout.CgroupParent+"/"+c.Name),
+		oci.WithLinuxNamespace(specs.LinuxNamespace{Type: specs.CgroupNamespace}))
 	if c.ReadOnlyRoot {
 		spec = append(spec, oci.WithRootFSReadonly())
 	}
@@ -897,6 +976,7 @@ func (s *containers) startTaskOnce(ctx context.Context, made containerd.Containe
 		_, _ = task.Delete(ctx, containerd.WithProcessKill)
 		return err
 	}
+	s.starts++
 	return nil
 }
 

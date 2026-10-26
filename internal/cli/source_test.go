@@ -357,6 +357,27 @@ func TestTheRerunHintLeavesOutAReleaseSourceWithAPassword(t *testing.T) {
 	}
 }
 
+// The hint of an update run by MOOCTL_DIR names the cluster directory with
+// -C, so that it runs the same update pasted anywhere, and mooctl says
+// which cluster directory it acts on once, though the hint reads it again.
+func TestTheRerunHintOfAnUpdateByMOOCTL_DIRNamesTheDirectory(t *testing.T) {
+	o := newOperator(t, "op")
+	source := updateCluster(t, o)
+	t.Chdir(t.TempDir())
+	t.Setenv("MOOCTL_DIR", o.dir)
+	o.nodes["node2"].serviceErr = errors.New("the disk is full")
+	r := o.runWithoutDir("--release-source", source, "cluster", "update")
+	if r.err == nil {
+		t.Fatal("cluster update succeeded")
+	}
+	if got, want := hintArgs(t, "sh", r.err), []string{"-C", o.dir, "--release-source", source, "cluster", "update"}; !slices.Equal(got, want) {
+		t.Errorf("sh reads the hint as %q, want %q", got, want)
+	}
+	if n := strings.Count(r.stderr, "Cluster directory: "+o.dir+", from MOOCTL_DIR\n"); n != 1 {
+		t.Errorf("cluster update said which cluster directory it acts on %d times, want once:\n%s", n, r.stderr)
+	}
+}
+
 // An empty --source, as from a variable that isn't set, isn't taken for
 // none, which would install the release over the development builds.
 func TestAnEmptySourceIsRefused(t *testing.T) {

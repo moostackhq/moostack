@@ -1,0 +1,9 @@
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+Content-Length: 157
+Docker-Distribution-Api-Version: registry/2.0
+Www-Authenticate: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull"
+Docker-Ratelimit-Source: 192.0.2.1
+Strict-Transport-Security: max-age=31536000
+
+{"errors":[{"code":"UNAUTHORIZED","message":"authentication required","detail":[{"Type":"repository","Class":"","Name":"library/alpine","Action":"pull"}]}]}

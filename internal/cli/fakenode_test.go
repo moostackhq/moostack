@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
+	"github.com/moostackhq/moostack/internal/appfile"
 	"github.com/moostackhq/moostack/internal/buildid"
 	"github.com/moostackhq/moostack/internal/cluster"
 	"github.com/moostackhq/moostack/internal/nodeclient"
@@ -75,6 +76,8 @@ type fakeNode struct {
 	// asked are the containers the node was asked to run, in order, those
 	// it refused too.
 	asked []*nodev1.Container
+	// apps is how the node pulls images and runs apps.
+	apps apps
 	// sent are the last binary of the agent and of the updater the node
 	// was sent, and the last archive of each image it imported, by the
 	// image's name.
@@ -402,12 +405,41 @@ func (n *fakeNode) ImportImage(ctx context.Context, archive []byte, lease string
 // run other than locked down, or not named for its service.
 // Successful updates of components show in the node's status too, with
 // the build of their binaries.
-func (n *fakeNode) Run(ctx context.Context, c *nodev1.Container, lease string) error {
+// Run runs c as run does, and says whether it started c's process: as
+// the agent does, a run of an app that takes a new name of the build it
+// runs starts none.
+func (n *fakeNode) Run(ctx context.Context, c *nodev1.Container, lease string) (bool, error) {
+	n.mu.Lock()
+	n.apps.started = true
+	n.mu.Unlock()
+	err := n.run(ctx, c, lease)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return err == nil && n.apps.started, err
+}
+
+func (n *fakeNode) run(ctx context.Context, c *nodev1.Container, lease string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if l := n.heldLock(); l == nil || l.Lease != lease {
 		return status.Error(codes.FailedPrecondition, "the operation's lease doesn't hold the node's operation lock")
+	}
+	if appfile.IsApp(c.Name) {
+		// The run goes on if its call ends meanwhile, as the agent's does.
+		if n.apps.running != nil {
+			n.apps.running(ctx)
+		}
+		n.mu.Lock()
+		err := n.runApp(c)
+		n.mu.Unlock()
+		if err == nil && n.apps.ran != nil {
+			n.apps.ran()
+		}
+		if ctx.Err() != nil {
+			return status.FromContextError(ctx.Err()).Err()
+		}
+		return err
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -562,7 +594,7 @@ func TestTheFakeNodeRefusesARunAsTheAgentDoes(t *testing.T) {
 		if _, err := n.AcquireLock(t.Context(), nodeclient.Lock{Lease: "op"}, time.Minute); err != nil {
 			t.Fatal(err)
 		}
-		err := n.Run(c.ctx, c.container(), c.lease)
+		_, err := n.Run(c.ctx, c.container(), c.lease)
 		if want := name == "as mooctl runs a service"; (err == nil) != want {
 			t.Errorf("%s: the fake node's run says %v, want it run: %v", name, err, want)
 		}
@@ -607,13 +639,13 @@ func TestTheFakeNodeRefusesAnImportAndARemovalAsTheAgentDoes(t *testing.T) {
 	}
 	nobody := "65534:65534"
 	dns := &nodev1.Container{Name: "service-dns", Image: release.ImageRef("dns", "1.0.0"), User: &nobody, ReadOnlyRoot: true, Capabilities: &nodev1.Capabilities{}, Api: "moostack.dns.v1.DNS"}
-	if err := n.Run(t.Context(), dns, "op"); err == nil {
+	if _, err := n.Run(t.Context(), dns, "op"); err == nil {
 		t.Error("the fake ran service-dns from the image the removal of dns deleted")
 	}
 	if _, err := n.ImportImage(t.Context(), archive(t), "op"); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.Run(t.Context(), dns, "op"); err != nil {
+	if _, err := n.Run(t.Context(), dns, "op"); err != nil {
 		t.Errorf("the fake refused service-dns, its image imported again: %v", err)
 	}
 }

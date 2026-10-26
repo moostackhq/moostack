@@ -229,6 +229,21 @@ func TestRunRunsAContainerAsItsImageSaysWithCommonDefaults(t *testing.T) {
 	if cgroup := procFile(t, n, pid, "cgroup"); !strings.HasSuffix(strings.TrimSpace(cgroup), hostlayout.CgroupParent+"/app-web") {
 		t.Errorf("the container's cgroup is %q, want one of its own under %s", cgroup, hostlayout.CgroupParent)
 	}
+	// Its namespaces are its own, its cgroup namespace too, so that it
+	// sees its own cgroup alone, not the node's tree.
+	for _, ns := range []string{"cgroup", "pid", "mnt", "net", "ipc", "uts"} {
+		own, err := n.Output("root", "readlink", "/proc/"+pid+"/ns/"+ns)
+		if err != nil {
+			t.Fatal(err)
+		}
+		node, err := n.Output("root", "readlink", "/proc/1/ns/"+ns)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if own == node {
+			t.Errorf("the container shares the node's %s namespace, %s", ns, strings.TrimSpace(own))
+		}
+	}
 }
 
 func TestRunRunsAContainerAsItsImagesUser(t *testing.T) {
@@ -388,8 +403,10 @@ func TestRunningAContainerAgainUnchangedChangesNothing(t *testing.T) {
 func TestRunningAContainerChangedReplacesIt(t *testing.T) {
 	user, caps := "1000", &nodev1.Capabilities{}
 	for name, change := range map[string]func(t *testing.T, n *nodetest.Node, c *nodev1.Container){
+		// Another image of another build; one of the same build under
+		// another name runs on, renamed.
 		"another image": func(t *testing.T, n *nodetest.Node, c *nodev1.Container) {
-			n.Import(t, nodetest.Image{Name: otherImage})
+			n.Import(t, nodetest.Image{Name: otherImage, Rebuild: 2})
 			c.Image = otherImage
 		},
 		"another build of its image": func(t *testing.T, n *nodetest.Node, c *nodev1.Container) {

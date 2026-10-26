@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 120
+X-Ratelimit-Limit: 3000, 3000;w=60
+X-Ratelimit-Remaining: 2999
+Strict-Transport-Security: max-age=31536000
+Server: cloudflare
+
+{"token":"recorded-token","access_token":"recorded-token","expires_in":300,"issued_at":"2026-10-25T15:43:17.375299752Z"}

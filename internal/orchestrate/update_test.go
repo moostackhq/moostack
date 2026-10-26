@@ -795,25 +795,25 @@ func TestTheFakeNodeRefusesAsTheAgentDoes(t *testing.T) {
 	if _, err := n.ImportImage(ctx, []byte("image moostack.local/dns:1.0.0"), "ours"); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.Run(ctx, dns, "ours"); err == nil {
+	if _, err := n.Run(ctx, dns, "ours"); err == nil {
 		t.Error("the fake ran service-dns while dns runs")
 	}
 	if err := n.Remove(ctx, "dns", "ours"); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.Run(ctx, dns, "ours"); err == nil {
+	if _, err := n.Run(ctx, dns, "ours"); err == nil {
 		t.Error("the fake ran service-dns from the image the removal of dns deleted")
 	}
 	if _, err := n.ImportImage(ctx, []byte("image moostack.local/dns:1.0.0"), "ours"); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.Run(ctx, dns, "theirs"); err == nil {
+	if _, err := n.Run(ctx, dns, "theirs"); err == nil {
 		t.Error("the fake ran for another lease")
 	}
-	if err := n.Run(ended, dns, "ours"); err == nil {
+	if _, err := n.Run(ended, dns, "ours"); err == nil {
 		t.Error("the fake ran for an ended call")
 	}
-	if err := n.Run(ctx, dns, "ours"); err != nil {
+	if _, err := n.Run(ctx, dns, "ours"); err != nil {
 		t.Errorf("the fake refused service-dns, its image imported again: %v", err)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/nodetest"
+	"github.com/moostackhq/moostack/internal/ociimage"
 )
 
 // A container replaced again and again, from rebuilds that change the
@@ -194,6 +195,10 @@ func stateMachineSeed(t *testing.T) uint64 {
 type containerModel struct {
 	runs   map[string]string
 	images map[string]bool
+	// tagged is the build each image's name is at, as an import of a build
+	// last moved it, and ran the build each container's run asked for, by
+	// the container's name.
+	tagged, ran map[string]int
 }
 
 // used is whether a container runs from image.
@@ -244,35 +249,62 @@ func TestRunAndRemoveSequencesMatchTheModel(t *testing.T) {
 	lease := hold(t, n)
 	names := []string{"app-a", "app-b", "app-c"}
 	images := []string{appImage, otherImage, thirdImage}
-	m := &containerModel{runs: map[string]string{}, images: map[string]bool{}}
-	for step := range 40 {
+	m := &containerModel{runs: map[string]string{}, images: map[string]bool{}, tagged: map[string]int{}, ran: map[string]int{}}
+	// digests are the digests of each image's builds, by image and build.
+	digests := map[string]string{}
+	digest := func(image string, build int) string {
+		key := image + " " + strconv.Itoa(build)
+		if _, ok := digests[key]; !ok {
+			d, err := ociimage.Digest(nodetest.Image{Name: image, Rebuild: build}.Archive(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			digests[key] = d
+		}
+		return digests[key]
+	}
+	for step := range 50 {
 		name := names[r.IntN(len(names))]
 		var did string
-		switch r.IntN(5) {
+		switch r.IntN(7) {
 		case 0:
 			// An image imported and not run, as one an update stopped after
-			// importing, is held until a run deletes it.
+			// importing, is held until a run deletes it; a build of it other
+			// than one a container runs, as a pull of a moved tag with no run
+			// after it, changes no container, then or once the agent
+			// restarts. Each import moves the name to its other build.
 			image := images[r.IntN(len(images))]
-			did = "import " + image
-			n.Import(t, nodetest.Image{Name: image})
-			m.images[image] = true
+			build := 1 - m.tagged[image]
+			did = "import " + image + " of build " + strconv.Itoa(build)
+			n.Import(t, nodetest.Image{Name: image, Rebuild: build})
+			m.images[image], m.tagged[image] = true, build
+			if r.IntN(2) == 0 {
+				did += ", then restart the agent"
+				n.Restart(t, "agent")
+				n.EventuallyHealthy(t)
+			}
 		case 1:
 			did = "remove " + name
 			if err := removeContainer(t, n, lease, name); err != nil {
 				t.Fatalf("step %d, %s: %v", step, did, err)
 			}
 			m.remove(name)
+		case 5:
+			did = "restart the agent"
+			n.Restart(t, "agent")
+			n.EventuallyHealthy(t)
 		default:
 			image := images[r.IntN(len(images))]
 			did = "run " + name + " from " + image
 			if !m.images[image] {
-				n.Import(t, nodetest.Image{Name: image})
+				n.Import(t, nodetest.Image{Name: image, Rebuild: m.tagged[image]})
 				m.images[image] = true
 			}
 			if err := run(t, n, lease, app(name, image)); err != nil {
 				t.Fatalf("step %d, %s: %v", step, did, err)
 			}
 			m.run(name, image)
+			m.ran[name] = m.tagged[image]
 		}
 		s, err := n.Status(t)
 		if err != nil {
@@ -280,10 +312,10 @@ func TestRunAndRemoveSequencesMatchTheModel(t *testing.T) {
 		}
 		var got, want []string
 		for _, c := range s.Containers {
-			got = append(got, c.Name+" "+c.Image)
+			got = append(got, c.Name+" "+c.Image+" "+c.Digest)
 		}
 		for name, image := range m.runs {
-			want = append(want, name+" "+image)
+			want = append(want, name+" "+image+" "+digest(image, m.ran[name]))
 		}
 		slices.Sort(got)
 		slices.Sort(want)

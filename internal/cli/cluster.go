@@ -116,7 +116,7 @@ const caKeySecret = "cluster-ca-key"
 // directory before asking the operator anything. If it fails, it undoes
 // what it did, so that it can run again.
 func clusterInit(env Env, cmd *cli.Command) error {
-	dir, name := cmd.String("dir"), cmd.String("name")
+	dir, name := clusterDir(cmd), cmd.String("name")
 	if env.Version == "" {
 		return errors.New("this mooctl has no release to pin, since it wasn't built by the release build")
 	}
@@ -327,7 +327,7 @@ func (u *rollback) putBack(path string, before []byte, existed bool) {
 // clusterStatus is mooctl cluster status. It reaches every node at once,
 // and shows those it can't reach rather than failing.
 func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
-	d, err := cluster.Open(cmd.String("dir"))
+	d, err := openCluster(cmd)
 	if err != nil {
 		return err
 	}
@@ -599,7 +599,7 @@ func rerun(cmd *cli.Command) string {
 // to show them.
 func mooctlIn(cmd *cli.Command) []string {
 	args := []string{"mooctl"}
-	if dir := cmd.String("dir"); dir != "." {
+	if dir := clusterDir(cmd); dir != "." {
 		args = append(args, "-C", dir)
 	}
 	if source := cmd.String("release-source"); source != "" {
@@ -680,7 +680,7 @@ func tellStep(env Env, changed *bool) func(orchestrate.Step) {
 
 // runClusterUpdate is cluster update, apart from catching the signals.
 func runClusterUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
-	d, err := cluster.Open(cmd.String("dir"))
+	d, err := openCluster(cmd)
 	if err != nil {
 		return err
 	}
@@ -794,7 +794,7 @@ func serviceOf(archive []byte, s release.Service) (orchestrate.Service, error) {
 // mooctl still running can go on, and fails naming the nodes it couldn't
 // reach, whose lock expires on its own.
 func clusterUnlock(ctx context.Context, env Env, cmd *cli.Command) error {
-	d, err := cluster.Open(cmd.String("dir"))
+	d, err := openCluster(cmd)
 	if err != nil {
 		return err
 	}

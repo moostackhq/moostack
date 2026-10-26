@@ -240,13 +240,13 @@ func (r *serviceRecorder) Remove(_ context.Context, name, _ string) error {
 	return nil
 }
 
-func (r *serviceRecorder) Run(_ context.Context, c *nodev1.Container, _ string) error {
+func (r *serviceRecorder) Run(_ context.Context, c *nodev1.Container, _ string) (bool, error) {
 	r.steps = append(r.steps, c.Name)
 	r.containers = append(r.containers, &nodev1.ContainerStatus{Name: c.Name, Image: c.Image, Health: nodev1.Health_HEALTH_HEALTHY})
 	if r.onRun != nil {
 		r.onRun()
 	}
-	return nil
+	return true, nil
 }
 
 // Asleep while a service runs, Update must not go on to the next service

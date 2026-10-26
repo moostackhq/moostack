@@ -6,7 +6,8 @@
 // message, and its Stream answers each message of the call with an
 // empty one. It prints "serving <API>" once it listens. -health-delay
 // has Health take that long to answer. Without -api, it is an app,
-// which serves nothing, and with -exit <code> it exits at once.
+// which serves nothing, and with -exit <code> it exits at once, or with
+// -exit-after too, once that long has passed.
 package main
 
 import (
@@ -32,11 +33,13 @@ import (
 
 func main() {
 	api := flag.String("api", "", "the gRPC service name of the API to serve, none for an app")
-	exit := flag.Int("exit", -1, "the code to exit with at once, if any")
+	exit := flag.Int("exit", -1, "the code to exit with, if any")
+	exitAfter := flag.Duration("exit-after", 0, "how long to run before it exits with -exit's code")
 	flag.DurationVar(&healthDelay, "health-delay", 0, "how long Health takes to answer")
 	flag.Parse()
 	switch {
 	case *exit >= 0:
+		time.Sleep(*exitAfter)
 		fmt.Println("exiting with", *exit)
 		os.Exit(*exit)
 	case *api == "":

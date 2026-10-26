@@ -13,7 +13,6 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"github.com/moostackhq/moostack/internal/buildid"
-	"github.com/moostackhq/moostack/internal/cluster"
 	"github.com/moostackhq/moostack/internal/orchestrate"
 	"github.com/moostackhq/moostack/internal/release"
 )
@@ -71,7 +70,7 @@ func runSourceUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 		return err
 	}
 	source := cmd.String("source")
-	d, err := cluster.Open(cmd.String("dir"))
+	d, err := openCluster(cmd)
 	if err != nil {
 		return err
 	}

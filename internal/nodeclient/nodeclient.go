@@ -390,6 +390,23 @@ func (n *Node) ImportImage(ctx context.Context, archive []byte, lease string) ([
 	return ImportImage(ctx, n.Agent, archive, lease)
 }
 
+// PulledImage is an image a node pulled: its name, and the digest of
+// the build it pulled.
+type PulledImage struct {
+	Name, Digest string
+}
+
+// PullImage has the agent pull the public image ref, a normalized
+// reference, into the node's containerd, for the operation whose lease
+// holds the node's operation lock, and returns the image pulled.
+func (n *Node) PullImage(ctx context.Context, ref, lease string) (PulledImage, error) {
+	res, err := n.Agent.PullImage(ctx, &nodev1.PullImageRequest{Reference: ref, Lease: lease})
+	if err != nil {
+		return PulledImage{}, err
+	}
+	return PulledImage{Name: Printable(res.Image), Digest: Printable(res.Digest)}, nil
+}
+
 // Remove has the agent stop and delete the container called name, for
 // the operation whose lease holds the node's operation lock.
 func (n *Node) Remove(ctx context.Context, name, lease string) error {
@@ -398,10 +415,11 @@ func (n *Node) Remove(ctx context.Context, name, lease string) error {
 }
 
 // Run has the agent run c from its image, replacing the container of its
-// name, for the operation whose lease holds the node's operation lock.
-func (n *Node) Run(ctx context.Context, c *nodev1.Container, lease string) error {
-	_, err := n.Agent.Run(ctx, &nodev1.RunRequest{Container: c, Lease: lease})
-	return err
+// name, for the operation whose lease holds the node's operation lock,
+// and says whether it started the container's process.
+func (n *Node) Run(ctx context.Context, c *nodev1.Container, lease string) (bool, error) {
+	res, err := n.Agent.Run(ctx, &nodev1.RunRequest{Container: c, Lease: lease})
+	return res.GetStarted(), err
 }
 
 // UpdateAgent has the updater replace the agent with binary, the agent at

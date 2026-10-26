@@ -13,6 +13,7 @@ import (
 	"time"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
+	"github.com/moostackhq/moostack/internal/appfile"
 	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/orchestrate"
 	"github.com/moostackhq/moostack/internal/release"
@@ -84,6 +85,8 @@ type node struct {
 	// removals delete them, and importDelay how long an import takes.
 	images      map[string]bool
 	importDelay time.Duration
+	// app is how the node pulls and runs apps, as deploy_test.go fakes it.
+	app appFake
 
 	mu sync.Mutex
 	// updates are the updates of the node's components, in order.
@@ -153,6 +156,10 @@ func (n *node) Status(ctx context.Context) nodeclient.Status {
 		return nodeclient.Status{AgentErr: ctx.Err(), UpdaterErr: ctx.Err()}
 	}
 	n.mu.Lock()
+	if err := n.app.statusErr; err != nil {
+		n.mu.Unlock()
+		return nodeclient.Status{AgentErr: err}
+	}
 	n.statusCalls++
 	generation := n.generation
 	if n.laterGeneration != 0 && n.statusCalls > 1 {
@@ -366,13 +373,29 @@ func (n *node) fence(lease string) error {
 // and keeps c. It refuses c once ctx ended, unless lease holds the
 // node's operation lock, and while the service runs under its name alone
 // too, as the agent refuses a container whose API another serves.
-func (n *node) Run(ctx context.Context, c *nodev1.Container, lease string) error {
+// Run runs c as run does, and says whether it started c's process: as
+// the agent does, a run of an app that takes a new name of the build it
+// runs starts none.
+func (n *node) Run(ctx context.Context, c *nodev1.Container, lease string) (bool, error) {
+	n.mu.Lock()
+	n.app.started = true
+	n.mu.Unlock()
+	err := n.run(ctx, c, lease)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return err == nil && n.app.started, err
+}
+
+func (n *node) run(ctx context.Context, c *nodev1.Container, lease string) error {
 	// A call whose context ended is never sent.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := n.fence(lease); err != nil {
 		return err
+	}
+	if appfile.IsApp(c.Name) {
+		return n.runApp(c)
 	}
 	service, ok := release.ServiceName(c.Name)
 	if !ok {

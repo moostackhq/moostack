@@ -259,7 +259,7 @@ func (c *Cluster) updateService(ctx context.Context, n *namedConn, svc Service, 
 			return err
 		}
 	}
-	if err := n.conn.Run(runCtx, svc.Container, c.lease.Lease); err != nil {
+	if _, err := n.conn.Run(runCtx, svc.Container, c.lease.Lease); err != nil {
 		return err
 	}
 	stepCtx := ctx

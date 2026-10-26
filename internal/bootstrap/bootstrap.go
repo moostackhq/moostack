@@ -431,7 +431,7 @@ func startServices(ctx context.Context, node *nodeclient.Node, h Host, rel *rele
 		if !slices.Contains(images, c.Image) {
 			return fmt.Errorf("seeding %s's image imported %s, not %s", s.Name, strings.Join(images, ", "), c.Image)
 		}
-		if err := node.Run(ctx, c, lease); err != nil {
+		if _, err := node.Run(ctx, c, lease); err != nil {
 			return fmt.Errorf("starting %s: %w", s.Name, err)
 		}
 	}

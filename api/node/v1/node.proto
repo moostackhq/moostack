@@ -47,14 +47,29 @@ service Agent {
   // importing nothing, unless the first request's lease holds the
   // operation lock.
   rpc ImportImage(stream ImportImageRequest) returns (ImportImageResponse);
+  // PullImage pulls a public image into the node's containerd, by a
+  // reference normalized as Docker normalizes one, such as
+  // docker.io/library/nginx:1.27, and unpacks it. A pull of an image the
+  // node has fetches only what it lacks. It refuses, with
+  // INVALID_ARGUMENT, a reference that isn't normalized, and, with
+  // FAILED_PRECONDITION, an image for another platform than the node's,
+  // and the pull unless the request's lease holds the operation lock,
+  // pulling nothing. A failed pull answers NOT_FOUND for an image the
+  // registry doesn't have, PERMISSION_DENIED for one it denies access to,
+  // RESOURCE_EXHAUSTED at the registry's first answer that the node is
+  // rate limited, with no retry, and UNAVAILABLE for a registry that
+  // can't be reached. The pull ends when its call ends.
+  rpc PullImage(PullImageRequest) returns (PullImageResponse);
   // Run runs a container from its image, which the node must have, and
   // keeps it running across restarts of the agent, of containerd and of
   // the node. The container gets no-new-privileges, a cgroup of its
   // own, and a network namespace of its own with loopback alone. Its
   // output goes to the node's log as <name>.log. Running a container as
   // it runs already, from the same build of the same image with the same
-  // properties, changes nothing; otherwise the container of that name is
-  // replaced, and if the new one can't be made, the old one runs on.
+  // properties, changes nothing, and one that runs the same build under
+  // another name of its image takes the new name in place; otherwise the
+  // container of that name is replaced, and if the new one can't be made,
+  // the old one runs on.
   // Once the agent has the call, it goes on even if the call ends. It is
   // refused with FAILED_PRECONDITION, changing nothing, unless the
   // request's lease holds the operation lock, if the node lacks the
@@ -265,6 +280,20 @@ message ImportImageResponse {
   repeated string images = 1;
 }
 
+message PullImageRequest {
+  // Reference is the image's, normalized.
+  string reference = 1;
+  // Lease is the operation's lease, which must hold the operation lock.
+  string lease = 2;
+}
+
+message PullImageResponse {
+  // Image is the name of the image pulled, which is its reference, and
+  // digest the digest of the build pulled.
+  string image = 1;
+  string digest = 2;
+}
+
 // Container is a container as Run runs it: its name, its image and its
 // properties.
 message Container {
@@ -301,7 +330,12 @@ message RunRequest {
   string lease = 2;
 }
 
-message RunResponse {}
+message RunResponse {
+  // Started says the run started the container's process, as one made
+  // anew or one whose process had stopped; it is false for a container
+  // that ran as asked already, or took a new name of its image in place.
+  bool started = 1;
+}
 
 message RemoveRequest {
   // Name is the container's.

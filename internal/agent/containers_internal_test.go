@@ -192,7 +192,7 @@ func TestARunThatCantReadTheReplacedImageChangesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	fail = true
-	if err := s.Run(t.Context(), &container{Name: "app-web", Image: "example.test/app:2"}, unfenced); status.Code(err) != codes.Unavailable {
+	if _, err := s.Run(t.Context(), &container{Name: "app-web", Image: "example.test/app:2"}, unfenced); status.Code(err) != codes.Unavailable {
 		t.Fatalf("running app-web from app:2 while app:1 can't be read: %v, want it refused as unavailable", err)
 	}
 	again := loadAgain(t, s, s.client)
@@ -233,7 +233,7 @@ func TestARunWhoseImageFailsToUnpackLeavesTheOldContainerRunning(t *testing.T) {
 	if _, err := s.Import(t.Context(), bytes.NewReader(nodetest.Image{Name: "example.test/app:2", Rebuild: 2}.Archive(t)), unfenced); err != nil {
 		t.Fatal(err)
 	}
-	err := s.Run(t.Context(), &container{Name: "app-web", Image: "example.test/app:2"}, unfenced)
+	_, err := s.Run(t.Context(), &container{Name: "app-web", Image: "example.test/app:2"}, unfenced)
 	if err == nil {
 		t.Fatal("app-web ran from an image that can't be unpacked")
 	}
@@ -484,7 +484,7 @@ func TestRunningAServiceWithoutAContainerKeepsItsSnapshotUnderGarbageCollection(
 			// The container can't be made from this machine, since its
 			// spec reads the node's files: what counts is the snapshot it
 			// is made on.
-			runErr := s.Run(t.Context(), containerOf(fixture), unfenced)
+			_, runErr := s.Run(t.Context(), containerOf(fixture), unfenced)
 			if !collected {
 				t.Fatalf("the run never found the layer's snapshot there: %v", runErr)
 			}
@@ -506,7 +506,7 @@ func TestARunThatEndsWhileItMakesAContainerLetsGoOfItsLease(t *testing.T) {
 			cancel()
 		}
 	})
-	if err := s.Run(ctx, containerOf(nodetest.Fixture()), unfenced); err == nil {
+	if _, err := s.Run(ctx, containerOf(nodetest.Fixture()), unfenced); err == nil {
 		t.Fatal("the run went on once its context ended")
 	}
 	if ls, err := plain.LeasesService().List(namespaced(t.Context())); err != nil || len(ls) != 0 {
@@ -534,7 +534,7 @@ func TestARunLetsGoOfItsLeaseWithinABound(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 	ran := make(chan error, 1)
-	go func() { ran <- s.Run(ctx, containerOf(nodetest.Fixture()), unfenced) }()
+	go func() { _, err := s.Run(ctx, containerOf(nodetest.Fixture()), unfenced); ran <- err }()
 	select {
 	case <-ran:
 	case <-time.After(3*time.Second + leaseReleaseTimeout + 2*time.Second):
@@ -582,7 +582,7 @@ func TestASnapshotLeftUnderAServicesNameGivesWayToItsContainers(t *testing.T) {
 			prepareSeen, prepared = true, err
 		}
 	})
-	runErr := s.Run(t.Context(), containerOf(fixture), unfenced)
+	_, runErr := s.Run(t.Context(), containerOf(fixture), unfenced)
 	if !prepareSeen || prepared != nil {
 		t.Errorf("making the container's snapshot with one left under its name: %v (tried: %v), want it made (the run: %v)", prepared, prepareSeen, runErr)
 	}

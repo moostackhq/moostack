@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -40,6 +41,9 @@ type operator struct {
 	client *http.Client
 	// nodes, if set, answer for the nodes, by name, instead of SSH.
 	nodes map[string]*fakeNode
+	// startCheck is how long deploy waits before it checks an app, its
+	// own default if zero.
+	startCheck time.Duration
 
 	mu sync.Mutex
 	// exits are the codes mooctl exited with after an interrupt.
@@ -120,6 +124,19 @@ type result struct {
 // run runs mooctl with args in the operator's cluster directory.
 func (o *operator) run(args ...string) result {
 	o.t.Helper()
+	return o.runWith(append([]string{"-C", o.dir}, args...))
+}
+
+// runWithoutDir runs mooctl with args, without naming the cluster
+// directory with -C.
+func (o *operator) runWithoutDir(args ...string) result {
+	o.t.Helper()
+	return o.runWith(args)
+}
+
+// runWith runs mooctl with args as they are.
+func (o *operator) runWith(args []string) result {
+	o.t.Helper()
 	var stdout, stderr bytes.Buffer
 	env := cli.Env{
 		Version:    o.version,
@@ -132,6 +149,7 @@ func (o *operator) run(args ...string) result {
 		DialNode:   o.dialNode(),
 		HTTPClient: o.client,
 		Cache:      o.cache(),
+		StartCheck: o.startCheck,
 		Terminal: func(func(int)) (terminal.Terminal, io.Closer) {
 			if o.terminal == nil {
 				return nil, nil
@@ -146,7 +164,7 @@ func (o *operator) run(args ...string) result {
 			o.tempFilesAtExit = len(entries)
 		},
 	}
-	err := cli.New(env).Run(context.Background(), append([]string{"mooctl", "-C", o.dir}, args...))
+	err := cli.New(env).Run(context.Background(), append([]string{"mooctl"}, args...))
 	return result{stdout: stdout.String(), stderr: stderr.String(), err: err}
 }
 
