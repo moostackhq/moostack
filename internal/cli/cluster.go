@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -28,6 +29,18 @@ func clusterCommand(env Env) *cli.Command {
 					&cli.StringFlag{Name: "email", Usage: "the email of the Let's Encrypt account that apps' certificates are issued to; without it, they are self-signed"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error { return clusterInit(ctx, env, cmd) },
+			},
+			{
+				Name:      "remote",
+				Usage:     "set the git remote that the cluster directory is pushed to after each operation, and push it",
+				ArgsUsage: "<url>",
+				Action:    func(ctx context.Context, cmd *cli.Command) error { return clusterRemote(ctx, env, cmd) },
+			},
+			{
+				Name:      "clone",
+				Usage:     "clone a cluster directory from its remote",
+				ArgsUsage: "<cluster ref> <url>",
+				Action:    func(ctx context.Context, cmd *cli.Command) error { return clusterClone(ctx, env, cmd) },
 			},
 		},
 	}
@@ -127,4 +140,60 @@ func existsError(ctx context.Context, dir string) error {
 		return fmt.Errorf("%w, without a commit; if a cluster init was cut off, remove it", err)
 	}
 	return err
+}
+
+// clusterRemote is mooctl cluster remote.
+func clusterRemote(ctx context.Context, env Env, cmd *cli.Command) error {
+	if err := wantArgs(cmd, 1); err != nil {
+		return err
+	}
+	d, err := openCluster(env, cmd)
+	if err != nil {
+		return err
+	}
+	repo, err := gitrepo.Open(ctx, d.Path)
+	if err != nil {
+		return err
+	}
+	if err := repo.SetRemote(ctx, cmd.Args().First()); err != nil {
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "Pushed to %s\n", gitrepo.Redact(cmd.Args().First()))
+	return nil
+}
+
+// clusterClone is mooctl cluster clone.
+func clusterClone(ctx context.Context, env Env, cmd *cli.Command) error {
+	if err := wantArgs(cmd, 2); err != nil {
+		return err
+	}
+	ref, dir, err := refDir(env, cmd, cmd.Args().Get(0))
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		return err
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("%s %w", dir, clusterdir.ErrExists)
+		}
+		return err
+	}
+	if _, err := gitrepo.Clone(ctx, cmd.Args().Get(1), dir); err != nil {
+		os.RemoveAll(dir)
+		return err
+	}
+	d, err := clusterdir.Open(dir)
+	if err == nil {
+		if got, _ := clusterdir.ParseRef(d.Cluster.Ref); got != ref {
+			err = fmt.Errorf("it is the cluster directory of %s, not of %s", d.Cluster.Ref, ref)
+		}
+	}
+	if err != nil {
+		os.RemoveAll(dir)
+		return fmt.Errorf("%s: %w", gitrepo.Redact(cmd.Args().Get(1)), errors.Join(errors.New("not a cluster directory"), err))
+	}
+	fmt.Fprintf(env.Stdout, "Cloned cluster %s into %s\n", ref, dir)
+	return nil
 }

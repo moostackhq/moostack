@@ -116,6 +116,33 @@ func TestAFailedInitLeavesNothing(t *testing.T) {
 	}
 }
 
+func TestRemoteAndClone(t *testing.T) {
+	home := newHome(t)
+	key := sshKey(t, home)
+	if out, err := mooctl(t, home, home, "--ssh-key", key, "cluster", "init", "acme/prod"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	remote := filepath.Join(t.TempDir(), "prod.git")
+	git(t, home, "init", "--bare", "--quiet", "--initial-branch=main", remote)
+	if out, err := mooctl(t, home, home, "-c", "acme/prod", "cluster", "remote", remote); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+
+	other := newHome(t)
+	if out, err := mooctl(t, other, other, "cluster", "clone", "acme/prod", remote); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if _, err := clusterdir.Open(filepath.Join(other, "clusters", "acme", "prod")); err != nil {
+		t.Error(err)
+	}
+	if out, err := mooctl(t, other, other, "cluster", "clone", "acme/other", remote); err == nil || !strings.Contains(err.Error(), "not of acme/other") {
+		t.Errorf("a clone under another ref: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(other, "clusters", "acme", "other")); !os.IsNotExist(err) {
+		t.Error("a refused clone left its directory")
+	}
+}
+
 func TestInitIntoADirectoryNamedDirectlySetsNoDefault(t *testing.T) {
 	home := newHome(t)
 	key := sshKey(t, home)
@@ -148,5 +175,18 @@ func TestInitNamesADirectoryACutOffInitLeft(t *testing.T) {
 	_, err = mooctl(t, home, home, "--ssh-key", key, "cluster", "init", "other")
 	if err == nil || strings.Contains(err.Error(), "cut off") {
 		t.Errorf("a second init of a whole cluster: %v", err)
+	}
+}
+
+func TestCloneOntoAnExistingDirectoryLeavesIt(t *testing.T) {
+	home := newHome(t)
+	dir := filepath.Join(home, "clusters", "default", "prod")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "keep"), []byte("x"), 0o644)
+	if _, err := mooctl(t, home, home, "cluster", "clone", "prod", filepath.Join(t.TempDir(), "nowhere.git")); err == nil {
+		t.Error("clone onto an existing directory passed")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "keep")); err != nil {
+		t.Error("clone removed what was there")
 	}
 }
