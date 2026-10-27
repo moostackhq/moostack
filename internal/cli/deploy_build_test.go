@@ -236,6 +236,28 @@ func readyNode(containers ...*nodev1.ContainerStatus) *fakeNode {
 	return n
 }
 
+// A built app found on more than one node is built, as every build is
+// before mooctl contacts a node, then refused as an image's is, and no
+// node imports or runs anything.
+func TestADeployOfABuiltAppOnTwoNodesChangesNothing(t *testing.T) {
+	app := builtApp(t, ".")
+	nodes, _ := buildDeploy{
+		nodes: func() map[string]*fakeNode {
+			return map[string]*fakeNode{"node1": readyNode(appRunning("web", nginx, nginxBuild)), "node2": readyNode(appRunning("web", nginx, nginxBuild))}
+		},
+		docker: buildsWeb(t, "web 1"),
+	}.run(t, app, "Building web as "+tag+" for linux/amd64\n", "#1 building\n",
+		"web runs on node1 and node2, more than one node, so mooctl can't tell which to replace; nothing changed\n"+
+			"Run mooctl deploy --remove, which removes web from every node it runs on, then deploy it again")
+	for name, n := range nodes {
+		n.mu.Lock()
+		if len(n.apps.imported) != 0 || len(n.updates) != 0 {
+			t.Errorf("%s imported %v and changed %v for an app on two nodes", name, n.apps.imported, n.updates)
+		}
+		n.mu.Unlock()
+	}
+}
+
 func TestDeployBuildsTheAppThenImportsItOnTheNodeWithTheFewestApps(t *testing.T) {
 	app := builtApp(t, ".")
 	_, digest := webBuild(t, "amd64", "web 1")

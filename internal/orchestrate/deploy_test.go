@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -324,6 +326,15 @@ func TestPlacePicksTheNodeThatRunsTheAppElseTheOneWithTheFewestApps(t *testing.T
 		"an app of a longer name isn't the app": {map[string][]*nodev1.ContainerStatus{
 			"node1": containersOf("app-web-2"), "node2": nil,
 		}, orchestrate.Placement{Node: "node2"}},
+		// A node keeps an app whose container exited, failed or is of a
+		// state it can't tell, and starts it again when it reboots.
+		"apps that don't run count as the node's": {map[string][]*nodev1.ContainerStatus{
+			"node1": {{Name: "app-a", State: nodev1.TaskState_TASK_STATE_EXITED}},
+			"node2": {{Name: "app-b", State: nodev1.TaskState_TASK_STATE_FAILED}},
+			"node3": {{Name: "app-c", State: nodev1.TaskState_TASK_STATE_UNSPECIFIED}},
+			"node4": containersOf("app-d", "app-e"),
+			"node5": {appContainer("f", nginx, nginxBuild)},
+		}, orchestrate.Placement{Node: "node1"}},
 	} {
 		got, err := orchestrate.Place("web", c.containers)
 		if err != nil || got != c.want {
@@ -345,6 +356,84 @@ func TestPlaceRefusesAnAppOnMoreThanOneNodeNamingThem(t *testing.T) {
 	}
 	if _, err := orchestrate.Place("web", nil); err == nil {
 		t.Error("Place on no nodes picked one")
+	}
+	// Copies that don't run are copies all the same.
+	_, err = orchestrate.Place("web", map[string][]*nodev1.ContainerStatus{
+		"node4":  {{Name: "app-web", State: nodev1.TaskState_TASK_STATE_EXITED}},
+		"node2":  {{Name: "app-web", State: nodev1.TaskState_TASK_STATE_UNSPECIFIED}},
+		"node10": {{Name: "app-web", State: nodev1.TaskState_TASK_STATE_FAILED}},
+		"node1":  containersOf("app-web"),
+	})
+	if !errors.As(err, &dup) || !slices.Equal(dup.Nodes, []string{"node1", "node10", "node2", "node4"}) {
+		t.Fatalf("Place of an app on four nodes, three not running: %v, want a *DuplicateAppError naming the four in order", err)
+	}
+	if want := "web runs on node1, node10, node2 and node4, more than one node, so mooctl can't tell which to replace; nothing changed"; err.Error() != want {
+		t.Errorf("the error says %q, want %q", err, want)
+	}
+}
+
+// Place, over seeded clusters of generated nodes and containers, picks
+// as its rule says, whatever order the nodes come in: the app on more
+// than one node is refused, naming them in order; on one, that node; or
+// else a node with the fewest apps, the first by name of those.
+func TestPlaceFollowsItsRule(t *testing.T) {
+	seed := stateSeed(t)
+	t.Logf("MOOSTACK_STATE_SEED=%d", seed)
+	r := rand.New(rand.NewPCG(seed, seed))
+	names := []string{"app-web", "app-api", "app-", "app-web-2", "web", "service-dns", "apps"}
+	states := []nodev1.TaskState{nodev1.TaskState_TASK_STATE_RUNNING, nodev1.TaskState_TASK_STATE_EXITED, nodev1.TaskState_TASK_STATE_FAILED, nodev1.TaskState_TASK_STATE_UNSPECIFIED}
+	for i := range 20000 {
+		containers := map[string][]*nodev1.ContainerStatus{}
+		var on, nodes []string
+		apps := map[string]int{}
+		for range 1 + r.IntN(12) {
+			// Numbers that sort apart from their names, as node10 before
+			// node2.
+			node := fmt.Sprint("node", 1+r.IntN(20))
+			if _, ok := containers[node]; ok {
+				continue
+			}
+			nodes = append(nodes, node)
+			var cs []*nodev1.ContainerStatus
+			for range r.IntN(4) {
+				cs = append(cs, &nodev1.ContainerStatus{Name: names[r.IntN(len(names))], State: states[r.IntN(len(states))]})
+			}
+			containers[node] = cs
+			for _, c := range cs {
+				if c.Name == "app-web" && !slices.Contains(on, node) {
+					on = append(on, node)
+				}
+				if c.Name == "app-web" || c.Name == "app-api" || c.Name == "app-web-2" {
+					apps[node]++
+				}
+			}
+		}
+		slices.Sort(on)
+		slices.Sort(nodes)
+		var want orchestrate.Placement
+		switch len(on) {
+		case 0:
+			want.Node = nodes[0]
+			for _, node := range nodes {
+				if apps[node] < apps[want.Node] {
+					want.Node = node
+				}
+			}
+		case 1:
+			want = orchestrate.Placement{Node: on[0], RunsThere: true}
+		}
+		// Each call ranges over the map in an order of its own.
+		for range 5 {
+			got, err := orchestrate.Place("web", containers)
+			var dup *orchestrate.DuplicateAppError
+			if len(on) > 1 {
+				if !errors.As(err, &dup) || !slices.Equal(dup.Nodes, on) {
+					t.Fatalf("cluster %d, %v: Place = %+v, %v, want a *DuplicateAppError naming %v", i, containers, got, err, on)
+				}
+			} else if err != nil || got != want {
+				t.Fatalf("cluster %d, %v: Place = %+v, %v, want %+v", i, containers, got, err, want)
+			}
+		}
 	}
 }
 
@@ -555,8 +644,10 @@ func TestADeployOfAnAppOnTwoNodesChangesNothing(t *testing.T) {
 	if _, _, err := deploy(t, cl); !errors.As(err, new(*orchestrate.DuplicateAppError)) {
 		t.Errorf("Deploy of an app on two nodes: %v, want a *DuplicateAppError", err)
 	}
-	if len(a.pulls())+len(b.pulls()) != 0 {
-		t.Error("a node pulled for an app on two nodes")
+	for name, n := range map[string]*node{"node1": a, "node2": b} {
+		if len(n.pulls())+len(n.containersRun()) != 0 {
+			t.Errorf("%s pulled %v and ran %v for an app on two nodes", name, n.pulls(), n.containersRun())
+		}
 	}
 }
 
@@ -746,5 +837,47 @@ func TestARedeployThatCantReadTheNodeIsUnchangedIfTheRunStartedNothing(t *testin
 	}
 	if got := n.containersRun(); len(got) != 1 {
 		t.Errorf("the node ran %v, want app-web run once", got)
+	}
+}
+
+// Two operators deploying two new apps at once, on two nodes with none,
+// never both pass the preflight at once: a deploy that passed it always
+// runs its app, the other is refused as the lock is held, and two that
+// both deploy, one after the other, put their apps on different nodes.
+// Both may be refused, each holding the lock on one node as the other
+// asks.
+func TestTwoDeploysOfNewAppsAtOnceNeverShareTheLockOrANode(t *testing.T) {
+	const nginx2 = "docker.io/library/nginx:2"
+	for round := range 100 {
+		n1, n2 := withRegistry(&node{}, nginxBuild), withRegistry(&node{}, nginxBuild)
+		n1.app.registry[nginx2], n2.app.registry[nginx2] = newBuild, newBuild
+		f := fakes{"node1": n1, "node2": n2}
+		apps := []orchestrate.App{{Name: "web", Image: nginx}, {Name: "api", Image: nginx2}}
+		placed := make([]*orchestrate.Deployed, 2)
+		var wg sync.WaitGroup
+		for i, app := range apps {
+			wg.Go(func() {
+				nodes := f.nodes()
+				nodes.StartCheck = time.Millisecond
+				cl, err := orchestrate.Preflight(t.Context(), nodes, 1, false, orchestrate.Holder{Who: fmt.Sprint("op", i), Machine: "laptop"})
+				if err != nil {
+					if !errors.As(err, new(*orchestrate.LockHeldError)) {
+						t.Errorf("round %d: the preflight of %s failed for another reason than the lock: %v", round, app.Name, err)
+					}
+					return
+				}
+				defer cl.Close()
+				d, err := cl.Deploy(cl.Context(), app, func(orchestrate.DeployStep) {})
+				if err != nil {
+					t.Errorf("round %d: the deploy of %s failed past its preflight: %v", round, app.Name, err)
+					return
+				}
+				placed[i] = d
+			})
+		}
+		wg.Wait()
+		if placed[0] != nil && placed[1] != nil && placed[0].Node == placed[1].Node {
+			t.Errorf("round %d: web and api both went to %s", round, placed[0].Node)
+		}
 	}
 }

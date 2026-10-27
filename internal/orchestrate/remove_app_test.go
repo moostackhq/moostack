@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -132,6 +133,8 @@ func TestRemoveAppStopsAtANodeWhoseRemovalFails(t *testing.T) {
 	var re *orchestrate.RemoveError
 	if !errors.As(err, &re) || re.Node != "node2" || re.App != "web" || re.Stopped || !strings.Contains(err.Error(), "the disk is full") {
 		t.Errorf("RemoveApp with node2 failing: %v, want a *RemoveError naming node2 and why", err)
+	} else if !slices.Equal(re.Unasked, []string{"node3"}) {
+		t.Errorf("RemoveApp with node2 failing says it didn't ask %v, want node3", re.Unasked)
 	}
 	if !slices.Equal(removed, []string{"node1"}) || !slices.Equal(told, removed) {
 		t.Errorf("RemoveApp with node2 failing removed %v, told %v, want node1 alone", removed, told)
@@ -200,8 +203,12 @@ func TestRemoveAppStoppedBetweenTwoNodesSendsTheNextNothing(t *testing.T) {
 	cl := deploying(t, fakes{"node1": node1, "node2": node2}, nil)
 	ctx, cancel := context.WithCancel(t.Context())
 	removed, err := cl.RemoveApp(ctx, "web", func(string) { cancel() })
-	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "stopped before it removed web from node2") || !strings.Contains(err.Error(), "nothing changed there") || errors.As(err, new(*orchestrate.RemoveError)) {
-		t.Errorf("RemoveApp stopped between node1 and node2: %v, want it stopped before node2, nothing changed there", err)
+	var na *orchestrate.NotAskedError
+	if !errors.Is(err, context.Canceled) || !errors.As(err, &na) || !slices.Equal(na.Unasked, []string{"node2"}) || errors.As(err, new(*orchestrate.RemoveError)) {
+		t.Errorf("RemoveApp stopped between node1 and node2: %v, want a *NotAskedError naming node2", err)
+	}
+	if want := "mooctl stopped before it asked node2 to remove web: context canceled; nothing changed there"; err.Error() != want {
+		t.Errorf("RemoveApp stopped between node1 and node2 says %q, want %q", err, want)
 	}
 	if !slices.Equal(removed, []string{"node1"}) {
 		t.Errorf("RemoveApp stopped between node1 and node2 removed %v, want node1", removed)
@@ -395,6 +402,9 @@ func TestRemoveAppSequencesMatchTheModel(t *testing.T) {
 			if !errors.As(err, &re) || re.Node != failing {
 				t.Fatalf("step %d: removing %s with %s failing: %v, want a *RemoveError naming %s", step, app, failing, err, failing)
 			}
+			if after := names[slices.Index(names, failing)+1:]; !slices.Equal(re.Unasked, after) {
+				t.Fatalf("step %d: removing %s with %s failing says it didn't ask %v, want %v", step, app, failing, re.Unasked, after)
+			}
 		} else if err != nil {
 			t.Fatalf("step %d: removing %s: %v", step, app, err)
 		}
@@ -412,5 +422,96 @@ func TestRemoveAppSequencesMatchTheModel(t *testing.T) {
 				}
 			}
 		}
+		// A deploy judges where each app runs as the removal does.
+		containers := map[string][]*nodev1.ContainerStatus{}
+		for _, name := range names {
+			containers[name] = f[name].containers()
+		}
+		for _, a := range apps {
+			var on []string
+			for _, name := range names {
+				if model[name][a] {
+					on = append(on, name)
+				}
+			}
+			p, err := orchestrate.Place(a, containers)
+			var dup *orchestrate.DuplicateAppError
+			switch {
+			case len(on) > 1 && (!errors.As(err, &dup) || !slices.Equal(dup.Nodes, on)):
+				t.Fatalf("step %d: %s is on %v, and Place says %+v, %v, want a *DuplicateAppError naming them", step, a, on, p, err)
+			case len(on) == 1 && (err != nil || p != orchestrate.Placement{Node: on[0], RunsThere: true}):
+				t.Fatalf("step %d: %s is on %s, and Place says %+v, %v", step, a, on[0], p, err)
+			case len(on) == 0 && (err != nil || p.RunsThere):
+				t.Fatalf("step %d: %s is on no node, and Place says %+v, %v", step, a, p, err)
+			}
+		}
+	}
+}
+
+// stopAt is a context that ends, as Err says, from its nth call of Err,
+// with err, once it ran hook, if set: the call RemoveApp makes as it
+// checks whether it was stopped before a node.
+type stopAt struct {
+	context.Context
+	calls atomic.Int32
+	n     int32
+	err   error
+	hook  func()
+}
+
+func (c *stopAt) Err() error {
+	k := c.calls.Add(1)
+	if k == c.n && c.hook != nil {
+		c.hook()
+	}
+	if k >= c.n {
+		return c.err
+	}
+	return nil
+}
+
+// A removal stopped before a node, as the lock is lost, says the lock
+// was lost, with nothing to run again, whether the lock was found lost
+// as the removal stopped, or the operation was stopped for it, though
+// the lease was granted again since; one stopped otherwise says which
+// nodes it didn't ask.
+func TestRemoveAppStoppedAsTheLockIsLostSaysSo(t *testing.T) {
+	lost := fmt.Errorf("%w: node1 didn't renew the lease in time", orchestrate.ErrLockLost)
+	for name, c := range map[string]struct {
+		ttl  time.Duration
+		ctx  func(node2 *node) *stopAt
+		lost bool
+	}{
+		// Err's first call is askable's, its second the check before node1.
+		"lost as it stopped": {300 * time.Millisecond, func(node2 *node) *stopAt {
+			return &stopAt{n: 2, err: context.Canceled, hook: func() {
+				node2.lockFor("bobs", time.Hour)
+				time.Sleep(400 * time.Millisecond)
+			}}
+		}, true},
+		"stopped for a lock granted again": {0, func(*node) *stopAt { return &stopAt{n: 2, err: lost} }, true},
+		"stopped":                          {0, func(*node) *stopAt { return &stopAt{n: 2, err: context.Canceled} }, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			node1, node2 := running(appContainer("web", nginx, nginxBuild)), running(appContainer("web", nginx, nginxBuild))
+			cl := deploying(t, fakes{"node1": node1, "node2": node2}, func(nodes *orchestrate.Nodes) {
+				if c.ttl != 0 {
+					nodes.LeaseTTL = c.ttl
+				}
+			})
+			ctx := c.ctx(node2)
+			ctx.Context = t.Context()
+			removed, err := cl.RemoveApp(ctx, "web", func(string) {})
+			var na *orchestrate.NotAskedError
+			switch {
+			case c.lost && (!errors.Is(err, orchestrate.ErrLockLost) || errors.As(err, &na) || !strings.Contains(err.Error(), "before mooctl removed web from any node; nothing changed")):
+				t.Errorf("RemoveApp = %v, want it to say it lost the lock, before it removed web from any node", err)
+			case !c.lost && (!errors.As(err, &na) || !slices.Equal(na.Unasked, []string{"node1", "node2"})):
+				t.Errorf("RemoveApp = %v, want a *NotAskedError naming node1 and node2", err)
+			}
+			if len(removed) != 0 || len(removals(node1))+len(removals(node2)) != 0 {
+				t.Errorf("RemoveApp stopped before node1 removed web from %v", removed)
+			}
+		})
 	}
 }

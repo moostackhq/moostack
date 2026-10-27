@@ -94,6 +94,28 @@ func TestRemoveRemovesTheAppFromEveryNodeThatRunsIt(t *testing.T) {
 	}
 }
 
+// An app doubled with another image on each node is refused by deploy,
+// as one of the same image is, and removed from both: the app is its
+// container's name, whatever it runs.
+func TestAnAppDoubledWithTwoImagesIsRefusedAndRemovedFromBoth(t *testing.T) {
+	const httpd = "docker.io/library/httpd:2.4"
+	doubled := func() map[string]*fakeNode {
+		return map[string]*fakeNode{"node1": pulling(nginxBuild, appRunning("web", nginx, nginxBuild)), "node2": pulling(nginxBuild, appRunning("web", httpd, "sha256:aaaa"))}
+	}
+	wantDeploy(t, doubled, web(t), "", "web runs on node1 and node2, more than one node, so mooctl can't tell which to replace; nothing changed\n"+
+		"Run mooctl deploy --remove, which removes web from every node it runs on, then deploy it again")
+	var nodes map[string]*fakeNode
+	wantRemove(t, func() map[string]*fakeNode {
+		nodes = doubled()
+		return nodes
+	}, web(t), "Removed web from node1\nRemoved web from node2\n", "")
+	for name, n := range nodes {
+		if runsApp(n, "web") {
+			t.Errorf("web runs on %s after it was removed", name)
+		}
+	}
+}
+
 // Removing an app no node runs says so, and succeeds, so that a removal
 // is safe to repeat.
 func TestRemovingAnAppThatIsntDeployedSaysSoAndSucceeds(t *testing.T) {
@@ -229,7 +251,7 @@ func TestARemovalThatFailsOnANodeSaysWhatToDo(t *testing.T) {
 		node3 = pulling(nginxBuild, appRunning("web", nginx, nginxBuild))
 		return map[string]*fakeNode{"node1": pulling(nginxBuild, appRunning("web", nginx, nginxBuild)), "node2": node2, "node3": node3}
 	}, web(t), "Removed web from node1\n",
-		"node2 failed to remove web: removing app-web: the disk is full\nRun mooctl deploy --remove again: it removes web from every node it is still on")
+		"node2 failed to remove web: removing app-web: the disk is full; mooctl didn't ask node3\nRun mooctl deploy --remove again: it removes web from every node it is still on")
 	if !runsApp(node3, "web") {
 		t.Error("node3 removed web after node2 failed")
 	}
@@ -252,6 +274,18 @@ func TestCtrlCDuringARemovalSaysItMayGoOn(t *testing.T) {
 	}
 }
 
+// Ctrl-C once a node that didn't keep the app answered, before the
+// next, names the nodes not asked, which may run the app, and says what
+// to run to remove it from them.
+func TestCtrlCBeforeAnyNodeRemovedTheAppSaysToRemoveAgain(t *testing.T) {
+	wantRemove(t, func() map[string]*fakeNode {
+		node1 := pulling(nginxBuild)
+		node1.apps.removed = interrupt
+		return map[string]*fakeNode{"node1": node1, "node2": pulling(nginxBuild, appRunning("web", nginx, nginxBuild)), "node3": pulling(nginxBuild, appRunning("web", nginx, nginxBuild))}
+	}, web(t), "",
+		"mooctl stopped before it asked node2 or node3 to remove web: context canceled; nothing changed there\nRun mooctl deploy --remove again: it removes web from every node it is still on")
+}
+
 // Ctrl-C once the app was removed from one node, before the next, says
 // what to run to remove it from the rest.
 func TestCtrlCBetweenTwoNodesSaysToRemoveAgain(t *testing.T) {
@@ -263,7 +297,7 @@ func TestCtrlCBetweenTwoNodesSaysToRemoveAgain(t *testing.T) {
 		node2s = append(node2s, node2)
 		return map[string]*fakeNode{"node1": node1, "node2": node2}
 	}, web(t), "Removed web from node1\n",
-		"mooctl stopped before it removed web from node2: context canceled; nothing changed there\nRun mooctl deploy --remove again: it removes web from every node it is still on")
+		"mooctl stopped before it asked node2 to remove web: context canceled; nothing changed there\nRun mooctl deploy --remove again: it removes web from every node it is still on")
 	for _, n := range node2s {
 		if !runsApp(n, "web") || len(n.nodeUpdates()) != 0 {
 			t.Errorf("node2 was changed after mooctl stopped: %v", n.nodeUpdates())
@@ -340,6 +374,40 @@ func TestARemovalThatsUnavailableSaysMooctlCantTell(t *testing.T) {
 			n.removeErr = status.Error(codes.Unavailable, msg)
 			return map[string]*fakeNode{"node1": n}
 		}, web(t), "", "mooctl can't tell whether node1 removed web: "+msg+"\nRun mooctl deploy --remove again: it says whether web is deployed")
+	}
+}
+
+// A removal that mooctl can't tell the end of, on a node with nodes
+// after it, says which nodes it didn't ask, and that removing again
+// removes the app from them too.
+func TestARemovalCutOffBeforeTheLastNodeSaysWhichItDidntAsk(t *testing.T) {
+	for name, c := range map[string]struct {
+		edit func(*fakeNode)
+		want string
+	}{
+		"stopped": {func(n *fakeNode) { n.apps.removing = interrupt },
+			"mooctl stopped waiting for node1 to remove web, which may go on on the node: context canceled; mooctl didn't ask node2 or node3"},
+		"unavailable": {func(n *fakeNode) { n.removeErr = status.Error(codes.Unavailable, "error reading from server: EOF") },
+			"mooctl can't tell whether node1 removed web: error reading from server: EOF; mooctl didn't ask node2 or node3"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var after []*fakeNode
+			wantRemove(t, func() map[string]*fakeNode {
+				node1 := pulling(nginxBuild, appRunning("web", nginx, nginxBuild))
+				c.edit(node1)
+				node2, node3 := pulling(nginxBuild, appRunning("web", nginx, nginxBuild)), pulling(nginxBuild)
+				after = append(after, node2, node3)
+				return map[string]*fakeNode{"node3": node3, "node1": node1, "node2": node2}
+			}, web(t), "", c.want+"\nRun mooctl deploy --remove again: it says whether web is deployed, and removes web from every node it is still on")
+			for _, n := range after {
+				n.mu.Lock()
+				asked := slices.Contains(n.updates, "remove app-web")
+				n.mu.Unlock()
+				if asked {
+					t.Error("mooctl asked a node after the one it couldn't tell the end of")
+				}
+			}
+		})
 	}
 }
 
@@ -434,6 +502,7 @@ func TestRemoveFalseDeploysTheApp(t *testing.T) {
 func TestDeployHelpSaysWhatRemoveDoes(t *testing.T) {
 	r := newOperator(t, "op").mustRun("deploy", "--help")
 	wantContains(t, "deploy --help", r.stdout,
+		"The app runs on the node that runs it already, or else on the node that runs the fewest apps.",
 		"--remove removes the app from every node that runs it, with its image unless another container runs from it, and its log; it needs only the app file's name.",
 		"--remove    remove the app from every node that runs it, rather than deploy it")
 }

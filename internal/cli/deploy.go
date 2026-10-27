@@ -103,23 +103,31 @@ func removeError(app string, removed []string, err error) error {
 	says := fmt.Sprintf("Run mooctl deploy --remove again: it says whether %s is deployed", app)
 	finishes := fmt.Sprintf("Run mooctl deploy --remove again: it removes %s from every node it is still on", app)
 	var re *orchestrate.RemoveError
+	if !errors.As(err, &re) {
+		// One stopped before it asked a node, or that lost the lock once it
+		// removed the app from one, leaves the app on those after.
+		if len(removed) > 0 || errors.As(err, new(*orchestrate.NotAskedError)) {
+			return fmt.Errorf("%w\n%s", err, finishes)
+		}
+		return err
+	}
+	// The nodes after it weren't asked, and may run the app too.
+	unasked := ""
+	if len(re.Unasked) > 0 {
+		unasked = "; mooctl didn't ask " + joinNouns(re.Unasked, "or")
+		says += fmt.Sprintf(", and removes %s from every node it is still on", app)
+	}
 	switch {
-	case errors.As(err, &re) && re.Stopped:
-		return fmt.Errorf("mooctl stopped waiting for %s to remove %s, which may go on on the node: %v\n%s", re.Node, app, re.Err, says)
+	case re.Stopped:
+		return fmt.Errorf("mooctl stopped waiting for %s to remove %s, which may go on on the node: %v%s\n%s", re.Node, app, re.Err, unasked, says)
 	// Unavailable comes from a node that crashed, or whose connection was
 	// cut, once it had the call, which may have removed the app all the
 	// same; from a call that was never sent; and from the agent itself
 	// while containerd doesn't answer, saying what it changed.
-	case errors.As(err, &re) && status.Code(re.Err) == codes.Unavailable:
-		return fmt.Errorf("mooctl can't tell whether %s removed %s: %s\n%s", re.Node, app, status.Convert(re.Err).Message(), says)
-	case errors.As(err, &re):
-		return fmt.Errorf("%s failed to remove %s: %s\n%s", re.Node, app, status.Convert(re.Err).Message(), finishes)
-	// One stopped, or that lost the lock, between two nodes leaves the app
-	// on those after.
-	case len(removed) > 0:
-		return fmt.Errorf("%w\n%s", err, finishes)
+	case status.Code(re.Err) == codes.Unavailable:
+		return fmt.Errorf("mooctl can't tell whether %s removed %s: %s%s\n%s", re.Node, app, status.Convert(re.Err).Message(), unasked, says)
 	}
-	return err
+	return fmt.Errorf("%s failed to remove %s: %s%s\n%s", re.Node, app, status.Convert(re.Err).Message(), unasked, finishes)
 }
 
 // deploy is mooctl deploy. Everything it checks of the app file it

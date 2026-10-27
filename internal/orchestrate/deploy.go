@@ -96,7 +96,17 @@ type DuplicateAppError struct {
 }
 
 func (e *DuplicateAppError) Error() string {
-	return fmt.Sprintf("%s runs on %s, more than one node, so mooctl can't tell which to replace; nothing changed", e.App, strings.Join(e.Nodes, " and "))
+	return fmt.Sprintf("%s runs on %s, more than one node, so mooctl can't tell which to replace; nothing changed", e.App, joinNodes(e.Nodes, "and"))
+}
+
+// joinNodes is nodes, at least one, as a sentence lists them with conj:
+// "node1", "node1 and node2", or "node1, node2 and node3".
+func joinNodes(nodes []string, conj string) string {
+	last := len(nodes) - 1
+	if last == 0 {
+		return nodes[0]
+	}
+	return strings.Join(nodes[:last], ", ") + " " + conj + " " + nodes[last]
 }
 
 // DeployStep is a step of a deploy, as Deploy tells it: the node it
@@ -406,14 +416,25 @@ func (c *Cluster) sortedConns() []*namedConn {
 	return conns
 }
 
+// connNames are the names of the nodes of conns, in their order.
+func connNames(conns []*namedConn) []string {
+	var names []string
+	for _, n := range conns {
+		names = append(names, n.name)
+	}
+	return names
+}
+
 // RemoveError says the node called Node failed to remove the app called
 // App, as Err says. Stopped says the removal was stopped, or lost the
 // lock, as Err then says, before the node answered, so that the node's
-// removal may or may not go on.
+// removal may or may not go on. Unasked are the nodes after Node, in
+// order of their names, which weren't asked to remove the app.
 type RemoveError struct {
 	Node, App string
 	Err       error
 	Stopped   bool
+	Unasked   []string
 }
 
 func (e *RemoveError) Error() string {
@@ -421,6 +442,21 @@ func (e *RemoveError) Error() string {
 }
 
 func (e *RemoveError) Unwrap() error { return e.Err }
+
+// NotAskedError says the removal of the app called App was stopped, as
+// Err says, before it asked the nodes Unasked, in order of their names,
+// which may run it still.
+type NotAskedError struct {
+	App     string
+	Unasked []string
+	Err     error
+}
+
+func (e *NotAskedError) Error() string {
+	return fmt.Sprintf("mooctl stopped before it asked %s to remove %s: %v; nothing changed there", joinNodes(e.Unasked, "or"), e.App, e.Err)
+}
+
+func (e *NotAskedError) Unwrap() error { return e.Err }
 
 // RemoveApp has every node the cluster has a connection to remove the
 // app called app, one node after another in order of their names,
@@ -443,23 +479,36 @@ func (c *Cluster) RemoveApp(ctx context.Context, app string, told func(node stri
 	}
 	name := appfile.ContainerName(app)
 	var removedFrom []string
-	for _, n := range c.sortedConns() {
+	conns := c.sortedConns()
+	lockLost := func(err error) ([]string, error) {
+		if len(removedFrom) == 0 {
+			return nil, fmt.Errorf("%w, before mooctl removed %s from any node; nothing changed", err, app)
+		}
+		return removedFrom, fmt.Errorf("%w, so mooctl removed %s from no more nodes", err, app)
+	}
+	for i, n := range conns {
 		if err := c.CheckLock(); err != nil {
-			if len(removedFrom) == 0 {
-				return nil, fmt.Errorf("%w, before mooctl removed %s from any node; nothing changed", err, app)
-			}
-			return removedFrom, fmt.Errorf("%w, so mooctl removed %s from no more nodes", err, app)
+			return lockLost(err)
 		}
 		if cause := stopped(ctx); cause != nil {
-			return removedFrom, fmt.Errorf("mooctl stopped before it removed %s from %s: %w; nothing changed there", app, n.name, cause)
+			// A lost lock stops the operation, and may have been lost since
+			// the check above.
+			if errors.Is(cause, ErrLockLost) {
+				return lockLost(cause)
+			}
+			if err := c.CheckLock(); err != nil {
+				return lockLost(err)
+			}
+			return removedFrom, &NotAskedError{App: app, Unasked: connNames(conns[i:]), Err: cause}
 		}
 		removed, err := n.conn.Remove(ctx, name, c.lease.Lease)
 		if err != nil {
+			re := &RemoveError{Node: n.name, App: app, Err: err, Unasked: connNames(conns[i+1:])}
 			if cause := stopped(ctx); cause != nil {
 				// A removal goes on once the agent has the call.
-				return removedFrom, &RemoveError{Node: n.name, App: app, Err: cause, Stopped: true}
+				re.Err, re.Stopped = cause, true
 			}
-			return removedFrom, &RemoveError{Node: n.name, App: app, Err: err}
+			return removedFrom, re
 		}
 		if removed {
 			removedFrom = append(removedFrom, n.name)
