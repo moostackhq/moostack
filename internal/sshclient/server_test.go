@@ -208,6 +208,16 @@ func (s *server) answerGlobalRequests(reqs <-chan *ssh.Request) {
 	}
 }
 
+// freezeOpen stops the server reading from the connections open now, for
+// good, as if the network to them had gone silent. New connections work.
+func (s *server) freezeOpen() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.tcpConns {
+		c.frozenAlone.Store(true)
+	}
+}
+
 // freezableConn reads nothing while frozen or frozenAlone is set.
 type freezableConn struct {
 	net.Conn
@@ -221,6 +231,25 @@ func (c *freezableConn) Read(p []byte) (int, error) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return c.Conn.Read(p)
+}
+
+// acceptedConns counts the connections accepted so far.
+func (s *server) acceptedConns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accepted
+}
+
+// drop closes every connection the server has accepted, and if dropNew
+// is set, every one it accepts from now on.
+func (s *server) drop(dropNew bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dropNew = dropNew
+	for _, c := range s.conns {
+		c.Close()
+	}
+	s.conns = nil
 }
 
 // config is an SSH config that reaches s as root under the name "node",
