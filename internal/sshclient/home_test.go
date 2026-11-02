@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -100,6 +101,14 @@ func startAgentWith(t *testing.T, keys ...agent.AddedKey) string {
 	return serveAgent(t, newKeyring(t, keys...))
 }
 
+// startSlowAgent serves an ssh-agent holding keys that takes delay to
+// sign, as one waiting for its user to approve would, and returns its
+// socket.
+func startSlowAgent(t *testing.T, delay time.Duration, keys ...ed25519.PrivateKey) string {
+	t.Helper()
+	return serveAgent(t, slowAgent{Agent: newKeyring(t, addedKeys(keys...)...), delay: delay})
+}
+
 // addedKeys are keys as ssh-agent holds them.
 func addedKeys(keys ...ed25519.PrivateKey) []agent.AddedKey {
 	var added []agent.AddedKey
@@ -107,6 +116,17 @@ func addedKeys(keys ...ed25519.PrivateKey) []agent.AddedKey {
 		added = append(added, agent.AddedKey{PrivateKey: k})
 	}
 	return added
+}
+
+// slowAgent is an ssh-agent that takes delay to sign.
+type slowAgent struct {
+	agent.Agent
+	delay time.Duration
+}
+
+func (a slowAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
+	time.Sleep(a.delay)
+	return a.Agent.Sign(key, data)
 }
 
 // newKeyring is an ssh-agent keyring holding keys.
@@ -159,6 +179,19 @@ func listenUnix(t *testing.T) (net.Listener, string) {
 	return l, sock
 }
 
+// namedKeys makes an ed25519 key for each name, and returns the private
+// and public keys by name.
+func namedKeys(t *testing.T, names ...string) (map[string]ed25519.PrivateKey, map[string]ssh.PublicKey) {
+	t.Helper()
+	keys := map[string]ed25519.PrivateKey{}
+	pubs := map[string]ssh.PublicKey{}
+	for _, name := range names {
+		signer, _, priv := newKey(t)
+		keys[name], pubs[name] = priv, signer.PublicKey()
+	}
+	return keys, pubs
+}
+
 // eventually calls try until it succeeds, and fails the test with its last
 // error if it hasn't within timeout.
 func eventually(t *testing.T, timeout time.Duration, try func() error) {
@@ -174,4 +207,30 @@ func eventually(t *testing.T, timeout time.Duration, try func() error) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// holdConnections accepts connections on l and holds them open, saying
+// nothing, until the test ends.
+func holdConnections(t *testing.T, l net.Listener) {
+	t.Helper()
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	})
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
 }
