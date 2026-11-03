@@ -233,6 +233,13 @@ func (c *freezableConn) Read(p []byte) (int, error) {
 	return c.Conn.Read(p)
 }
 
+// ranCommands returns the commands clients asked to run so far.
+func (s *server) ranCommands() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.ran...)
+}
+
 // acceptedConns counts the connections accepted so far.
 func (s *server) acceptedConns() int {
 	s.mu.Lock()
