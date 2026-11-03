@@ -7,8 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"net"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -71,26 +69,7 @@ func TestAFingerprintIsTheCertificatesSHA256(t *testing.T) {
 // issue is the identity ca issues the node called name.
 func issue(t *testing.T, ca *identity.CA, name string) *identity.Identity {
 	t.Helper()
-	dir := t.TempDir()
-	files := identity.Files{Key: filepath.Join(dir, "node.key"), Cert: filepath.Join(dir, "node.crt"), CA: filepath.Join(dir, "ca.crt")}
-	request, err := identity.NewKey(files.Key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, err := ca.Issue(request, name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for path, data := range map[string][]byte{files.Cert: cert, files.CA: ca.CertPEM()} {
-		if err := os.WriteFile(path, data, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	id, err := identity.Load(files)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return id
+	return load(t, issueFiles(t, ca, name))
 }
 
 // handshake runs a TLS handshake between server and client, and has the
@@ -135,4 +114,50 @@ func handshake(t *testing.T, server, client *tls.Config) (serverErr, clientErr e
 func hexSHA256(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+// A peer removed after a first handshake is refused when it resumes that
+// session, on either side.
+func TestAPeerRemovedAfterAHandshakeIsRefusedOnResumingIt(t *testing.T) {
+	ca := newCA(t)
+	server, client := issue(t, ca, "node1"), issue(t, ca, "node2")
+	for _, side := range []string{"server", "client"} {
+		t.Run("by the "+side, func(t *testing.T) {
+			var removed bool
+			isRemoved := func(string) bool { return removed }
+			serverTLS, clientTLS := server.ServerTLS(nil), client.ClientTLS("node1", nil)
+			if side == "server" {
+				serverTLS = server.ServerTLS(isRemoved)
+			} else {
+				clientTLS = client.ClientTLS("node1", isRemoved)
+			}
+			clientTLS.ClientSessionCache = tls.NewLRUClientSessionCache(1)
+			var resumed bool
+			check := clientTLS.VerifyConnection
+			clientTLS.VerifyConnection = func(cs tls.ConnectionState) error {
+				resumed = cs.DidResume
+				if check == nil {
+					return nil
+				}
+				return check(cs)
+			}
+			for range 2 {
+				if serverErr, clientErr := handshake(t, serverTLS, clientTLS); serverErr != nil || clientErr != nil {
+					t.Fatalf("before the removal: %v, %v", serverErr, clientErr)
+				}
+			}
+			if !resumed {
+				t.Fatal("the second handshake didn't resume the first's session")
+			}
+			removed = true
+			serverErr, clientErr := handshake(t, serverTLS, clientTLS)
+			err := serverErr
+			if side == "client" {
+				err = clientErr
+			}
+			if err == nil || !strings.Contains(err.Error(), "removed") {
+				t.Errorf("the %s took a resumed session of a removed identity: %v, %v", side, serverErr, clientErr)
+			}
+		})
+	}
 }

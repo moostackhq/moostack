@@ -3,13 +3,14 @@
 // node's agent and updater prove who they are.
 //
 // Certificates never expire. A node's identity is revoked by removing
-// the node, not by letting it run out: the cluster lists the removed
-// identities by their fingerprints, and peers refuse them.
+// the node: the cluster lists the removed identities by their
+// fingerprints, and peers refuse them.
 package identity
 
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -134,8 +135,7 @@ func (ca *CA) Issue(requestPEM []byte, node string) ([]byte, error) {
 
 // NewKey creates a node's key at path, readable by its owner alone, and
 // returns a certificate request for it, PEM, for the CA to Issue. It
-// refuses to replace a key that is there. The key never leaves the node:
-// only the request does.
+// refuses to replace a key that is there.
 func NewKey(path string) ([]byte, error) {
 	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -251,8 +251,8 @@ func parse(keyPEM, certPEM, caPEM []byte, files Files) (*Identity, error) {
 	if cert.Subject.CommonName == "" {
 		return nil, fmt.Errorf("the node's identity: %s names no node", certName)
 	}
-	// Peers check the node's name against the certificate's DNS names, as
-	// TLS checks a server's, never against its common name.
+	// The certificate must name its node, its common name, among its DNS
+	// names.
 	if err := cert.VerifyHostname(cert.Subject.CommonName); err != nil {
 		return nil, fmt.Errorf("the node's identity: %s doesn't name its node, %s, among its DNS names, which peers check: %w", certName, cert.Subject.CommonName, err)
 	}
@@ -267,6 +267,18 @@ func parse(keyPEM, certPEM, caPEM []byte, files Files) (*Identity, error) {
 // of removed identities names it.
 func (id *Identity) Fingerprint() string { return CertFingerprint(id.cert.Leaf) }
 
+// DeriveKey is a 32-byte key for label, derived from the node's private
+// key with HKDF-SHA256: the same for every load of the identity, secret
+// to the node, and different for every label.
+func (id *Identity) DeriveKey(label string) [32]byte {
+	seed := id.cert.PrivateKey.(ed25519.PrivateKey).Seed()
+	k, err := hkdf.Key(sha256.New, seed, nil, label, 32)
+	if err != nil {
+		panic(err)
+	}
+	return [32]byte(k)
+}
+
 // IsRemoved says whether the identity of fingerprint is removed from the
 // cluster. A nil IsRemoved says none is.
 type IsRemoved func(fingerprint string) bool
@@ -276,11 +288,11 @@ type IsRemoved func(fingerprint string) bool
 // that removed doesn't say is removed.
 func (id *Identity) ServerTLS(removed IsRemoved) *tls.Config {
 	return &tls.Config{
-		MinVersion:            tls.VersionTLS13,
-		Certificates:          []tls.Certificate{id.cert},
-		ClientAuth:            tls.RequireAndVerifyClientCert,
-		ClientCAs:             id.cas,
-		VerifyPeerCertificate: refuseRemoved(removed),
+		MinVersion:       tls.VersionTLS13,
+		Certificates:     []tls.Certificate{id.cert},
+		ClientAuth:       tls.RequireAndVerifyClientCert,
+		ClientCAs:        id.cas,
+		VerifyConnection: refuseRemoved(removed),
 	}
 }
 
@@ -289,25 +301,24 @@ func (id *Identity) ServerTLS(removed IsRemoved) *tls.Config {
 // cluster CA, unless removed says it is removed.
 func (id *Identity) ClientTLS(peer string, removed IsRemoved) *tls.Config {
 	return &tls.Config{
-		MinVersion:            tls.VersionTLS13,
-		Certificates:          []tls.Certificate{id.cert},
-		RootCAs:               id.cas,
-		ServerName:            peer,
-		VerifyPeerCertificate: refuseRemoved(removed),
+		MinVersion:       tls.VersionTLS13,
+		Certificates:     []tls.Certificate{id.cert},
+		RootCAs:          id.cas,
+		ServerName:       peer,
+		VerifyConnection: refuseRemoved(removed),
 	}
 }
 
 // refuseRemoved checks, once the peer's certificate has verified against
-// the cluster CA, that removed doesn't say it is removed.
-func refuseRemoved(removed IsRemoved) func([][]byte, [][]*x509.Certificate) error {
-	return func(_ [][]byte, chains [][]*x509.Certificate) error {
-		if removed == nil {
+// the cluster CA, on every handshake, resumed ones included, that removed
+// doesn't say it is removed.
+func refuseRemoved(removed IsRemoved) func(tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		if removed == nil || len(cs.PeerCertificates) == 0 {
 			return nil
 		}
-		for _, chain := range chains {
-			if leaf := chain[0]; removed(CertFingerprint(leaf)) {
-				return fmt.Errorf("the identity of %s, %s, is removed from the cluster", leaf.Subject.CommonName, CertFingerprint(leaf))
-			}
+		if leaf := cs.PeerCertificates[0]; removed(CertFingerprint(leaf)) {
+			return fmt.Errorf("the identity of %s, %s, is removed from the cluster", leaf.Subject.CommonName, CertFingerprint(leaf))
 		}
 		return nil
 	}

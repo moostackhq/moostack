@@ -10,8 +10,8 @@
 // identities, admits only the cluster's members and refuses removed ones,
 // tells the node which member sent each message (transport.Message's
 // Peer), and hands each message only to the member it is meant for
-// (transport.Dest), not to whoever answers at the member's address; a seed
-// known only by its address it reaches unpinned. The runtime drops a
+// (transport.Dest), not to whoever answers at the member's address, and
+// drops a message for a seed known only by its address. The runtime drops a
 // message that carries no proven peer unless it is told its transport
 // proves nobody (runtime.Options.Unauthenticated). A transport that proves
 // nobody, so allowed, leaves everything below open to anyone

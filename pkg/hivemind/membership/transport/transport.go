@@ -13,8 +13,7 @@ package transport
 //
 // Peer is the member ID the transport proved the sender to be, as by its
 // certificate on an mTLS connection, or empty from a transport that proves
-// none. A node drops a message whose sender entry names another member: an
-// admitted member can't pose as the sender of a message it didn't send.
+// none. A node drops a message whose sender entry names another member.
 // The runtime drops one with no Peer unless told its transport proves
 // nobody. See package hivemind's doc for what the protocol trusts and
 // what it doesn't.
@@ -29,14 +28,16 @@ type Message struct {
 // it for. An authenticating transport must hand it only to an other end
 // that proves it is Peer, as by its certificate, and drop it otherwise, as
 // a lost packet. Peer is empty for a seed the node knows only by its
-// address, which the transport reaches unpinned.
+// address: an authenticating transport drops the message, and one that
+// proves no identity hands it to whoever is at Addr.
 type Dest struct {
 	Addr string
 	Peer string
 }
 
 // Transport is one node's network endpoint. Sending never blocks: a
-// message that can't go is dropped, as a lost packet is.
+// message that can't go is dropped, as a lost packet is. A send takes a
+// copy of b: the caller may reuse b once it returns.
 type Transport interface {
 	// Addr is the address other nodes reach this one at.
 	Addr() string
