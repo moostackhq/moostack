@@ -263,22 +263,18 @@ func reachHosts(ctx context.Context, env Env, d *cluster.Dir, targets []nodeTarg
 }
 
 // recheckTimeout bounds the check that addNode makes again of a host
-// whose connection has sat idle through the installs before it, which a
-// firewall may have dropped without a word.
+// whose connection has sat idle through the installs before it.
 const recheckTimeout = time.Minute
 
 // addNode installs the release on h, records it in the cluster directory
 // at the next generation, and has every node record that generation.
-// A host that comes later, after another, it checks again first, since
-// an earlier install may have changed it: two targets can reach the same
-// host, which no host key tells apart from a clone.
+// A host that comes later, after another, it checks again first.
 func addNode(ctx context.Context, env Env, cl *orchestrate.Cluster, d *cluster.Dir, rel *release.Release, ca *identity.CA, removed []string, h *newHost, later bool) error {
 	n, name := h.n, h.n.Name
 	adding := fmt.Sprintf("adding %s as %s", h.target, name)
 	if later {
-		// The host must answer within recheckTimeout, but the check, which
-		// a slow host may take longer to run, has no bound of its own, as
-		// the first check had none.
+		// The host must answer within recheckTimeout, but the check has no
+		// bound of its own.
 		answerCtx, cancel := context.WithTimeout(ctx, recheckTimeout)
 		_, err := h.c.Run(answerCtx, "true", nil)
 		timedOut := err != nil && errors.Is(answerCtx.Err(), context.DeadlineExceeded)
@@ -313,9 +309,9 @@ func addNode(ctx context.Context, env Env, cl *orchestrate.Cluster, d *cluster.D
 	// The other nodes record the generation even if the new node can't
 	// be reached to.
 	if node, err := nodeclient.Dial(h.c); err != nil {
-		cl.Add(name, unreachedNode{err})
+		cl.Add(name, n.PrivateAddress, unreachedNode{err})
 	} else {
-		cl.Add(name, sshNode{node, h.c})
+		cl.Add(name, n.PrivateAddress, sshNode{node, h.c})
 		h.added = true
 	}
 	interrupted, err := tellNodes(ctx, env, cl, h.target+" is added as "+name, func(ctx context.Context) error {
@@ -812,7 +808,9 @@ func (n unreachedNode) Status(context.Context) nodeclient.Status {
 	return nodeclient.Status{AgentErr: n.err, UpdaterErr: n.err}
 }
 
-func (n unreachedNode) RecordGeneration(context.Context, int64, []string, string) error { return n.err }
+func (n unreachedNode) RecordGeneration(context.Context, int64, []*nodev1.GenerationNode, string) error {
+	return n.err
+}
 
 func (n unreachedNode) AcquireLock(context.Context, nodeclient.Lock, time.Duration) (nodeclient.Lock, error) {
 	return nodeclient.Lock{}, n.err

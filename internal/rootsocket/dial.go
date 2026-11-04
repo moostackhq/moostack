@@ -18,8 +18,15 @@ var Reconnect = grpc.WithConnectParams(grpc.ConnectParams{
 	MinConnectTimeout: 20 * time.Second,
 })
 
+// MaxAnswer is the largest answer read from the node API.
+const MaxAnswer = 32 << 20
+
+// ReadAnswers has a connection to the node API read answers of up to
+// MaxAnswer.
+var ReadAnswers = grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(MaxAnswer))
+
 // Dial is a connection to the node API on the unix socket at path, as
 // the agent and the updater make to each other's.
 func Dial(path string) (*grpc.ClientConn, error) {
-	return grpc.NewClient("unix://"+path, grpc.WithTransportCredentials(insecure.NewCredentials()), Reconnect)
+	return grpc.NewClient("unix://"+path, grpc.WithTransportCredentials(insecure.NewCredentials()), Reconnect, ReadAnswers)
 }

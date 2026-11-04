@@ -41,6 +41,7 @@ import (
 	"github.com/moostackhq/moostack/internal/buildid"
 	"github.com/moostackhq/moostack/internal/controlplane"
 	"github.com/moostackhq/moostack/internal/gateway"
+	"github.com/moostackhq/moostack/internal/hivemindadapter"
 	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/rootsocket"
@@ -77,7 +78,7 @@ type Config struct {
 	// cluster, which the node refuses as peers. Its directory must exist.
 	RemovedIdentitiesFile string
 	// PeerPort is the port to listen for peers on, at the node's private
-	// address.
+	// address: on TCP for the peer listener, and on UDP for membership.
 	PeerPort uint16
 	// Updater is the updater's binary, a symbolic link to the active one
 	// of UpdaterSlots, relative, in the same directory.
@@ -102,15 +103,17 @@ type Config struct {
 }
 
 // StopTimeout bounds how long the agent waits, once told to stop, for
-// open calls to finish, such as a peer watching its health. Then it
-// closes them.
+// open calls to finish, such as a peer watching its health, and for
+// membership to leave the cluster. Then it closes them.
 const StopTimeout = 5 * time.Second
 
 // containerdTimeout bounds asking containerd for its version.
 const containerdTimeout = 2 * time.Second
 
 // Serve serves the node API on cfg.Socket, and listens for peers at the
-// node's private address, until ctx ends. Its graceful stop waits for
+// node's private address, until ctx ends. It runs membership on UDP at
+// the same address and port, joined through the nodes of the generation
+// it last recorded, and leaves when it stops. Its graceful stop waits for
 // an update of the updater that runs, past StopTimeout, since the update
 // goes on once its call ends. If a swap of the updater is recorded, as
 // when the agent crashed in one, it switches the updater back meanwhile.
@@ -148,11 +151,19 @@ func Serve(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	peerListener, err := net.Listen("tcp", netip.AddrPortFrom(node.PrivateAddress, cfg.PeerPort).String())
+	peerAddress := netip.AddrPortFrom(node.PrivateAddress, cfg.PeerPort)
+	peerListener, err := net.Listen("tcp", peerAddress.String())
 	if err != nil {
 		return fmt.Errorf("listening for peers: %w", err)
 	}
 	defer peerListener.Close()
+	// Membership runs past ctx's end, until the agent stops it, which
+	// leaves.
+	members, err := hivemindadapter.Start(context.WithoutCancel(ctx), hivemindadapter.Config{Identity: id, Address: peerAddress, Removed: removed.has})
+	if err != nil {
+		return err
+	}
+	defer members.Stop()
 	l, err := rootsocket.Listen(cfg.Socket)
 	if err != nil {
 		return err
@@ -170,11 +181,15 @@ func Serve(ctx context.Context, cfg Config) error {
 		Restart:  cfg.RestartUpdater,
 		Healthy:  healthy,
 	}
-	agent := &agentServer{node: node, nodeFile: cfg.NodeFile, containerd: client, shim: filepath.Join(cfg.ContainerdBinDir, hostlayout.ContainerdShim), runc: cfg.Runc, containers: containers, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile), removed: removed, updater: updater, version: cfg.Version}
+	agent := &agentServer{node: node, nodeFile: cfg.NodeFile, containerd: client, shim: filepath.Join(cfg.ContainerdBinDir, hostlayout.ContainerdShim), runc: cfg.Runc, containers: containers, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile), removed: removed, members: members, peerPort: cfg.PeerPort, updater: updater, version: cfg.Version}
 	agent.controlPlane.Store(node.Mode == hostlayout.ModeControlPlane)
+	// A generation file the agent can't read gives no seeds; status says
+	// why, and the next recording repairs it.
+	if applied, err := agent.applied(); err == nil {
+		agent.seed(applied.Nodes)
+	}
 	agent.containerdBinaries = &containerdBinaries{dir: cfg.ContainerdBinDir, files: cfg.ContainerdFiles, restart: cfg.RestartContainerd, wait: agent.waitContainerd}
-	// The builds are hashed from the start, in the background, so that
-	// status says them by the time an operation asks.
+	// The builds are hashed from the start, in the background.
 	agent.build(map[string]string{"agent": executable()})
 	agent.build(agent.containerdFiles())
 	agent.build(map[string]string{"runc": agent.runc})
@@ -194,13 +209,13 @@ func Serve(ctx context.Context, cfg Config) error {
 	go containers.StartAll(ctx)
 	go containers.KeepDeletingUnused(ctx, unusedRetry, changeTimeout)
 	go recoverUpdater(ctx, updater)
-	return serveAll(ctx, servers)
+	return serveAll(ctx, servers, members.Stop)
 }
 
 // serveAll serves each server on its listener until ctx ends or one of
 // them fails, and then stops them all, giving open calls StopTimeout to
-// finish.
-func serveAll(ctx context.Context, servers map[*grpc.Server]net.Listener) error {
+// finish, and calls stop meanwhile, waiting for it as long.
+func serveAll(ctx context.Context, servers map[*grpc.Server]net.Listener, stop func()) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errs := make(chan error, len(servers))
@@ -215,6 +230,12 @@ func serveAll(ctx context.Context, servers map[*grpc.Server]net.Listener) error 
 		}()
 	}
 	<-ctx.Done()
+	stopped := make(chan struct{})
+	go func() {
+		stop()
+		close(stopped)
+	}()
+	deadline := time.After(StopTimeout)
 	force := time.AfterFunc(StopTimeout, func() {
 		for s := range servers {
 			s.Stop()
@@ -227,6 +248,10 @@ func serveAll(ctx context.Context, servers map[*grpc.Server]net.Listener) error 
 	var err error
 	for range servers {
 		err = errors.Join(err, <-errs)
+	}
+	select {
+	case <-stopped:
+	case <-deadline:
 	}
 	return err
 }
@@ -248,12 +273,15 @@ type agentServer struct {
 	detaching  sync.Mutex
 	containerd *containerd.Client
 	// shim is containerd's shim, which must be at containerd's version.
-	shim               string
-	runc               string
-	containers         *containers
-	generationFile     string
-	lock               *operationLock
-	removed            *removedIdentities
+	shim           string
+	runc           string
+	containers     *containers
+	generationFile string
+	lock           *operationLock
+	removed        *removedIdentities
+	members        *hivemindadapter.Membership
+	// peerPort is the port the nodes listen for peers on.
+	peerPort           uint16
 	updater            *abslot.Component
 	containerdBinaries *containerdBinaries
 	// builds tells the builds of the node components' files.
@@ -270,29 +298,55 @@ func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nod
 		},
 		Lock:       s.lockStatus(),
 		Containers: s.containers.Report(ctx),
+		Membership: membershipOf(s.members.Status()),
 	}
 	if applied, err := s.applied(); err != nil {
 		res.GenerationUnknown = err.Error()
 	} else {
-		res.Generation, res.Nodes = applied.Generation, applied.Nodes
+		res.Generation = applied.Generation
+		for _, n := range applied.Nodes {
+			res.Nodes = append(res.Nodes, n.Name)
+		}
 	}
 	return res, nil
 }
 
+// memberStates are membership's states as the node API names them.
+var memberStates = map[hivemindadapter.State]nodev1.MemberState{
+	hivemindadapter.Alive:   nodev1.MemberState_MEMBER_STATE_ALIVE,
+	hivemindadapter.Suspect: nodev1.MemberState_MEMBER_STATE_SUSPECT,
+	hivemindadapter.Dead:    nodev1.MemberState_MEMBER_STATE_DEAD,
+	hivemindadapter.Left:    nodev1.MemberState_MEMBER_STATE_LEFT,
+}
+
+// membershipOf is s as the node API reports it.
+func membershipOf(s hivemindadapter.Status) *nodev1.Membership {
+	m := &nodev1.Membership{HealthScore: uint32(s.HealthScore), Dropped: s.Dropped}
+	for _, e := range s.Members {
+		m.Members = append(m.Members, &nodev1.Member{Node: e.NodeID, Address: e.Address, State: memberStates[e.State]})
+	}
+	return m
+}
+
 func (s *agentServer) RecordGeneration(_ context.Context, req *nodev1.RecordGenerationRequest) (*nodev1.RecordGenerationResponse, error) {
-	err := s.lock.fenced(req.Lease, func() error {
+	nodes, err := generationNodes(req.Nodes)
+	if err != nil {
+		return nil, err
+	}
+	err = s.lock.fenced(req.Lease, func() error {
 		// A node that can't tell the generation it applied accepts any, so
 		// that a recording repairs it.
 		if recorded, err := s.applied(); err == nil && req.Generation < recorded.Generation {
 			return status.Errorf(codes.FailedPrecondition, "the node has applied generation %d, later than %d", recorded.Generation, req.Generation)
 		}
-		data, err := json.Marshal(appliedGeneration{Generation: req.Generation, Nodes: req.Nodes})
+		data, err := json.Marshal(appliedGeneration{Generation: req.Generation, Nodes: nodes})
 		if err == nil {
 			err = writeFile(s.generationFile, append(data, '\n'))
 		}
 		if err != nil {
 			return status.Errorf(codes.Internal, "recording the generation: %v", err)
 		}
+		s.seed(nodes)
 		return nil
 	})
 	if err != nil {
@@ -302,11 +356,51 @@ func (s *agentServer) RecordGeneration(_ context.Context, req *nodev1.RecordGene
 }
 
 // appliedGeneration is what the generation file holds: the generation of
-// the cluster directory that the node last applied, and the names of the
-// directory's nodes at that generation.
+// the cluster directory that the node last applied, and the directory's
+// nodes at that generation.
 type appliedGeneration struct {
-	Generation int64    `json:"generation"`
-	Nodes      []string `json:"nodes"`
+	Generation int64            `json:"generation"`
+	Nodes      []generationNode `json:"nodes"`
+}
+
+// generationNode is a node of the cluster directory: its name and the
+// address other nodes reach it at.
+type generationNode struct {
+	Name           string     `json:"name"`
+	PrivateAddress netip.Addr `json:"private_address"`
+}
+
+// badNode says a node of a generation isn't valid, given its name and
+// its private address.
+const badNode = "a node %q at the private address %q, want a name and an IP address"
+
+// valid says whether n has a name and an IP address.
+func (n generationNode) valid() bool { return n.Name != "" && n.PrivateAddress.IsValid() }
+
+// generationNodes are nodes as the generation file keeps them. It fails
+// with INVALID_ARGUMENT for a node with no name or with a private address
+// that isn't an IP address.
+func generationNodes(nodes []*nodev1.GenerationNode) ([]generationNode, error) {
+	out := make([]generationNode, len(nodes))
+	for i, n := range nodes {
+		addr, _ := netip.ParseAddr(n.PrivateAddress)
+		out[i] = generationNode{Name: n.Name, PrivateAddress: addr}
+		if !out[i].valid() {
+			return nil, status.Errorf(codes.InvalidArgument, badNode, n.Name, n.PrivateAddress)
+		}
+	}
+	return out, nil
+}
+
+// seed has membership join the cluster through nodes, each at its
+// private address and the peer port. Membership skips this node.
+func (s *agentServer) seed(nodes []generationNode) {
+	var seeds []hivemindadapter.Seed
+	for _, n := range nodes {
+		seeds = append(seeds, hivemindadapter.Seed{NodeID: n.Name, Address: netip.AddrPortFrom(n.PrivateAddress, s.peerPort).String()})
+	}
+	// It fails only once membership stopped.
+	_ = s.members.SetSeeds(seeds)
 }
 
 // applied is what the node last applied: generation 0 of no nodes if it
@@ -319,6 +413,13 @@ func (s *agentServer) applied() (appliedGeneration, error) {
 	}
 	if err == nil {
 		err = json.Unmarshal(data, &a)
+	}
+	if err == nil {
+		for _, n := range a.Nodes {
+			if !n.valid() {
+				err = fmt.Errorf(badNode, n.Name, n.PrivateAddress)
+			}
+		}
 	}
 	if err != nil {
 		return appliedGeneration{}, fmt.Errorf("reading %s: %w", s.generationFile, err)
@@ -538,8 +639,7 @@ func (s *agentServer) Run(ctx context.Context, req *nodev1.RunRequest) (*nodev1.
 		return nil, status.Error(codes.InvalidArgument, "no container")
 	}
 	c := containerOf(req.Container)
-	// The run goes on if the call ends, as when mooctl is stopped, since
-	// it may have removed the container's old one already.
+	// The run goes on if the call ends, as when mooctl is stopped.
 	ctx = context.WithoutCancel(ctx)
 	started, err := s.containers.Run(ctx, c, s.fence(req.Lease))
 	if err != nil {

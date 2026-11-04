@@ -2,6 +2,7 @@
 Description=Moostack agent
 Wants={{.ContainerdUnit}}
 After={{.ContainerdUnit}}
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart={{.AgentBinary}} serve

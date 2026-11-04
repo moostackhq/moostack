@@ -2,12 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,6 +22,7 @@ import (
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/cluster"
+	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/interrupt"
 	"github.com/moostackhq/moostack/internal/nodeclient"
@@ -53,7 +56,7 @@ func clusterCommand(env Env) *cli.Command {
 			},
 			{
 				Name:  "status",
-				Usage: "show each node's mode and node components, next to the pinned release",
+				Usage: "show each node's mode and node components, next to the pinned release, and a summary of its membership",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{
 						Name:  "json",
@@ -65,6 +68,22 @@ func clusterCommand(env Env) *cli.Command {
 						return err
 					}
 					return clusterStatus(ctx, env, cmd)
+				},
+			},
+			{
+				Name:  "members",
+				Usage: "show every node each node knows, with its state and address",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{
+						Name:  "json",
+						Usage: "print the members as JSON",
+					},
+				},
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					if err := wantArgs(cmd, 0); err != nil {
+						return err
+					}
+					return clusterMembers(ctx, env, cmd)
 				},
 			},
 			{
@@ -195,8 +214,7 @@ func openCAStore(path string, opts secretstore.KeyOptions) (caStore, error) {
 // it is new, and adds to undo what puts the store back.
 func (s caStore) keep(key []byte, undo *rollback) error {
 	// Save makes the lock file if there is none. It is removed only once
-	// no store is left next to it, since a lock file must never be
-	// removed while it is in use.
+	// no store is left next to it.
 	lock := filepath.Join(filepath.Dir(s.path), secretstore.LockFileName)
 	if _, err := os.Lstat(lock); errors.Is(err, fs.ErrNotExist) {
 		undo.add(func() {
@@ -383,7 +401,7 @@ func printStatus(env Env, view statusView) error {
 		t.node(n.Name, mode)
 		// The containers sit under the agent that runs them. A node whose
 		// agent isn't listed has them after its node components, at their
-		// level, so that they read as no other component's.
+		// level.
 		containers := n.Containers
 		for _, c := range n.Components {
 			t.component(n.Name, 1, c)
@@ -397,8 +415,14 @@ func printStatus(env Env, view statusView) error {
 		for _, c := range containers {
 			t.component(n.Name, 1, c)
 		}
+		if n.Membership != nil {
+			t.membership(*n.Membership)
+		}
 		if n.GenerationProblem != "" {
 			t.problem(n.Name + ": " + nodeclient.Printable(n.GenerationProblem))
+		}
+		for _, p := range suspicionProblems(n) {
+			t.problem(p)
 		}
 	}
 	t.print(&b)
@@ -439,12 +463,135 @@ func (t *statusTree) component(node string, depth int, c componentStatusView) {
 	}
 }
 
+// suspicionProblems say which other nodes don't hold n alive.
+func suspicionProblems(n nodeStatusView) []string {
+	var problems []string
+	for _, by := range n.SuspectedBy {
+		held := "holds it " + by.State
+		if by.State == memberAbsent {
+			held = "doesn't know it"
+		}
+		problems = append(problems, fmt.Sprintf("%s: %s %s, though its agent answers mooctl, so they may not reach each other over UDP on the peer port, %d", n.Name, by.Node, held, hostlayout.PeerPort))
+	}
+	return problems
+}
+
+// membership adds the line of a node's membership: how many members it
+// holds in each state, its health and what it dropped.
+func (t *statusTree) membership(m membershipView) {
+	dropped := "no message dropped"
+	if len(m.Dropped) > 0 {
+		var counts []string
+		for _, reason := range slices.Sorted(maps.Keys(m.Dropped)) {
+			counts = append(counts, fmt.Sprintf("%d %s", m.Dropped[reason], reason))
+		}
+		dropped = "dropped " + strings.Join(counts, ", ")
+	}
+	held := map[string]int{}
+	for _, e := range m.Members {
+		held[e.State]++
+	}
+	var states []string
+	for _, state := range []string{"alive", "suspect", "dead", "left", "unknown"} {
+		if held[state] > 0 {
+			states = append(states, fmt.Sprintf("%d %s", held[state], state))
+		}
+	}
+	if len(states) == 0 {
+		states = []string{"no member"}
+	}
+	t.lines = append(t.lines, []string{fmt.Sprintf("  membership: %s, health score %d, %s", strings.Join(states, ", "), m.HealthScore, dropped)})
+}
+
+// clusterMembers shows every node each node knows, as a list or as JSON.
+func clusterMembers(ctx context.Context, env Env, cmd *cli.Command) error {
+	d, err := openCluster(cmd)
+	if err != nil {
+		return err
+	}
+	nodes, err := d.Nodes()
+	if err != nil {
+		return err
+	}
+	view := membersView{Cluster: d.Cluster.Name, Nodes: membersOf(orchestrate.Survey(ctx, nodesToDial(env, nodes)))}
+	if cmd.Bool("json") {
+		e := json.NewEncoder(env.Stdout)
+		e.SetIndent("", "  ")
+		return e.Encode(view)
+	}
+	return printMembers(env, view)
+}
+
+// membersView is what cluster members shows, as a list or as JSON.
+type membersView struct {
+	Cluster string           `json:"cluster"`
+	Nodes   []nodeStatusView `json:"nodes"`
+}
+
+// membersOf are the nodes as reached, each with what cluster members
+// shows of it.
+func membersOf(reached []orchestrate.Reached) []nodeStatusView {
+	nodes := []nodeStatusView{}
+	for _, r := range reached {
+		n := nodeStatusView{Name: r.Name, Reachable: r.Err == nil}
+		switch {
+		case r.Err != nil:
+			n.Error = r.Err.Error()
+		case r.Status.AgentErr != nil:
+			n.MembershipProblem = "its agent doesn't answer: " + r.Status.AgentErr.Error()
+		case r.Status.Membership == nil:
+			n.MembershipProblem = "its agent reports no membership"
+		default:
+			n.Membership = membershipOf(r.Status.Membership)
+		}
+		nodes = append(nodes, n)
+	}
+	markSuspicions(nodes)
+	return nodes
+}
+
+// printMembers prints each node with the members it knows below it, with
+// their states and addresses, and the problems it found below.
+func printMembers(env Env, view membersView) error {
+	var b strings.Builder
+	if len(view.Nodes) == 0 {
+		fmt.Fprintf(&b, "Cluster %s has no nodes\n", view.Cluster)
+	}
+	var problems []string
+	for _, n := range view.Nodes {
+		if n.Membership == nil {
+			fmt.Fprintf(&b, "%s  no view\n", n.Name)
+			problems = append(problems, n.Name+": "+nodeclient.Printable(cmp.Or(n.Error, n.MembershipProblem)))
+			continue
+		}
+		fmt.Fprintln(&b, n.Name)
+		nameWidth, stateWidth := 0, 0
+		for _, e := range n.Membership.Members {
+			nameWidth, stateWidth = max(nameWidth, utf8.RuneCountInString(e.Node)), max(stateWidth, len(e.State))
+		}
+		for _, e := range n.Membership.Members {
+			fmt.Fprintf(&b, "  %s  %s  %s\n", padRight(e.Node, nameWidth), padRight(e.State, stateWidth), e.Address)
+		}
+		problems = append(problems, suspicionProblems(n)...)
+	}
+	if len(problems) > 0 {
+		fmt.Fprintf(&b, "\n%s\n", strings.Join(problems, "\n"))
+	}
+	_, err := io.WriteString(env.Stdout, b.String())
+	return err
+}
+
+// padRight is s with spaces after it up to width characters.
+func padRight(s string, width int) string {
+	return s + strings.Repeat(" ", width-utf8.RuneCountInString(s))
+}
+
 // problem adds p to the problems listed below the tree.
 func (t *statusTree) problem(p string) { t.problems = append(t.problems, p) }
 
 // print writes the tree to w, under its header, with each column of the
 // components' lines as wide as its widest cell, in characters, two spaces
-// apart. A node's line takes no part in the columns.
+// apart. A node's line and its membership's take no part in the columns.
 func (t *statusTree) print(w io.Writer) {
 	lines := append([][]string{{"NODE", "RUNNING", "PINNED", "HEALTH"}}, t.lines...)
 	widths := make([]int, 4)
@@ -578,8 +725,7 @@ func clusterUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 // rerun is the command line that runs cluster update as cmd ran it: in
 // its cluster directory, from its release source, with --force and its
 // --source and the components it names, if it has them, each quoted for
-// a shell, so that it can be pasted. A release source with a user or a
-// password in it is left out, so as not to show them.
+// a shell. A release source with a user or a password in it is left out.
 func rerun(cmd *cli.Command) string {
 	args := append(mooctlIn(cmd), "cluster", "update")
 	if cmd.Bool("force") {
@@ -595,8 +741,7 @@ func rerun(cmd *cli.Command) string {
 }
 
 // mooctlIn is mooctl, run in cmd's cluster directory, from its release
-// source, which it leaves out if it holds a user or a password, so as not
-// to show them.
+// source, which it leaves out if it holds a user or a password.
 func mooctlIn(cmd *cli.Command) []string {
 	args := []string{"mooctl"}
 	if dir := clusterDir(cmd); dir != "." {
@@ -853,6 +998,94 @@ type nodeStatusView struct {
 	// Containers are the containers the node keeps, the cluster services
 	// among them, each by its full name.
 	Containers []componentStatusView `json:"containers,omitempty"`
+	// Membership is the node's view of the cluster, nil if its agent
+	// didn't answer or reported none.
+	Membership *membershipView `json:"membership,omitempty"`
+	// MembershipProblem says why cluster members has no view of a node
+	// that was reached.
+	MembershipProblem string `json:"membership_problem,omitempty"`
+	// SuspectedBy are the other nodes whose view holds this one suspect,
+	// dead or left, or doesn't list it, though both agents answer mooctl.
+	SuspectedBy []suspicionView `json:"suspected_by,omitempty"`
+}
+
+// membershipView is a node's view of the cluster's membership.
+type membershipView struct {
+	Members     []memberView      `json:"members"`
+	HealthScore uint32            `json:"health_score"`
+	Dropped     map[string]uint64 `json:"dropped,omitempty"`
+}
+
+// memberView is a node as a node's membership holds it.
+type memberView struct {
+	Node    string `json:"node"`
+	Address string `json:"address"`
+	// State is alive, suspect, dead, left, or unknown if the node didn't
+	// say.
+	State string `json:"state"`
+}
+
+// suspicionView is a node's view of another that answers mooctl: State
+// is suspect, dead, left or memberAbsent.
+type suspicionView struct {
+	Node  string `json:"node"`
+	State string `json:"state"`
+}
+
+// memberAbsent is the state of a suspicionView whose node doesn't list
+// the other.
+const memberAbsent = "absent"
+
+// memberStates are the states of membership, as status names them.
+var memberStates = map[nodev1.MemberState]string{
+	nodev1.MemberState_MEMBER_STATE_ALIVE:   "alive",
+	nodev1.MemberState_MEMBER_STATE_SUSPECT: "suspect",
+	nodev1.MemberState_MEMBER_STATE_DEAD:    "dead",
+	nodev1.MemberState_MEMBER_STATE_LEFT:    "left",
+}
+
+// membershipOf is m as status shows it, nil if m is.
+func membershipOf(m *nodev1.Membership) *membershipView {
+	if m == nil {
+		return nil
+	}
+	v := &membershipView{Members: []memberView{}, HealthScore: m.HealthScore, Dropped: m.Dropped}
+	for _, e := range m.Members {
+		v.Members = append(v.Members, memberView{Node: e.Node, Address: e.Address, State: cmp.Or(memberStates[e.State], "unknown")})
+	}
+	return v
+}
+
+// markSuspicions sets the SuspectedBy of each node whose agent answered
+// to the other nodes whose agent answered and whose view doesn't hold it
+// alive.
+func markSuspicions(nodes []nodeStatusView) {
+	views := map[string]map[string]string{}
+	for _, n := range nodes {
+		if n.Membership != nil {
+			views[n.Name] = map[string]string{}
+			for _, e := range n.Membership.Members {
+				views[n.Name][e.Node] = e.State
+			}
+		}
+	}
+	for i := range nodes {
+		n := &nodes[i]
+		if n.Membership == nil {
+			continue
+		}
+		for _, other := range nodes {
+			if other.Name == n.Name || other.Membership == nil {
+				continue
+			}
+			switch state, known := views[other.Name][n.Name]; {
+			case !known:
+				n.SuspectedBy = append(n.SuspectedBy, suspicionView{Node: other.Name, State: memberAbsent})
+			case state != "alive":
+				n.SuspectedBy = append(n.SuspectedBy, suspicionView{Node: other.Name, State: state})
+			}
+		}
+	}
 }
 
 // componentStatusView is a component or a container in cluster status:
@@ -909,8 +1142,10 @@ func statusOf(d *cluster.Dir, rel *release.Release, nodes []cluster.Node, reache
 		builds := pinnedBuilds(rel, archOf(nodes, r.Name))
 		n.Components = componentsOf(pinnedComponents, builds, r.Status.Components)
 		n.Containers = containersOf(pinnedServices, builds, r.Status)
+		n.Membership = membershipOf(r.Status.Membership)
 		view.Nodes = append(view.Nodes, n)
 	}
+	markSuspicions(view.Nodes)
 	view.Update = "unknown"
 	if rel != nil {
 		view.Update = updateOf(view)

@@ -81,6 +81,7 @@ func dialUnix(c *sshclient.Client, socket string) (*grpc.ClientConn, error) {
 func dial(name string, d func(ctx context.Context) (net.Conn, error)) (*grpc.ClientConn, error) {
 	return grpc.NewClient("passthrough:///"+name,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		rootsocket.ReadAnswers,
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return d(ctx) }),
 		grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 			return quotedStatus(invoker(ctx, method, req, reply, cc, opts...))
@@ -98,7 +99,7 @@ func dial(name string, d func(ctx context.Context) (net.Conn, error)) (*grpc.Cli
 }
 
 // quotedStatus is err, with the message of the status a node answered
-// with made Printable, since mooctl repeats it to the operator.
+// with made Printable.
 func quotedStatus(err error) error {
 	if err == nil {
 		return nil
@@ -154,6 +155,9 @@ type Status struct {
 	// Containers are the containers the node keeps, the cluster services
 	// among them, none if the agent didn't answer.
 	Containers []*nodev1.ContainerStatus
+	// Membership is the node's view of the cluster's membership, nil if
+	// the agent didn't answer.
+	Membership *nodev1.Membership
 }
 
 // Status asks the agent and the updater for their status, both at once,
@@ -181,6 +185,7 @@ func (n *Node) Status(ctx context.Context) Status {
 		s.Lock = lockOf(agent.Lock)
 		s.Components = append(s.Components, agent.Components...)
 		s.Containers = agent.Containers
+		s.Membership = agent.Membership
 	}
 	if updaterErr != nil {
 		s.UpdaterErr = updaterErr
@@ -198,6 +203,16 @@ func (n *Node) Status(ctx context.Context) Status {
 	}
 	for _, c := range s.Containers {
 		c.Name, c.Image, c.Digest, c.Problem = Printable(c.Name), Printable(c.Image), Printable(c.Digest), Printable(c.Problem)
+	}
+	if s.Membership != nil {
+		for _, m := range s.Membership.Members {
+			m.Node, m.Address = Printable(m.Node), Printable(m.Address)
+		}
+		dropped := map[string]uint64{}
+		for reason, n := range s.Membership.Dropped {
+			dropped[Printable(reason)] += n
+		}
+		s.Membership.Dropped = dropped
 	}
 	return s
 }
@@ -242,9 +257,9 @@ func (s Status) KnownGeneration() (int64, bool) {
 }
 
 // RecordGeneration has the agent record generation, of a cluster
-// directory of the nodes called nodes, as the one the node has applied,
-// for the operation whose lease holds the node's operation lock.
-func (n *Node) RecordGeneration(ctx context.Context, generation int64, nodes []string, lease string) error {
+// directory of nodes, as the one the node has applied, for the operation
+// whose lease holds the node's operation lock.
+func (n *Node) RecordGeneration(ctx context.Context, generation int64, nodes []*nodev1.GenerationNode, lease string) error {
 	_, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: generation, Nodes: nodes, Lease: lease})
 	return err
 }
@@ -367,8 +382,6 @@ func ImportImage(ctx context.Context, agent nodev1.AgentClient, archive io.Reade
 	// The first request carries the lease, even for an empty archive.
 	req := &nodev1.ImportImageRequest{Lease: lease}
 	for {
-		// A message isn't to be changed once sent, so each chunk has its
-		// own buffer.
 		buf := make([]byte, importChunk)
 		n, readErr := io.ReadFull(archive, buf)
 		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {

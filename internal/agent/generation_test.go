@@ -5,6 +5,7 @@ package agent_test
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,19 +22,23 @@ func TestTheAgentKeepsTheGenerationItRecordsAcrossARestart(t *testing.T) {
 	if got := n.EventuallyHealthy(t).Generation; got != 0 {
 		t.Errorf("a new node reports generation %d, want 0", got)
 	}
-	record(t, n, 3, "node-1")
-	record(t, n, 3, "node-1", "node-2")
+	record(t, n, 3, nodeOf(n))
+	record(t, n, 3, nodeOf(n), listed("node-2", "192.0.2.2"))
 	n.Restart(t, "agent")
 	reported := n.EventuallyHealthy(t)
 	if reported.Generation != 3 || !slices.Equal(reported.Nodes, []string{"node-1", "node-2"}) {
 		t.Errorf("after a restart, the node reports generation %d of %v, want 3 of [node-1 node-2]", reported.Generation, reported.Nodes)
+	}
+	// The node keeps each node's private address, and joins node-2 there.
+	if out, err := n.Output("root", "cat", hostlayout.GenerationFile); err != nil || !strings.Contains(out, `{"name":"node-2","private_address":"192.0.2.2"}`) {
+		t.Errorf("the generation file holds %s, %v, want node-2 at 192.0.2.2", out, err)
 	}
 }
 
 func TestTheAgentSaysWhenItCantTellItsGenerationAndARecordingRepairsIt(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
-	record(t, n, 5, "node-1")
+	record(t, n, 5, nodeOf(n))
 	n.Exec(t, "root", "sh", "-c", "echo garbage > "+hostlayout.GenerationFile)
 	// The agent still answers, with its mode and components.
 	reported := n.EventuallyHealthy(t)
@@ -44,7 +49,7 @@ func TestTheAgentSaysWhenItCantTellItsGenerationAndARecordingRepairsIt(t *testin
 		t.Errorf("with its generation file corrupt, the agent reports generation %d and the problem %q, want 0 and a problem", reported.Generation, reported.GenerationUnknown)
 	}
 	// It can't tell the generation it applied, so it accepts any.
-	record(t, n, 2, "node-1")
+	record(t, n, 2, nodeOf(n))
 	if reported := n.EventuallyHealthy(t); reported.Generation != 2 || reported.GenerationUnknown != "" {
 		t.Errorf("after recording generation 2, the agent reports generation %d and the problem %q", reported.Generation, reported.GenerationUnknown)
 	}
@@ -53,7 +58,7 @@ func TestTheAgentSaysWhenItCantTellItsGenerationAndARecordingRepairsIt(t *testin
 func TestTheAgentRefusesALowerGeneration(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
-	record(t, n, 5, "node-1")
+	record(t, n, 5, nodeOf(n))
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	_, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: 4, Lease: "record"})
@@ -67,7 +72,7 @@ func TestTheAgentRefusesALowerGeneration(t *testing.T) {
 
 // record records generation g of a cluster directory of nodes on n, as
 // an operation whose lease holds the lock, which must succeed.
-func record(t *testing.T, n *nodetest.Node, g int64, nodes ...string) {
+func record(t *testing.T, n *nodetest.Node, g int64, nodes ...*nodev1.GenerationNode) {
 	t.Helper()
 	acquire(t, n, "record", time.Minute)
 	recordAs(t, n, "record", g, nodes...)
@@ -75,11 +80,22 @@ func record(t *testing.T, n *nodetest.Node, g int64, nodes ...string) {
 
 // recordAs records generation g of a cluster directory of nodes on n, as
 // the operation of lease, which must succeed.
-func recordAs(t *testing.T, n *nodetest.Node, lease string, g int64, nodes ...string) {
+func recordAs(t *testing.T, n *nodetest.Node, lease string, g int64, nodes ...*nodev1.GenerationNode) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	if _, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: g, Nodes: nodes, Lease: lease}); err != nil {
 		t.Fatalf("recording generation %d: %v", g, err)
 	}
+}
+
+// listed is the node called name, at the private address addr, as a
+// generation lists it.
+func listed(name, addr string) *nodev1.GenerationNode {
+	return &nodev1.GenerationNode{Name: name, PrivateAddress: addr}
+}
+
+// nodeOf is n as a generation lists it.
+func nodeOf(n *nodetest.Node) *nodev1.GenerationNode {
+	return listed(n.NodeName, n.PeerAddress.Addr().String())
 }

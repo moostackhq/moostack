@@ -125,7 +125,7 @@ func TestTheAgentRecordsAGenerationOnlyForTheLeaseThatHoldsTheLock(t *testing.T)
 	acquire(t, n, "a", time.Minute)
 	for _, lease := range []string{"", "b"} {
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		_, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: 2, Nodes: []string{"node-1"}, Lease: lease})
+		_, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: 2, Nodes: []*nodev1.GenerationNode{listed("node-1", "192.0.2.1")}, Lease: lease})
 		cancel()
 		if status.Code(err) != codes.FailedPrecondition {
 			t.Errorf("recording a generation with lease %q while a holds the lock: %v, want FailedPrecondition", lease, err)
@@ -134,7 +134,7 @@ func TestTheAgentRecordsAGenerationOnlyForTheLeaseThatHoldsTheLock(t *testing.T)
 	if got := n.EventuallyHealthy(t).Generation; got != 0 {
 		t.Errorf("after the refused recordings, the node reports generation %d, want 0", got)
 	}
-	recordAs(t, n, "a", 2, "node-1")
+	recordAs(t, n, "a", 2, nodeOf(n))
 	if got := n.EventuallyHealthy(t).Generation; got != 2 {
 		t.Errorf("after lease a recorded generation 2, the node reports %d", got)
 	}
@@ -263,7 +263,7 @@ func TestALeaseThatLostTheLockCantRecordAGeneration(t *testing.T) {
 	// The lock is free: a was broken, and b ran out.
 	for _, lease := range []string{"a", "b"} {
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		_, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: 2, Nodes: []string{"node-1"}, Lease: lease})
+		_, err := n.Agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: 2, Nodes: []*nodev1.GenerationNode{listed("node-1", "192.0.2.1")}, Lease: lease})
 		cancel()
 		if status.Code(err) != codes.FailedPrecondition {
 			t.Errorf("recording a generation with lease %s, which no longer holds the free lock: %v, want FailedPrecondition", lease, err)

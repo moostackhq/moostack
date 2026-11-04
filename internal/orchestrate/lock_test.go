@@ -243,7 +243,7 @@ func TestAnAddedNodeTakesTheLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	added := &node{}
-	cl.Add("node2", added)
+	cl.Add("node2", privateAddress("node2"), added)
 	if l, want := added.heldLock(), f["node1"].heldLock(); l == nil || l.Lease != want.Lease {
 		t.Errorf("the added node has the lock %+v, want the operation's %+v", l, want)
 	}
@@ -262,7 +262,7 @@ func TestAnAddedNodeThatRefusesTheLeaseDoesntRecord(t *testing.T) {
 	defer cl.Close()
 	added := &node{}
 	added.lockFor("bobs", time.Minute)
-	cl.Add("node2", added)
+	cl.Add("node2", privateAddress("node2"), added)
 	err = cl.Record(t.Context(), 2)
 	if err == nil {
 		t.Fatal("Record passed with node2 locked by another")
@@ -349,7 +349,7 @@ func TestTheLeaseOutlivesTheCallersContext(t *testing.T) {
 		t.Fatalf("three lease times after its caller's context ended, the operation lost its lease: %v", err)
 	}
 	added := &node{generation: 0}
-	cl.Add("node2", added)
+	cl.Add("node2", privateAddress("node2"), added)
 	if l := added.heldLock(); l == nil {
 		t.Error("a node added after the caller's context ended wasn't locked")
 	}

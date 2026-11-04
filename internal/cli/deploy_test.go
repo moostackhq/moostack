@@ -430,7 +430,7 @@ func TestMOOCTL_DIRPointsEveryCommandAtTheClusterDirectory(t *testing.T) {
 	if r := o.run("cluster", "status", "--json"); r.err != nil || !strings.Contains(r.stdout, `"cluster": "prod"`) {
 		t.Errorf("cluster status with -C, and MOOCTL_DIR naming another directory: %v\n%s", r.err, r.stdout)
 	}
-	for _, args := range [][]string{{"deploy", web(t)}, {"cluster", "status"}, {"cluster", "update"}, {"cluster", "update", "--source", t.TempDir()},
+	for _, args := range [][]string{{"deploy", web(t)}, {"cluster", "status"}, {"cluster", "members"}, {"cluster", "update"}, {"cluster", "update", "--source", t.TempDir()},
 		{"node", "add", "web.invalid"}, {"node", "add", "--join-token", joinToken, "web.invalid"}, {"node", "remove", "node1"}, {"cluster", "unlock"}} {
 		r := o.runWithoutDir(args...)
 		want := empty + " is not a cluster directory, since it has no cluster.yml: open " + filepath.Join(empty, "cluster.yml") + ": no such file or directory\nPass -C <cluster dir>, or set MOOCTL_DIR to the cluster directory."

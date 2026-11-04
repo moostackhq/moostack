@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -25,9 +26,9 @@ type Node interface {
 	// Status is what the node's agent and updater report.
 	Status(ctx context.Context) nodeclient.Status
 	// RecordGeneration has the node record generation, of a cluster
-	// directory of the nodes called nodes, as the one it has applied, for
-	// the operation whose lease holds the node's operation lock.
-	RecordGeneration(ctx context.Context, generation int64, nodes []string, lease string) error
+	// directory of nodes, as the one it has applied, for the operation
+	// whose lease holds the node's operation lock.
+	RecordGeneration(ctx context.Context, generation int64, nodes []*nodev1.GenerationNode, lease string) error
 	// AcquireLock asks the node for its operation lock for lock's lease,
 	// or to renew it, for ttl, and returns the lock as it now is.
 	AcquireLock(ctx context.Context, lock nodeclient.Lock, ttl time.Duration) (nodeclient.Lock, error)
@@ -91,8 +92,11 @@ const DefaultServiceTimeout = time.Minute
 
 // Nodes are the nodes an operation runs on, and how to reach them.
 type Nodes struct {
-	// Names are the names of the nodes in the cluster directory.
-	Names []string
+	// Names are the names of the nodes in the cluster directory, and
+	// PrivateAddresses the address other nodes reach each one at, by
+	// name, which Record records.
+	Names            []string
+	PrivateAddresses map[string]netip.Addr
 	// Dial connects to a node by its name.
 	Dial Dial
 	// ReachTimeout bounds connecting to one node and asking for its
@@ -235,12 +239,13 @@ type Cluster struct {
 	conns      []*namedConn
 }
 
-// namedConn is the connection to the node called name, and the
-// operation's hold on its lock.
+// namedConn is the connection to the node called name, at the private
+// address privateAddress, and the operation's hold on its lock.
 type namedConn struct {
-	name  string
-	conn  Node
-	lease leased
+	name           string
+	privateAddress netip.Addr
+	conn           Node
+	lease          leased
 }
 
 // LaterGenerationError says a node has applied a later generation than
@@ -306,7 +311,7 @@ func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, h
 	reached := reach(ctx, nodes)
 	for _, r := range reached {
 		if r.conn != nil {
-			c.conns = append(c.conns, &namedConn{name: r.Name, conn: r.conn})
+			c.conns = append(c.conns, &namedConn{name: r.Name, privateAddress: nodes.PrivateAddresses[r.Name], conn: r.conn})
 		}
 	}
 	// A node that can't be operated fails the preflight before the lock
@@ -323,9 +328,8 @@ func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, h
 	if problems := c.takeLease(ctx, c.reachTimeout); len(problems) > 0 {
 		return fail(&PreflightError{Problems: problems})
 	}
-	// Another operation may have recorded a generation and ended between
-	// the check and the lock. Holding the lock, no other can, so the
-	// generations are checked again on what the nodes say now.
+	// Holding the lock, the generations are checked again on what the
+	// nodes say now.
 	refresh(ctx, reached, c.reachTimeout)
 	if problems := c.check(reached, generation, force); len(problems) > 0 {
 		return fail(&PreflightError{Problems: problems})
@@ -548,12 +552,13 @@ func (e *PreflightError) Forceable() bool {
 // older generation is forced.
 func (c *Cluster) Next(generation int64) int64 { return max(generation, c.Latest) + 1 }
 
-// Add adds the connection to a new node called name, which Close closes,
-// and takes the operation lock on it. A node that doesn't grant it can't
-// record a generation, and Record says why. The new node gets the
-// removed identities from its install, not from Add.
-func (c *Cluster) Add(name string, conn Node) {
-	n := &namedConn{name: name, conn: conn}
+// Add adds the connection to a new node called name, whose private
+// address is privateAddress, which Close closes, and takes the operation
+// lock on it. A node that doesn't grant it can't record a generation, and
+// Record says why. The new node gets the removed identities from its
+// install, not from Add.
+func (c *Cluster) Add(name string, privateAddress netip.Addr, conn Node) {
+	n := &namedConn{name: name, privateAddress: privateAddress, conn: conn}
 	sent, err := c.take(c.held, conn, c.reachTimeout)
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -618,18 +623,18 @@ func (c *Cluster) push(ctx context.Context, conns []*namedConn, identities []str
 }
 
 // Record has every node record generation, of a cluster directory of
-// every node the cluster has a connection to, as the one it has applied,
-// all at once, each within the record timeout. It fails naming every
-// node that didn't.
+// every node the cluster has a connection to, by name and private
+// address, as the one it has applied, all at once, each within the
+// record timeout. It fails naming every node that didn't.
 func (c *Cluster) Record(ctx context.Context, generation int64) error {
 	c.mu.Lock()
 	conns := slices.Clone(c.conns)
 	c.mu.Unlock()
-	names := make([]string, len(conns))
+	nodes := make([]*nodev1.GenerationNode, len(conns))
 	for i, n := range conns {
-		names[i] = n.name
+		nodes[i] = &nodev1.GenerationNode{Name: n.name, PrivateAddress: n.privateAddress.String()}
 	}
-	slices.Sort(names)
+	slices.SortFunc(nodes, func(a, b *nodev1.GenerationNode) int { return strings.Compare(a.Name, b.Name) })
 	errs := make([]error, len(conns))
 	var wg sync.WaitGroup
 	for i, n := range conns {
@@ -640,7 +645,7 @@ func (c *Cluster) Record(ctx context.Context, generation int64) error {
 			}
 			ctx, cancel := context.WithTimeout(ctx, c.recordTimeout)
 			defer cancel()
-			if err := n.conn.RecordGeneration(ctx, generation, names, c.lease.Lease); err != nil {
+			if err := n.conn.RecordGeneration(ctx, generation, nodes, c.lease.Lease); err != nil {
 				errs[i] = fmt.Errorf("%s didn't record generation %d: %w", n.name, generation, err)
 			}
 		})

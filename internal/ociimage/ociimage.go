@@ -78,13 +78,10 @@ func WriteFile(path string, img Image) error {
 // Write writes img to w as an OCI image layout archive. The same image
 // always makes the same archive: every time in it is zero.
 func Write(w io.Writer, img Image) error {
-	var layer bytes.Buffer
-	if err := writeTar(&layer, img.Files); err != nil {
-		return err
-	}
 	var compressed bytes.Buffer
 	gz := gzip.NewWriter(&compressed)
-	if _, err := gz.Write(layer.Bytes()); err != nil {
+	diffID := sha256.New()
+	if err := writeTar(io.MultiWriter(diffID, gz), img.Files); err != nil {
 		return err
 	}
 	if err := gz.Close(); err != nil {
@@ -98,7 +95,7 @@ func Write(w io.Writer, img Image) error {
 		"architecture": img.Architecture,
 		"os":           "linux",
 		"config":       runConfig,
-		"rootfs":       map[string]any{"type": "layers", "diff_ids": []string{digest(layer.Bytes())}},
+		"rootfs":       map[string]any{"type": "layers", "diff_ids": []string{"sha256:" + hex.EncodeToString(diffID.Sum(nil))}},
 	})
 	if err != nil {
 		return err
@@ -175,7 +172,7 @@ func Digest(archive []byte) (string, error) {
 func ReadDigest(r io.Reader) (string, error) {
 	tr := tar.NewReader(r)
 	var manifests []descriptor
-	// containerd decodes each oci-layout in turn into one layout.
+	// Each oci-layout decodes in turn into this one layout.
 	var layout ocispec.ImageLayout
 	found := false
 	for {

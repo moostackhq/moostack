@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -109,7 +110,7 @@ type node struct {
 	hanging  bool
 	recorded []int64
 	// recordedNodes are the nodes given with the last recording.
-	recordedNodes []string
+	recordedNodes []*nodev1.GenerationNode
 	// removed are the identities the node holds as removed, and pushes
 	// counts the pushes of them.
 	removed []string
@@ -173,7 +174,7 @@ func (n *node) Status(ctx context.Context) nodeclient.Status {
 	return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock(), Components: n.components, Containers: n.containers()}
 }
 
-func (n *node) RecordGeneration(ctx context.Context, g int64, nodes []string, lease string) error {
+func (n *node) RecordGeneration(ctx context.Context, g int64, nodes []*nodev1.GenerationNode, lease string) error {
 	if n.hang(ctx) {
 		return ctx.Err()
 	}
@@ -607,9 +608,32 @@ func (f fakes) names() []string {
 }
 
 // nodes are the cluster's nodes, with extra names, as orchestrate takes
-// them.
+// them, each at its privateAddress.
 func (f fakes) nodes(extra ...string) orchestrate.Nodes {
-	return orchestrate.Nodes{Names: append(f.names(), extra...), Dial: f.dial}
+	names := append(f.names(), extra...)
+	addresses := map[string]netip.Addr{}
+	for _, name := range names {
+		addresses[name] = privateAddress(name)
+	}
+	return orchestrate.Nodes{Names: names, PrivateAddresses: addresses, Dial: f.dial}
+}
+
+// privateAddress is the private address of the node called name: one of
+// its own, made of its name's bytes.
+func privateAddress(name string) netip.Addr {
+	var a [16]byte
+	copy(a[:], name)
+	return netip.AddrFrom16(a)
+}
+
+// recorded are nodes as a node recorded them: each one's name and
+// private address.
+func recorded(nodes []*nodev1.GenerationNode) []string {
+	var out []string
+	for _, n := range nodes {
+		out = append(out, n.Name+" at "+n.PrivateAddress)
+	}
+	return out
 }
 
 func (f fakes) dial(_ context.Context, name string) (orchestrate.Node, error) {
@@ -664,7 +688,7 @@ func TestRecordRecordsOnEveryNodeTheAddedOneToo(t *testing.T) {
 		t.Fatal(err)
 	}
 	added := &node{}
-	cl.Add("node3", added)
+	cl.Add("node3", privateAddress("node3"), added)
 	if err := cl.Record(t.Context(), 2); err != nil {
 		t.Fatal(err)
 	}
@@ -797,14 +821,18 @@ func TestRecordRecordsTheNodesOfTheClusterDirectory(t *testing.T) {
 	}
 	defer cl.Close()
 	added := &node{}
-	cl.Add("node3", added)
+	cl.Add("node3", privateAddress("node3"), added)
 	if err := cl.Record(t.Context(), 2); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"node1", "node2", "node3"}
+	want := recorded([]*nodev1.GenerationNode{
+		{Name: "node1", PrivateAddress: privateAddress("node1").String()},
+		{Name: "node2", PrivateAddress: privateAddress("node2").String()},
+		{Name: "node3", PrivateAddress: privateAddress("node3").String()},
+	})
 	for name, n := range map[string]*node{"node1": f["node1"], "node2": f["node2"], "node3": added} {
-		if !slices.Equal(n.recordedNodes, want) {
-			t.Errorf("%s recorded the nodes %v, want %v", name, n.recordedNodes, want)
+		if got := recorded(n.recordedNodes); !slices.Equal(got, want) {
+			t.Errorf("%s recorded the nodes %v, want %v", name, got, want)
 		}
 	}
 }

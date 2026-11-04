@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -21,7 +22,17 @@ func TestUnitFilesRunTheInstalledBinaries(t *testing.T) {
 			"Wants=moostack-containerd.service",
 			"After=moostack-containerd.service",
 			"ExecStart=/opt/moostack/bin/agent serve",
+			// An agent that can't open its ports keeps trying until it can.
+			"Restart=always",
+			"StartLimitIntervalSec=0",
 		},
+	}
+	agent, err := os.ReadFile("units/moostack-agent.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limit, service := strings.Index(string(agent), "StartLimitIntervalSec="), strings.Index(string(agent), "[Service]"); limit < 0 || limit > service {
+		t.Error("StartLimitIntervalSec isn't in the agent unit's [Unit], the only section systemd reads it from")
 	}
 	if len(unitFiles) != len(want) {
 		t.Fatalf("there are %d unit files, want %d", len(unitFiles), len(want))

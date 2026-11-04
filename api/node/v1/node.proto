@@ -12,7 +12,7 @@ import "google/protobuf/timestamp.proto";
 // Agent is the node API that the agent serves. On a node in control
 // plane mode, the agent's local socket serves only Status and Detach,
 // and refuses every other call, the cluster services' included, with
-// FAILED_PRECONDITION, so that the node is never operated in both modes.
+// FAILED_PRECONDITION.
 service Agent {
   // Status reports the node's mode and the state of its node components.
   rpc Status(StatusRequest) returns (StatusResponse);
@@ -171,6 +171,45 @@ message StatusResponse {
   // Containers are the containers the node keeps, the cluster services
   // among them, each as it runs.
   repeated ContainerStatus containers = 7;
+  // Membership is what the node knows of the cluster's nodes.
+  Membership membership = 8;
+}
+
+// Membership is a node's view of the cluster's membership.
+message Membership {
+  // Members are the nodes the node knows, itself included.
+  repeated Member members = 1;
+  // HealthScore is the node's own health: 0 when it hears what it
+  // expects from the others, and higher the more answers it misses, as
+  // when it is overloaded or its network drops packets.
+  uint32 health_score = 2;
+  // Dropped counts the messages the node dropped since it started, by
+  // reason. A reason it dropped none for is left out.
+  map<string, uint64> dropped = 3;
+}
+
+// Member is a node as another node's membership knows it.
+message Member {
+  string node = 1;
+  // Address is where the node is reached for membership: its private
+  // address and the peer port.
+  string address = 2;
+  MemberState state = 3;
+}
+
+// MemberState is what a node believes of another.
+enum MemberState {
+  MEMBER_STATE_UNSPECIFIED = 0;
+  // MEMBER_STATE_ALIVE answers its probes.
+  MEMBER_STATE_ALIVE = 1;
+  // MEMBER_STATE_SUSPECT missed its probes, and is declared dead unless
+  // it refutes the suspicion in time.
+  MEMBER_STATE_SUSPECT = 2;
+  // MEMBER_STATE_DEAD stopped answering.
+  MEMBER_STATE_DEAD = 3;
+  // MEMBER_STATE_LEFT said it was leaving, as an agent does when it
+  // stops.
+  MEMBER_STATE_LEFT = 4;
 }
 
 // ContainerStatus is a container as the node runs it.
@@ -211,11 +250,18 @@ enum TaskState {
 message RecordGenerationRequest {
   // Generation is the cluster directory's generation.
   int64 generation = 1;
-  // Nodes are the names of the nodes in the cluster directory at that
-  // generation.
-  repeated string nodes = 2;
+  // Nodes are the nodes in the cluster directory at that generation. The
+  // agent joins the membership of each one but itself.
+  repeated GenerationNode nodes = 2;
   // Lease is the operation's lease, which must hold the operation lock.
   string lease = 3;
+}
+
+// GenerationNode is a node of the cluster directory.
+message GenerationNode {
+  string name = 1;
+  // PrivateAddress is the address other nodes reach the node at.
+  string private_address = 2;
 }
 
 message RecordGenerationResponse {}

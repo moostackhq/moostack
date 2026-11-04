@@ -97,10 +97,10 @@ func TestAJoinedNodeServesTheNodeAPIOverItsTunnels(t *testing.T) {
 	if err != nil || got.Lock.GetLease() != "cp" {
 		t.Fatalf("acquiring the lock over the tunnel: %v, %v", got, err)
 	}
-	if _, err := agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: 3, Nodes: []string{"node-1"}, Lease: "other"}); status.Code(err) != codes.FailedPrecondition {
+	if _, err := agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: 3, Nodes: []*nodev1.GenerationNode{listed("node-1", "192.0.2.1")}, Lease: "other"}); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("recording a generation over the tunnel without the lock: %v, want failed precondition", err)
 	}
-	if _, err := agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: 3, Nodes: []string{"node-1"}, Lease: "cp"}); err != nil {
+	if _, err := agent.RecordGeneration(ctx, &nodev1.RecordGenerationRequest{Generation: 3, Nodes: []*nodev1.GenerationNode{listed("node-1", "192.0.2.1")}, Lease: "cp"}); err != nil {
 		t.Fatalf("recording a generation over the tunnel: %v", err)
 	}
 	if _, err := agent.ReleaseLock(ctx, &nodev1.ReleaseLockRequest{Lease: "cp"}); err != nil {

@@ -2,6 +2,7 @@ package nodeclient
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"path/filepath"
 	"slices"
@@ -124,5 +125,47 @@ func TestTheNodeAPIsErrorsAndImageNamesComeQuoted(t *testing.T) {
 		cancel()
 		conn.Close()
 		s.Stop()
+	}
+}
+
+// fullAgent answers status with a view of the most members, of the
+// longest names and addresses membership takes.
+type fullAgent struct {
+	nodev1.UnimplementedAgentServer
+}
+
+func (fullAgent) Status(context.Context, *nodev1.StatusRequest) (*nodev1.StatusResponse, error) {
+	m := &nodev1.Membership{}
+	for i := range 10000 {
+		m.Members = append(m.Members, &nodev1.Member{Node: fmt.Sprintf("%0255d", i), Address: strings.Repeat("a", 255), State: nodev1.MemberState_MEMBER_STATE_ALIVE})
+	}
+	return &nodev1.StatusResponse{Membership: m}, nil
+}
+
+func TestAStatusWithAFullMembershipViewIsRead(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "agent.sock")
+	l, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := grpc.NewServer()
+	defer s.Stop()
+	nodev1.RegisterAgentServer(s, fullAgent{})
+	go s.Serve(l)
+	conn, err := dial(socket, func(ctx context.Context) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	res, err := nodev1.NewAgentClient(conn).Status(ctx, &nodev1.StatusRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(res.Membership.Members); got != 10000 {
+		t.Errorf("the status has %d members", got)
 	}
 }

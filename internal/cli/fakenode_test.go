@@ -50,7 +50,8 @@ type fakeNode struct {
 
 	mu sync.Mutex
 	// recorded are the generations recorded on the node, in order.
-	recorded []int64
+	recorded      []int64
+	recordedNodes []*nodev1.GenerationNode
 	// lock is the lease that holds the node's operation lock, nil if
 	// none. It never expires.
 	lock *nodeclient.Lock
@@ -273,7 +274,7 @@ func (n *fakeNode) Status(context.Context) nodeclient.Status {
 	return s
 }
 
-func (n *fakeNode) RecordGeneration(ctx context.Context, g int64, _ []string, lease string) error {
+func (n *fakeNode) RecordGeneration(ctx context.Context, g int64, nodes []*nodev1.GenerationNode, lease string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -283,7 +284,15 @@ func (n *fakeNode) RecordGeneration(ctx context.Context, g int64, _ []string, le
 		return fmt.Errorf("the operation's lease doesn't hold the node's operation lock")
 	}
 	n.recorded = append(n.recorded, g)
+	n.recordedNodes = nodes
 	return nil
+}
+
+// lastRecorded are the nodes of the last generation recorded.
+func (n *fakeNode) lastRecorded() []*nodev1.GenerationNode {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.recordedNodes
 }
 
 func (n *fakeNode) AcquireLock(_ context.Context, l nodeclient.Lock, _ time.Duration) (nodeclient.Lock, error) {

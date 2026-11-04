@@ -160,7 +160,15 @@ func stopScript(name, signal string) string {
 // its request.
 func Start(t *testing.T) *Node {
 	t.Helper()
-	return start(t, nil)
+	t.Parallel()
+	return start(t, nil, nil, "node-1")
+}
+
+// StartIn starts another node of cluster's, called name, with its
+// identity issued by cluster's CA as Start's is.
+func StartIn(t *testing.T, cluster *Node, name string) *Node {
+	t.Helper()
+	return start(t, nil, cluster.CA, name)
 }
 
 // StartJoined starts a node joined to peer, as node add --join-token
@@ -169,22 +177,21 @@ func Start(t *testing.T) *Node {
 // sockets, and peer calls the node API over its tunnels.
 func StartJoined(t *testing.T, peer *TunnelPeer) *Node {
 	t.Helper()
-	return start(t, peer)
+	t.Parallel()
+	return start(t, peer, nil, "")
 }
 
-// start starts a node, joined to peer unless it is nil.
-func start(t *testing.T, peer *TunnelPeer) *Node {
+// start starts a node, joined to peer unless it is nil, and otherwise
+// called name, with an identity from ca, or a new CA if it is nil.
+func start(t *testing.T, peer *TunnelPeer, ca *identity.CA, name string) *Node {
 	t.Helper()
 	if exec.Command("docker", "info").Run() != nil {
 		t.Skip("docker doesn't work")
 	}
-	t.Parallel()
 	bin := binaries(t)
-	n := &Node{NodeName: "node-1", config: t.TempDir()}
-	// The state directory is a volume of its own, since containerd's
-	// snapshots can't be overlays on the container's overlay. The agent
-	// of a joined node rewrites the node file when it detaches, and
-	// reaches the peer by TunnelHost.
+	n := &Node{NodeName: name, CA: ca, config: t.TempDir()}
+	// The agent of a joined node rewrites the node file when it detaches,
+	// and reaches the peer by TunnelHost.
 	config := n.config + ":" + hostlayout.ConfigDir + ":ro"
 	if peer != nil {
 		config = n.config + ":" + hostlayout.ConfigDir
@@ -236,8 +243,10 @@ func start(t *testing.T, peer *TunnelPeer) *Node {
 		"chmod 755 /usr/local/bin/systemctl\n")
 	node := hostlayout.NodeConfig{Cluster: "test", Node: n.NodeName, Mode: hostlayout.ModeDirect, PrivateAddress: private}
 	if peer == nil {
-		if n.CA, err = identity.NewCA("test"); err != nil {
-			t.Fatal(err)
+		if n.CA == nil {
+			if n.CA, err = identity.NewCA("test"); err != nil {
+				t.Fatal(err)
+			}
 		}
 		request, err := exec.Command("docker", "exec", n.Name, hostlayout.Agent, "request-identity").Output()
 		if err != nil {
@@ -564,6 +573,10 @@ func (n *Node) Import(t *testing.T, img Image) {
 	n.importArchive(t, img.Name, img.Archive(t), img.Name)
 }
 
+// slowFile is the large file of every slow image, which they share and
+// only read.
+var slowFile = sync.OnceValue(func() []byte { return make([]byte, 1<<30) })
+
 // Archive is img's OCI image layout archive, as Import imports it.
 func (img Image) Archive(t *testing.T) []byte {
 	t.Helper()
@@ -598,7 +611,7 @@ func (img Image) of(program []byte) ociimage.Image {
 		files = append(files, ociimage.File{Name: "build", Mode: 0o644, Data: []byte(strconv.Itoa(img.Rebuild))})
 	}
 	if img.Slow {
-		files = append(files, ociimage.File{Name: "large", Mode: 0o644, Data: make([]byte, 1<<30)})
+		files = append(files, ociimage.File{Name: "large", Mode: 0o644, Data: slowFile()})
 	}
 	if img.Group != "" {
 		files = append(files, ociimage.File{Name: "etc/group", Mode: 0o644, Data: []byte(img.Group)})

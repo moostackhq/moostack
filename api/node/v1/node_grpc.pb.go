@@ -45,7 +45,7 @@ const (
 // Agent is the node API that the agent serves. On a node in control
 // plane mode, the agent's local socket serves only Status and Detach,
 // and refuses every other call, the cluster services' included, with
-// FAILED_PRECONDITION, so that the node is never operated in both modes.
+// FAILED_PRECONDITION.
 type AgentClient interface {
 	// Status reports the node's mode and the state of its node components.
 	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
@@ -320,7 +320,7 @@ func (c *agentClient) Detach(ctx context.Context, in *DetachRequest, opts ...grp
 // Agent is the node API that the agent serves. On a node in control
 // plane mode, the agent's local socket serves only Status and Detach,
 // and refuses every other call, the cluster services' included, with
-// FAILED_PRECONDITION, so that the node is never operated in both modes.
+// FAILED_PRECONDITION.
 type AgentServer interface {
 	// Status reports the node's mode and the state of its node components.
 	Status(context.Context, *StatusRequest) (*StatusResponse, error)

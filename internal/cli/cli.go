@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -180,17 +181,20 @@ func sshOptions(env Env) sshclient.Options {
 func nodesToDial(env Env, nodes []cluster.Node) orchestrate.Nodes {
 	names := make([]string, len(nodes))
 	byName := map[string]cluster.Node{}
+	addresses := map[string]netip.Addr{}
 	for i, n := range nodes {
 		names[i] = n.Name
 		byName[n.Name] = n
+		addresses[n.Name] = n.PrivateAddress
 	}
 	dial := env.DialNode
 	if dial == nil {
 		dial = func(ctx context.Context, n cluster.Node) (orchestrate.Node, error) { return dialSSH(ctx, env, n) }
 	}
 	return orchestrate.Nodes{
-		Names: names,
-		Dial:  func(ctx context.Context, name string) (orchestrate.Node, error) { return dial(ctx, byName[name]) },
+		Names:            names,
+		PrivateAddresses: addresses,
+		Dial:             func(ctx context.Context, name string) (orchestrate.Node, error) { return dial(ctx, byName[name]) },
 	}
 }
 
@@ -224,8 +228,7 @@ func (n sshNode) Close() error { return errors.Join(n.ssh.Close(), n.Node.Close(
 // the current directory if it has a cluster file, or else the one
 // MOOCTL_DIR names: the current directory if none does, or if the one
 // that does is empty. With MOOCTL_DIR set and no -C, it says on stderr,
-// once, which directory it is, as an exported MOOCTL_DIR may be
-// forgotten.
+// once, which directory it is.
 func clusterDir(cmd *cli.Command) string {
 	if cmd.IsSet("dir") {
 		return cmp.Or(cmd.String("dir"), ".")
@@ -427,8 +430,7 @@ func operates(env Env, version string) bool {
 }
 
 // installable fails if this mooctl doesn't operate the release pinned,
-// which an operation is to install, so that it never puts nodes on a
-// release it can't operate.
+// which an operation is to install.
 func installable(env Env, pinned string) error {
 	if operates(env, pinned) {
 		return nil
@@ -467,9 +469,8 @@ func withHint(err error) error {
 
 // operated fails if the node whose status is s runs a release that this
 // mooctl doesn't operate, with an *unoperatedError. A node whose agent is
-// a development build is on no release: development builds sit outside
-// the releases mooctl operates, so that cluster update puts a release
-// back.
+// a development build passes, and cluster update puts a release back on
+// it.
 func operated(env Env, s nodeclient.Status) error {
 	if env.Version == "" {
 		return nil

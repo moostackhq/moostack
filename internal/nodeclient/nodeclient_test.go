@@ -95,11 +95,12 @@ func TestStatusQuotesWhatTheNodeReportsThatIsntPrintable(t *testing.T) {
 				Lock:              &nodev1.Lock{Lease: "l", Holder: bad, Machine: bad, Operation: bad},
 				Components:        []*nodev1.Component{{Name: "agent", Version: bad, Build: bad, Problem: bad}},
 				Containers:        []*nodev1.ContainerStatus{{Name: bad, Image: bad, Digest: bad, Problem: bad}},
+				Membership:        &nodev1.Membership{Members: []*nodev1.Member{{Node: bad, Address: bad}}, Dropped: map[string]uint64{bad: 1}},
 			}},
 			Updater: updaterStatusOf{res: &nodev1.UpdaterStatusResponse{Updater: &nodev1.Component{Name: "updater", Version: bad}}},
 		}
 		s := n.Status(t.Context())
-		agent, updater, container := s.Components[0], s.Components[1], s.Containers[0]
+		agent, updater, container, member := s.Components[0], s.Components[1], s.Containers[0], s.Membership.Members[0]
 		for what, got := range map[string]string{
 			"the node's name": s.Nodes[1], "why the generation is unknown": s.GenerationUnknown,
 			"the lock's holder": s.Lock.Holder, "the lock's machine": s.Lock.Machine, "the lock's operation": s.Lock.Operation,
@@ -107,10 +108,14 @@ func TestStatusQuotesWhatTheNodeReportsThatIsntPrintable(t *testing.T) {
 			"the updater's version": updater.Version,
 			"the container's name":  container.Name, "the container's image": container.Image,
 			"the container's digest": container.Digest, "the container's problem": container.Problem,
+			"the member's node": member.Node, "the member's address": member.Address,
 		} {
 			if got != quoted {
 				t.Errorf("%q as %s: Status says %q, want %q", bad, what, got, quoted)
 			}
+		}
+		if s.Membership.Dropped[quoted] != 1 || len(s.Membership.Dropped) != 1 {
+			t.Errorf("%q as a reason for dropping messages: Status says %v, want it quoted", bad, s.Membership.Dropped)
 		}
 		// What is printable is left as it is.
 		if s.Nodes[0] != "node1" || s.Lock.Lease != "l" {

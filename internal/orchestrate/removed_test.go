@@ -146,7 +146,7 @@ func TestARemovedNodeIsLeftOutOfTheOperation(t *testing.T) {
 	if got := f["node2"].recorded; len(got) != 0 {
 		t.Errorf("the removed node2 recorded %v", got)
 	}
-	if got := f["node1"].recordedNodes; !slices.Equal(got, []string{"node1"}) {
+	if got := recorded(f["node1"].recordedNodes); !slices.Equal(got, []string{"node1 at " + privateAddress("node1").String()}) {
 		t.Errorf("node1 recorded the nodes %v, want node1 alone", got)
 	}
 }
