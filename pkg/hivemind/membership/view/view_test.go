@@ -118,11 +118,19 @@ func TestCountsMatchTheEntries(t *testing.T) {
 		now := t0
 		for range 200 {
 			now = now.Add(time.Duration(r.IntN(10)) * time.Second)
-			if r.IntN(10) == 0 {
+			switch r.IntN(10) {
+			case 0:
 				v.Forget(now, 30*time.Second, 0)
-			} else {
+			case 1:
+				v.Drop(now, member.ID(rune('a'+r.IntN(8))), time.Duration(r.IntN(2))*time.Minute)
+			case 2:
+				v.Lift(member.ID(rune('a' + r.IntN(8))))
+			default:
 				id := member.ID(rune('a' + r.IntN(8)))
 				v.Apply(now, up(id, r.Uint64N(4), member.State(r.IntN(4))))
+			}
+			if err := v.Check(); err != nil {
+				t.Fatal(err)
 			}
 			live, next := 0, time.Time{}
 			for _, m := range v.All() {
@@ -442,5 +450,137 @@ func TestForgetOldestOfOneLeavesNoneDue(t *testing.T) {
 	}
 	if _, ok := v.ForgetOldest(t0.Add(2 * time.Second)); ok {
 		t.Fatal("forgot a second time with nobody gone")
+	}
+}
+
+// A dropped member, alive or not, is out of the view at once, and its held
+// grave ignores every entry of it, newer ones and tombstones included,
+// until it goes; its entry is drawn for no healing probe.
+func TestADroppedMemberStaysOutUntilItsGraveGoes(t *testing.T) {
+	for _, st := range []member.State{member.Alive, member.Suspect, member.Dead} {
+		v := New(member.Member{ID: "self"})
+		v.Apply(t0, up("x", 4, member.Alive))
+		v.Apply(t0, up("x", 4, st))
+		m, ok := v.Drop(t0, "x", time.Hour)
+		if !ok || m.ID != "x" || m.Incarnation != 4 || m.State != st {
+			t.Fatalf("%v: Drop = %v, %v", st, m, ok)
+		}
+		if _, ok := v.Get("x"); ok || v.Live() != 1 {
+			t.Fatalf("%v: still in the view, %d live", st, v.Live())
+		}
+		if _, ok := v.At("x"); ok {
+			t.Fatalf("%v: still found at its address", st)
+		}
+		for _, u := range []msg.Update{up("x", 4, member.Alive), up("x", 5, member.Alive), up("x", member.MaxIncarnation, member.Alive), up("x", 9, member.Dead)} {
+			if v.Admits(u.Member) {
+				t.Fatalf("%v: admits %v", st, u.Member)
+			}
+			if got := v.Apply(t0.Add(59*time.Minute), u); got != Ignored {
+				t.Fatalf("%v: Apply(%v) = %v, want Ignored", st, u.Member, got)
+			}
+		}
+		if _, ok := v.Grave(rand.New(rand.NewPCG(1, 1))); ok {
+			t.Fatalf("%v: a held grave drawn for healing", st)
+		}
+		if err := v.Check(); err != nil {
+			t.Fatalf("%v: %v", st, err)
+		}
+		v.Forget(t0.Add(time.Hour), time.Minute, time.Hour)
+		if _, ok := v.Buried("x"); ok {
+			t.Fatalf("%v: the grave outlived its time", st)
+		}
+		if got := v.Apply(t0.Add(time.Hour), up("x", 4, member.Alive)); got != Changed {
+			t.Fatalf("%v: after the grave went: %v", st, got)
+		}
+	}
+}
+
+// Dropping a buried member holds its grave from then on, and dropping a
+// member the view keeps nothing of holds a grave of it; dropping self or
+// the empty ID does nothing.
+func TestDropHoldsAGraveAndLeavesSelf(t *testing.T) {
+	v := New(member.Member{ID: "self"})
+	v.Apply(t0, up("x", 1, member.Alive))
+	v.Apply(t0, up("x", 1, member.Dead))
+	v.Forget(t0.Add(time.Minute), time.Minute, time.Hour)
+	if _, ok := v.Drop(t0.Add(30*time.Minute), "x", time.Hour); ok {
+		t.Fatal("dropped a buried member again")
+	}
+	if got := v.Apply(t0.Add(80*time.Minute), up("x", 2, member.Alive)); got != Ignored {
+		t.Fatalf("a newer entry of a held grave: %v", got)
+	}
+	v.Forget(t0.Add(89*time.Minute), time.Minute, time.Hour)
+	if _, ok := v.Buried("x"); !ok {
+		t.Fatal("the grave didn't last an hour from the drop")
+	}
+	if _, ok := v.Drop(t0, "self", time.Hour); ok || v.Self().ID != "self" {
+		t.Fatal("dropped self")
+	}
+	if _, ok := v.Drop(t0, "nobody", time.Hour); ok {
+		t.Fatal("dropped a stranger out of the view")
+	}
+	if got := v.Apply(t0, up("nobody", 1, member.Alive)); got != Ignored {
+		t.Fatalf("a dropped stranger's entry: %v", got)
+	}
+	if _, ok := v.Drop(t0, "", time.Hour); ok || v.graves[""].held {
+		t.Fatal("dropped the empty ID")
+	}
+	if err := v.Check(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Held graves stay past maxGraves: graves dug past the cap, however many,
+// push out the oldest graves that aren't held, never a held one.
+func TestHeldGravesOutlastTheCap(t *testing.T) {
+	v := New(member.Member{ID: "self"})
+	v.Apply(t0, up("x", 1, member.Alive))
+	v.Drop(t0, "x", time.Hour)
+	for i := range maxGraves + 10 {
+		id := member.ID(fmt.Sprintf("f%05d", i))
+		v.Apply(t0, up(id, 1, member.Alive))
+		v.Apply(t0, up(id, 1, member.Dead))
+		v.ForgetOldest(t0)
+	}
+	if _, ok := v.Buried("x"); !ok {
+		t.Fatal("the held grave went over the cap")
+	}
+	if got := v.Apply(t0.Add(time.Minute), up("x", 9, member.Alive)); got != Ignored {
+		t.Fatalf("x after the flood: %v", got)
+	}
+	if _, ok := v.Buried("f00009"); ok {
+		t.Fatal("a grave not held stayed past the cap")
+	}
+	if _, ok := v.Buried("f00010"); !ok {
+		t.Fatal("the held grave took the room of a grave not held")
+	}
+	if err := v.Check(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Lift ends a held grave: the member's entries are taken again. A grave
+// that isn't held, and a member with no grave, are left as they are.
+func TestLiftEndsAHold(t *testing.T) {
+	v := New(member.Member{ID: "self"})
+	v.Apply(t0, up("x", 1, member.Alive))
+	v.Drop(t0, "x", time.Hour)
+	v.Lift("x")
+	if v.graves["x"].held || len(v.Unburied()) != 1 {
+		t.Fatal("still held, or not reported unburied")
+	}
+	if got := v.Apply(t0, up("x", 1, member.Alive)); got != Changed {
+		t.Fatalf("x after the lift: %v", got)
+	}
+	v.Apply(t0, up("y", 1, member.Alive))
+	v.Apply(t0, up("y", 1, member.Dead))
+	v.Forget(t0.Add(time.Minute), time.Minute, time.Hour)
+	v.Lift("y")
+	v.Lift("nobody")
+	if _, ok := v.Buried("y"); !ok {
+		t.Fatal("lifted a grave that wasn't held")
+	}
+	if err := v.Check(); err != nil {
+		t.Fatal(err)
 	}
 }

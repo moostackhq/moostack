@@ -43,7 +43,8 @@ type Members interface {
 	Get(member.ID) (member.Member, bool)
 	// Random returns a member pick accepts, drawn at random.
 	Random(rng *rand.Rand, tries int, pick func(member.Member) bool) (member.Member, bool)
-	// Grave returns a random forgotten member's last entry.
+	// Grave returns a random forgotten member's last entry, one the view
+	// lets healing probes reach.
 	Grave(rng *rand.Rand) (member.Member, bool)
 }
 
@@ -83,7 +84,7 @@ type probe struct {
 	nacked   map[member.ID]bool
 	acked    bool
 	noSample bool // the node was paused during it: no round-trip sample
-	gone     bool // a healing probe of a gone member: no failure if unanswered
+	gone     bool // a healing probe of a gone member, or one Abandon ended: no verdict either way, no helpers
 }
 
 type relay struct {
@@ -299,7 +300,6 @@ func (d *Detector) sample(id member.ID, rtt time.Duration) {
 	d.rtt[id] = rtt
 }
 
-// Nack takes a helper's nack for the current probe.
 // Nack takes a helper's nack for the current probe: each helper asked
 // counts once, however many copies of its nack arrive.
 func (d *Detector) Nack(from member.ID, seq uint32) {
@@ -317,6 +317,15 @@ func (d *Detector) Measured() []member.ID { return slices.Sorted(maps.Keys(d.rtt
 
 // Forget drops what the detector keeps of a member the view forgot.
 func (d *Detector) Forget(id member.ID) { delete(d.rtt, id) }
+
+// Abandon makes the current probe of id, if there is one, count as
+// neither a failure nor a success: it asks no helpers from then on and
+// runs out its period. A direct ack still gives a round-trip sample.
+func (d *Detector) Abandon(id member.ID) {
+	if p := d.cur; p != nil && p.target.ID == id {
+		p.gone = true
+	}
+}
 
 // PingReq does a helper's part: ping the target for the asker, forward its
 // ack, and nack if none comes within the nack timeout. scale is the node's

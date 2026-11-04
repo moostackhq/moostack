@@ -16,6 +16,7 @@ import (
 	quicgo "github.com/quic-go/quic-go"
 
 	"github.com/moostackhq/moostack/pkg/hivemind/membership/transport"
+	"github.com/moostackhq/moostack/pkg/hivemind/membership/transport/transporttest"
 
 	. "github.com/moostackhq/moostack/pkg/hivemind/membership/transport/quic"
 )
@@ -1391,4 +1392,12 @@ func TestASentBufferCanBeReusedAtOnce(t *testing.T) {
 			t.Fatalf("stream %v: got %q, %v; want what was sent, \"first\"", stream, m.Data, ok)
 		}
 	}
+}
+
+// The QUIC transport keeps the port's promises.
+func TestThePortContract(t *testing.T) {
+	transporttest.Run(t, func(t *testing.T) transporttest.Pair {
+		c := newCluster(t)
+		return transporttest.Pair{A: listen(t, c.Node("a")), B: listen(t, c.Node("b"))}
+	})
 }

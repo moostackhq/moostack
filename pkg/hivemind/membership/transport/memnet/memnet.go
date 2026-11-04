@@ -55,9 +55,9 @@ func (n *Network) Cut(cut func(from, to string) bool) {
 func (n *Network) Listen(addr string) *Endpoint { return n.ListenAs(addr, "") }
 
 // ListenAs returns the endpoint at addr whose messages carry peer as the
-// identity of their sender (transport.Message.Peer), and that takes no
-// message meant for another peer (transport.Dest.Peer), as an
-// authenticating transport's do.
+// identity of their sender (transport.Message.Peer), and that takes only
+// messages meant for peer (transport.Dest.Peer), as an authenticating
+// transport's do.
 func (n *Network) ListenAs(addr, peer string) *Endpoint {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -78,8 +78,8 @@ func (n *Network) send(from, peer string, dest transport.Dest, b []byte, stream 
 	n.mu.Lock()
 	dst, ok := n.endpoints[to]
 	// An endpoint that listens as one peer doesn't take what is meant for
-	// another.
-	misdirected := ok && dest.Peer != "" && dst.peer != "" && dst.peer != dest.Peer
+	// another, or for nobody.
+	misdirected := ok && dst.peer != "" && dst.peer != dest.Peer
 	drop := !ok || misdirected || n.cut != nil && n.cut(from, to) || !stream && n.loss > 0 && n.rng.Float64() < n.loss
 	if drop {
 		n.lost++
@@ -114,6 +114,9 @@ type Endpoint struct {
 	in   chan transport.Message
 	once sync.Once
 	done chan struct{}
+	// mu is held to read closed and send on in; Close takes it to close in.
+	mu     sync.RWMutex
+	closed bool
 }
 
 var _ transport.Transport = (*Endpoint)(nil)
@@ -121,6 +124,11 @@ var _ transport.Transport = (*Endpoint)(nil)
 // deliver hands m to the endpoint. A full buffer drops a packet; a stream
 // waits until there is room or the endpoint closes.
 func (e *Endpoint) deliver(m transport.Message) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed {
+		return
+	}
 	if m.Stream {
 		select {
 		case <-e.done:
@@ -140,7 +148,8 @@ func (e *Endpoint) SendPacket(to transport.Dest, b []byte) { e.net.send(e.addr, 
 func (e *Endpoint) SendStream(to transport.Dest, b []byte) { e.net.send(e.addr, e.peer, to, b, true) }
 func (e *Endpoint) Receive() <-chan transport.Message      { return e.in }
 
-// Close takes the endpoint off the network; what is sent to it is dropped.
+// Close takes the endpoint off the network and closes Receive; what is
+// sent to it is dropped.
 func (e *Endpoint) Close() error {
 	e.once.Do(func() {
 		e.net.mu.Lock()
@@ -149,6 +158,10 @@ func (e *Endpoint) Close() error {
 		}
 		e.net.mu.Unlock()
 		close(e.done)
+		e.mu.Lock()
+		e.closed = true
+		close(e.in)
+		e.mu.Unlock()
 	})
 	return nil
 }

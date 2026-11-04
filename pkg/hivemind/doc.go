@@ -10,12 +10,12 @@
 // identities, admits only the cluster's members and refuses removed ones,
 // tells the node which member sent each message (transport.Message's
 // Peer), and hands each message only to the member it is meant for
-// (transport.Dest), not to whoever answers at the member's address, and
-// drops a message for a seed known only by its address. The runtime drops a
-// message that carries no proven peer unless it is told its transport
-// proves nobody (runtime.Options.Unauthenticated). A transport that proves
-// nobody, so allowed, leaves everything below open to anyone
-// who can reach the node, not only to members.
+// (transport.Dest), not to whoever answers at the member's address. Every
+// message a node sends names its member, seeds included (runtime.Join).
+// The runtime drops a message that carries no proven peer unless it is
+// told its transport proves nobody (runtime.Options.Unauthenticated). A
+// transport that proves nobody, so allowed, leaves everything below open
+// to anyone who can reach the node, not only to members.
 //
 // What a node enforces, whoever sends:
 //
@@ -24,6 +24,9 @@
 //     A member can't pose as the sender of a message it didn't send; what
 //     it relays of other members, in gossip and syncs, is another matter,
 //     below.
+//   - A member forgotten (runtime.Forget) is out of its view until
+//     GraveTimeout or until runtime.Join names it as a seed: every entry
+//     of it, at any incarnation and from anyone, is ignored until then.
 //   - Its own entry is its own to the end: an entry saying it is suspect,
 //     dead or left, at its incarnation or above, or alive at its
 //     incarnation but different, makes it raise its incarnation and gossip
@@ -33,7 +36,8 @@
 //     own view has alive, at the addresses it has for them.
 //   - Bounds: incarnations within the clock in milliseconds plus 2^32, IDs
 //     and addresses of at most 255 bytes, at most MaxMembers members, a
-//     capped number of graves and of indirect probes for others, and
+//     capped number of graves, beside those Forget holds, and of indirect
+//     probes for others, and
 //     packets and syncs within the sizes and counts the codec reads.
 //
 // What a node believes without proof, from any member it admits:

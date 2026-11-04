@@ -27,7 +27,7 @@ type Config struct {
 type Scheduler struct {
 	cfg     Config
 	rng     *rand.Rand
-	seeds   []string
+	seeds   []member.Member
 	next    time.Time // the next periodic sync
 	retryAt time.Time // the next join attempt; zero when not joining
 	backoff time.Duration
@@ -53,19 +53,24 @@ func New(cfg Config, rng *rand.Rand, now time.Time) *Scheduler {
 	return &Scheduler{cfg: cfg, rng: rng, next: now.Add(first)}
 }
 
-// Join keeps the seeds, other than self, and returns the addresses to sync
-// with now. With none, there is nothing to join: a join still trying
-// earlier seeds ends.
-func (s *Scheduler) Join(now time.Time, self string, seeds []string) []string {
-	s.seeds = slices.DeleteFunc(slices.Clone(seeds), func(a string) bool { return a == self })
+// Join keeps the seeds, each a member's ID and address, other than those
+// with self's ID or address, and returns the seeds to sync with now. No
+// further sync is brought forward for an earlier join. With none, a join
+// still trying earlier seeds ends.
+func (s *Scheduler) Join(now time.Time, self member.Member, seeds []member.Member) []member.Member {
+	s.seeds = slices.DeleteFunc(slices.Clone(seeds), func(m member.Member) bool { return m.ID == self.ID || m.Addr == self.Addr })
+	s.catchUp = 0
 	if len(s.seeds) == 0 {
-		s.retryAt, s.backoff, s.catchUp = time.Time{}, 0, 0
+		s.endJoin()
 		return nil
 	}
 	s.backoff = s.cfg.RetryEvery
 	s.retryAt = now.Add(s.jitter(s.backoff))
 	return slices.Clone(s.seeds)
 }
+
+// endJoin stops trying the seeds.
+func (s *Scheduler) endJoin() { s.retryAt, s.backoff = time.Time{}, 0 }
 
 // jitter is d give or take half.
 func (s *Scheduler) jitter(d time.Duration) time.Duration {
@@ -75,14 +80,14 @@ func (s *Scheduler) jitter(d time.Duration) time.Duration {
 	return d/2 + time.Duration(s.rng.Int64N(int64(d)))
 }
 
-// Tick returns the addresses to sync with at now. others says whether the
+// Tick returns the members to sync with at now. others says whether the
 // node knows another live member, and pick draws one at random. Without
 // any, a joining node tries its seeds again. Once it knows one, its join
 // is done, and it catches up: its next sync comes within RetryEvery or so
 // instead of Every, and so does the one after each sync that taught it of
 // members it didn't know (see Learned), maxCatchUp times at most.
-func (s *Scheduler) Tick(now time.Time, others bool, pick func() (member.Member, bool)) []string {
-	var out []string
+func (s *Scheduler) Tick(now time.Time, others bool, pick func() (member.Member, bool)) []member.Member {
+	var out []member.Member
 	if !s.retryAt.IsZero() {
 		if others {
 			s.retryAt = time.Time{}
@@ -103,7 +108,7 @@ func (s *Scheduler) Tick(now time.Time, others bool, pick func() (member.Member,
 		return append(out, s.seeds[s.rng.IntN(len(s.seeds))])
 	}
 	if m, ok := pick(); ok {
-		out = append(out, m.Addr)
+		out = append(out, m)
 	}
 	return out
 }
@@ -119,7 +124,7 @@ func (s *Scheduler) soon(now time.Time) {
 // Learned tells the scheduler that a sync taught the node of members it
 // didn't know. Soon after a join, that brings the next sync forward.
 func (s *Scheduler) Learned(now time.Time) {
-	if s.catchUp > 0 && s.retryAt.IsZero() {
+	if s.catchUp > 0 {
 		s.catchUp--
 		s.soon(now)
 	}
@@ -147,7 +152,24 @@ func (s *Scheduler) Shift(d time.Duration) {
 	}
 }
 
-func (s *Scheduler) IsSeed(addr string) bool { return slices.Contains(s.seeds, addr) }
+// Seed returns the seed at addr, if there is one: the one named id, or
+// with id empty, the first.
+func (s *Scheduler) Seed(id member.ID, addr string) (member.Member, bool) {
+	i := slices.IndexFunc(s.seeds, func(m member.Member) bool { return m.Addr == addr && (id == "" || m.ID == id) })
+	if i < 0 {
+		return member.Member{}, false
+	}
+	return s.seeds[i], true
+}
+
+// Forget drops the seed id, if there is one. With no seeds left, a join
+// still trying them ends; the syncs soon after one still come.
+func (s *Scheduler) Forget(id member.ID) {
+	s.seeds = slices.DeleteFunc(s.seeds, func(m member.Member) bool { return m.ID == id })
+	if len(s.seeds) == 0 {
+		s.endJoin()
+	}
+}
 
 // Joining reports whether the node is still trying its seeds.
 func (s *Scheduler) Joining() bool { return !s.retryAt.IsZero() }

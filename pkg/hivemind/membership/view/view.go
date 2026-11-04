@@ -25,10 +25,11 @@ const (
 	Changed
 	// Confirmed: the same suspicion, raised by another member.
 	Confirmed
-	// Ignored: an entry saying a member the view doesn't know is gone, or
-	// an entry of a forgotten member no newer than its grave. A node that
-	// has forgotten a member doesn't take it back from one that hasn't yet,
-	// nor from one that slept through its death.
+	// Ignored: an entry saying a member the view doesn't know is gone, an
+	// entry of a forgotten member no newer than its grave, or any entry of
+	// a member whose grave is held. A node that has forgotten a member
+	// doesn't take it back from one that hasn't yet, nor from one that
+	// slept through its death.
 	Ignored
 	// Reburied: a newer entry saying a forgotten member is gone. Its grave
 	// took it, and the caller passes it on.
@@ -40,6 +41,8 @@ type grave struct {
 	member.Member
 	at time.Time // when it was forgotten
 	n  uint64    // the order it was dug in
+	// held: every entry of the member is ignored, at any incarnation (Drop).
+	held bool
 }
 
 // digging is a grave in the order graves were dug. One whose grave has
@@ -49,7 +52,8 @@ type digging struct {
 	n  uint64
 }
 
-// maxGraves caps the graves a view keeps beyond its members.
+// maxGraves caps the graves a view keeps beyond its members, held graves
+// aside.
 const maxGraves = 10000
 
 type entry struct {
@@ -64,10 +68,14 @@ type View struct {
 	ids     []member.ID // sorted
 	byAddr  map[string][]member.ID
 	graves  map[member.ID]grave
-	order   []digging // oldest first
+	order   []digging // oldest first, held graves aside
 	dug     uint64
-	// unburied are the members whose graves went, expired or over the
-	// cap, since Unburied was last called.
+	held    int // graves held
+	// firstDug is no later than when any grave was dug; zero when it
+	// needs finding again.
+	firstDug time.Time
+	// unburied are the members whose graves went: expired, over the cap
+	// or lifted, since Unburied was last called.
 	unburied []member.ID
 	live     int // members not gone, self included
 	gone     int
@@ -156,7 +164,7 @@ func (v *View) Apply(now time.Time, u msg.Update) Outcome {
 	m := u.Member
 	e, ok := v.members[m.ID]
 	if g, buried := v.graves[m.ID]; !ok && buried {
-		if !member.Overrides(m, g.Member) {
+		if g.held || !member.Overrides(m, g.Member) {
 			return Ignored
 		}
 		if m.State.Gone() {
@@ -231,14 +239,9 @@ func (v *View) Common() member.Caps {
 // Forget removes the members gone for at least after, and returns them.
 // Each leaves a grave, its last entry, kept for graves: entries of the
 // member no newer than it are ignored, and healing probes can still reach
-// it.
+// it. It expires graves first, as Expire does.
 func (v *View) Forget(now time.Time, after, graves time.Duration) []member.Member {
-	for id, g := range v.graves {
-		if !now.Before(g.at.Add(graves)) {
-			delete(v.graves, id)
-			v.unburied = append(v.unburied, id)
-		}
-	}
+	v.Expire(now, graves)
 	if next := v.NextForget(after); next.IsZero() || now.Before(next) {
 		return nil
 	}
@@ -247,27 +250,107 @@ func (v *View) Forget(now time.Time, after, graves time.Duration) []member.Membe
 	for _, id := range slices.Clone(v.ids) {
 		e := v.members[id]
 		if id != v.self && e.State.Gone() && !now.Before(e.gone.Add(after)) {
-			out = append(out, e.Member)
-			v.gone--
-			v.unindex(e.Addr, id)
-			delete(v.members, id)
-			i, _ := slices.BinarySearch(v.ids, id)
-			v.ids = slices.Delete(v.ids, i, i+1)
+			out = append(out, v.remove(id))
 			if graves > 0 {
-				v.bury(e.Member, now)
+				v.bury(e.Member, now, false)
 			}
 		}
 	}
 	return out
 }
 
-// bury keeps m as the grave of a member forgotten at now. Beyond
-// maxGraves, the graves dug first go, whichever way they were dug.
-func (v *View) bury(m member.Member, now time.Time) {
+// Expire digs up the graves, held or not, dug at least graves before now,
+// and reports them in Unburied.
+func (v *View) Expire(now time.Time, graves time.Duration) {
+	if len(v.graves) == 0 || !v.firstDug.IsZero() && now.Before(v.firstDug.Add(graves)) {
+		return
+	}
+	v.firstDug = time.Time{}
+	for id, g := range v.graves {
+		if !now.Before(g.at.Add(graves)) {
+			v.unbury(id)
+		} else if v.firstDug.IsZero() || g.at.Before(v.firstDug) {
+			v.firstDug = g.at
+		}
+	}
+}
+
+// remove takes id, a member other than self, out of the view, and returns
+// its entry.
+func (v *View) remove(id member.ID) member.Member {
+	e := v.members[id]
+	if e.State.Gone() {
+		v.gone--
+		v.firstGone = time.Time{}
+	} else {
+		v.live--
+	}
+	v.unindex(e.Addr, id)
+	delete(v.members, id)
+	i, _ := slices.BinarySearch(v.ids, id)
+	v.ids = slices.Delete(v.ids, i, i+1)
+	return e.Member
+}
+
+// Drop forgets id at now, whatever its state, and holds its grave for
+// graves: every entry of it, at any incarnation, is ignored until the
+// grave goes or Lift lifts it. A member already buried has its grave held
+// from now on, and one the view keeps nothing of gets a held grave of its
+// own. With graves 0, Drop digs and holds no grave. Self and the empty ID
+// are never dropped. It returns the entry it took out of the view, if
+// there was one.
+func (v *View) Drop(now time.Time, id member.ID, graves time.Duration) (member.Member, bool) {
+	if id == v.self || id == "" {
+		return member.Member{}, false
+	}
+	m, ok := member.Member{ID: id}, false
+	if g, buried := v.graves[id]; buried {
+		m = g.Member
+	} else if _, known := v.members[id]; known {
+		m, ok = v.remove(id), true
+	}
+	if graves > 0 {
+		v.bury(m, now, true)
+	}
+	return m, ok
+}
+
+// Lift ends the hold of id's grave, if it is held: the grave goes, and
+// entries of id are taken again.
+func (v *View) Lift(id member.ID) {
+	if v.graves[id].held {
+		v.unbury(id)
+	}
+}
+
+// unbury removes id's grave, and reports it in Unburied.
+func (v *View) unbury(id member.ID) {
+	if v.graves[id].held {
+		v.held--
+	}
+	delete(v.graves, id)
+	v.unburied = append(v.unburied, id)
+}
+
+// bury keeps m as the grave of a member forgotten at now, held if held.
+// Beyond maxGraves graves that aren't held, the ones dug first go,
+// whichever way they were dug; held graves go only when they expire or are
+// lifted.
+func (v *View) bury(m member.Member, now time.Time, held bool) {
 	v.dug++
-	v.graves[m.ID] = grave{Member: m, at: now, n: v.dug}
-	v.order = append(v.order, digging{id: m.ID, n: v.dug})
-	for len(v.graves) > maxGraves {
+	if g, ok := v.graves[m.ID]; ok && g.held {
+		v.held--
+	}
+	v.graves[m.ID] = grave{Member: m, at: now, n: v.dug, held: held}
+	if len(v.graves) == 1 || !v.firstDug.IsZero() && now.Before(v.firstDug) {
+		v.firstDug = now
+	}
+	if held {
+		v.held++
+	} else {
+		v.order = append(v.order, digging{id: m.ID, n: v.dug})
+	}
+	for len(v.graves)-v.held > maxGraves {
 		d := v.order[0]
 		v.order = v.order[1:]
 		if g, ok := v.graves[d.id]; ok && g.n == d.n {
@@ -275,7 +358,7 @@ func (v *View) bury(m member.Member, now time.Time) {
 			v.unburied = append(v.unburied, d.id)
 		}
 	}
-	if len(v.order) > 2*len(v.graves)+64 {
+	if len(v.order) > 2*(len(v.graves)-v.held)+64 {
 		v.order = slices.DeleteFunc(v.order, func(d digging) bool {
 			g, ok := v.graves[d.id]
 			return !ok || g.n != d.n
@@ -284,13 +367,13 @@ func (v *View) bury(m member.Member, now time.Time) {
 }
 
 // Admits reports whether Apply would take m as a new member: m is unknown,
-// not gone, and newer than any grave of it.
+// not gone, and newer than any grave of it, which isn't held.
 func (v *View) Admits(m member.Member) bool {
 	if _, ok := v.members[m.ID]; ok || m.State.Gone() {
 		return false
 	}
 	g, buried := v.graves[m.ID]
-	return !buried || member.Overrides(m, g.Member)
+	return !buried || !g.held && member.Overrides(m, g.Member)
 }
 
 // ForgetOldest forgets, at now, the member gone longest, to make room for
@@ -306,28 +389,25 @@ func (v *View) ForgetOldest(now time.Time) (member.Member, bool) {
 			oldest = id
 		}
 	}
-	e := v.members[oldest]
-	v.gone--
-	v.firstGone = time.Time{}
-	v.unindex(e.Addr, oldest)
-	delete(v.members, oldest)
-	i, _ := slices.BinarySearch(v.ids, oldest)
-	v.ids = slices.Delete(v.ids, i, i+1)
-	v.bury(e.Member, now)
-	return e.Member, true
+	m := v.remove(oldest)
+	v.bury(m, now, false)
+	return m, true
 }
 
-// Unburied returns the members whose graves went, expired or over the
-// cap, since the last call: nothing is kept of them any more.
+// Unburied returns the members whose graves went: expired, over the cap
+// or lifted, since the last call; some may have been taken back or buried
+// again since.
 func (v *View) Unburied() []member.ID {
 	out := v.unburied
 	v.unburied = nil
 	return out
 }
 
-// Check reports a broken invariant of the view: the sorted IDs, the address index, the counts of live and
-// gone members, and the graves, capped, gone, of no member in the view,
-// and each in the order dug once.
+// Check reports a broken invariant of the view: the sorted IDs, the
+// address index, the counts of live and gone members, and the graves: none
+// of a member in the view, none dug before firstDug, those not held within
+// maxGraves, gone and in the order dug once, and the held ones counted and
+// not in that order.
 func (v *View) Check() error {
 	if len(v.ids) != len(v.members) || !slices.IsSorted(v.ids) {
 		return fmt.Errorf("view: %d IDs, sorted %v, for %d members", len(v.ids), slices.IsSorted(v.ids), len(v.members))
@@ -371,8 +451,20 @@ func (v *View) Check() error {
 	if n != indexed {
 		return fmt.Errorf("view: %d indexed, %d members with addresses", n, indexed)
 	}
-	if len(v.graves) > maxGraves {
-		return fmt.Errorf("view: %d graves, over %d", len(v.graves), maxGraves)
+	held := 0
+	for id, g := range v.graves {
+		if !v.firstDug.IsZero() && g.at.Before(v.firstDug) {
+			return fmt.Errorf("view: the grave of %s was dug at %v, before the first, %v", id, g.at, v.firstDug)
+		}
+		if g.held {
+			held++
+		}
+	}
+	if held != v.held {
+		return fmt.Errorf("view: %d graves held, counted %d", held, v.held)
+	}
+	if len(v.graves)-held > maxGraves {
+		return fmt.Errorf("view: %d graves not held, over %d", len(v.graves)-held, maxGraves)
 	}
 	dug := map[member.ID]int{}
 	for _, d := range v.order {
@@ -381,30 +473,38 @@ func (v *View) Check() error {
 		}
 	}
 	for id, g := range v.graves {
-		if !g.State.Gone() {
+		if !g.State.Gone() && !g.held {
 			return fmt.Errorf("view: the grave of %s holds a %v entry", id, g.State)
 		}
-		if dug[id] != 1 {
-			return fmt.Errorf("view: the grave of %s is in the order dug %d times", id, dug[id])
+		want := 1
+		if g.held {
+			want = 0
+		}
+		if dug[id] != want {
+			return fmt.Errorf("view: the grave of %s, held %v, is in the order dug %d times", id, g.held, dug[id])
 		}
 	}
 	return nil
 }
 
-// Grave returns a random forgotten member's last entry.
+// Grave returns a random forgotten member's last entry, of a grave that
+// isn't held.
 func (v *View) Grave(rng *rand.Rand) (member.Member, bool) {
-	if len(v.graves) == 0 {
-		return member.Member{}, false
-	}
 	ids := make([]member.ID, 0, len(v.graves))
-	for id := range v.graves {
-		ids = append(ids, id)
+	for id, g := range v.graves {
+		if !g.held {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return member.Member{}, false
 	}
 	slices.Sort(ids)
 	return v.graves[ids[rng.IntN(len(ids))]].Member, true
 }
 
-// Buried returns the last entry of a forgotten member.
+// Buried returns the last entry of a forgotten member: only its ID for a
+// member Drop held a grave of without knowing it.
 func (v *View) Buried(id member.ID) (member.Member, bool) {
 	g, ok := v.graves[id]
 	return g.Member, ok

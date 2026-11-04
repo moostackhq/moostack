@@ -162,7 +162,8 @@ func (c Config) MinPacket(sz gossip.Sizer) int {
 	return most
 }
 
-// Input is what Step takes: Tick, Receive, ReceiveSync, Join or Leave.
+// Input is what Step takes: Tick, Receive, ReceiveSync, Join, Leave,
+// Forget or Unreadable.
 type Input interface{ input() }
 
 // Tick is a wake-up the node asked for.
@@ -184,9 +185,26 @@ type ReceiveSync struct {
 	Sync msg.Sync
 }
 
-// Join contacts the seeds, given by address, and keeps them for the
-// periodic seed syncs.
-type Join struct{ Seeds []string }
+// Join contacts the seeds and keeps them for the periodic seed syncs, and
+// lifts the hold Forget put on each seed's grave. A seed with no ID or no
+// address, or with the node's own ID or address, is skipped.
+type Join struct{ Seeds []Seed }
+
+// Seed is a member to join through: its ID and its address.
+type Seed struct {
+	ID   member.ID
+	Addr string
+}
+
+// Forget removes the member ID from the view at once, reports it in
+// Result.Forgotten and holds its grave for GraveTimeout: until then, or
+// until a Join names it as a seed, the node ignores every entry of it, at
+// any incarnation, probes it no more, and it is no longer a seed. A probe
+// of it under way runs out its period with no verdict. A member already
+// buried, or one the node keeps nothing of, gets a held grave too, and
+// isn't reported. Forgetting the node itself, or the empty ID, does
+// nothing.
+type Forget struct{ ID member.ID }
 
 // Leave tells the cluster the node is leaving. It stops probing.
 type Leave struct{}
@@ -205,6 +223,7 @@ func (Receive) input()     {}
 func (ReceiveSync) input() {}
 func (Join) input()        {}
 func (Leave) input()       {}
+func (Forget) input()      {}
 func (Unreadable) input()  {}
 
 // Packet is a packet to send, in wire version Version.
@@ -218,8 +237,7 @@ type Packet struct {
 // Sync is a whole view to send on a stream, in wire version Version.
 //
 // To is the member the node means it for, whose identity an authenticating
-// transport checks at Addr (transport.Dest), or empty for a seed the node
-// knows only by its address.
+// transport checks at Addr (transport.Dest).
 type Sync struct {
 	To      member.ID
 	Addr    string
@@ -259,9 +277,12 @@ type Event struct {
 
 // Result is what one Step asks for.
 type Result struct {
-	Packets   []Packet
-	Syncs     []Sync
-	Changes   []member.Member // entries of other members that changed
+	Packets []Packet
+	Syncs   []Sync
+	Changes []member.Member // entries of other members that changed
+	// Forgotten are the members the step forgot that are out of the view at
+	// its end, each once, with the entry it was last forgotten at; one of
+	// them changed in the step changed before it was last forgotten.
 	Forgotten []member.Member
 	Events    []Event
 	// Wake is when to call Step with a Tick next; the zero time when the

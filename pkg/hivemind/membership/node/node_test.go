@@ -75,7 +75,7 @@ func newNet(t *testing.T, n int, edit func(i int, c *node.Config)) *testnet {
 
 func (tn *testnet) joinAll() {
 	for _, a := range tn.addrs[1:] {
-		tn.step(a, node.Join{Seeds: []string{tn.addrs[0]}})
+		tn.step(a, node.Join{Seeds: []node.Seed{seed(tn.addrs[0])}})
 	}
 }
 
@@ -95,6 +95,7 @@ func (tn *testnet) step(addr string, in node.Input) {
 		tn.events = append(tn.events, fmt.Sprintf("%s %s %d %s %s %d", tn.now.Sub(t0), addr, e.Kind, e.Member, e.By, e.Value))
 	}
 	for _, p := range r.Packets {
+		tn.pinned(addr, p.To, p.Addr)
 		b, err := wire.EncodePacket(p.Packet)
 		if err != nil {
 			tn.t.Fatal(err)
@@ -111,6 +112,7 @@ func (tn *testnet) step(addr string, in node.Input) {
 		tn.send(addr, p.Addr, b, false)
 	}
 	for _, s := range r.Syncs {
+		tn.pinned(addr, s.To, s.Addr)
 		if s.Sync.Reply {
 			tn.started[addr]++
 		}
@@ -119,6 +121,15 @@ func (tn *testnet) step(addr string, in node.Input) {
 			tn.t.Fatalf("%s: %v", addr, err)
 		}
 		tn.send(addr, s.Addr, b, true)
+	}
+}
+
+// pinned fails the test for a message that names no member, or a member
+// other than the node at its address: in the testnet a node's ID is its
+// address.
+func (tn *testnet) pinned(from string, to member.ID, addr string) {
+	if string(to) != addr {
+		tn.t.Fatalf("%s at %v sent to %q meant for %q", from, tn.now.Sub(t0), addr, to)
 	}
 }
 
@@ -600,7 +611,7 @@ func TestARestartSupersedesTheOldEntry(t *testing.T) {
 			c.Seed = 99
 			tn.nodes["n02"].n = node.New(c, wire.Sizer{}, tn.now)
 			tn.nodes["n02"].wake = tn.now
-			tn.step("n02", node.Join{Seeds: []string{"n00"}})
+			tn.step("n02", node.Join{Seeds: []node.Seed{seed("n00")}})
 			tn.after(10 * time.Second)
 			for _, a := range []string{"n00", "n01", "n03"} {
 				if m, _ := tn.state(a, "n02"); m.Version != tc.after {
@@ -646,11 +657,11 @@ func TestUnreadableIsAnsweredWithTheEntry(t *testing.T) {
 			t.Fatal("answered a stranger")
 		}
 	}
-	// A seed is answered before it is known as a member.
+	// A seed is answered before it is known as a member, named.
 	m := tn.nodes["n01"].n
-	m.Step(tn.now, node.Join{Seeds: []string{"seed:1"}})
-	if r := m.Step(tn.now.Add(time.Second), node.Unreadable{Addr: "seed:1"}); !slices.ContainsFunc(r.Packets, func(p node.Packet) bool { return p.Addr == "seed:1" }) {
-		t.Fatal("a seed wasn't answered")
+	m.Step(tn.now, node.Join{Seeds: []node.Seed{{ID: "s1", Addr: "seed:1"}}})
+	if r := m.Step(tn.now.Add(time.Second), node.Unreadable{Addr: "seed:1"}); !slices.ContainsFunc(r.Packets, func(p node.Packet) bool { return p.Addr == "seed:1" && p.To == "s1" }) {
+		t.Fatalf("a seed wasn't answered by name: %+v", r.Packets)
 	}
 }
 
@@ -773,7 +784,7 @@ func TestRejoinAfterLeave(t *testing.T) {
 	tn.after(10 * time.Second)
 	tn.step("n02", node.Leave{})
 	tn.after(10 * time.Second)
-	tn.step("n02", node.Join{Seeds: []string{"n00"}})
+	tn.step("n02", node.Join{Seeds: []node.Seed{seed("n00")}})
 	tn.after(20 * time.Second)
 	if !tn.everyone("n02", member.Alive) {
 		t.Fatal("n02 isn't alive again after rejoining")
@@ -875,7 +886,7 @@ func TestARestartBehindAndRolledBack(t *testing.T) {
 	c.Incarnation, c.Seed = 500_000, 7
 	tn.nodes["n02"].n = node.New(c, wire.Sizer{}, tn.now)
 	tn.nodes["n02"].wake = tn.now
-	tn.step("n02", node.Join{Seeds: []string{"n00"}})
+	tn.step("n02", node.Join{Seeds: []node.Seed{seed("n00")}})
 	tn.after(30 * time.Second)
 	for _, a := range []string{"n00", "n01", "n03"} {
 		if m, _ := tn.state(a, "n02"); m.State != member.Alive || m.Version != 1 || m.Incarnation <= 1_000_000 {
@@ -907,7 +918,7 @@ func TestASyncToAnIncompatibleSeedIsReported(t *testing.T) {
 	n := node.New(c, wire.Sizer{}, t0)
 	newer := member.Member{ID: "s", Addr: "s", MinVersion: 2, Version: 2}
 	first := n.Step(t0, node.Receive{Addr: "s", Packet: msg.Packet{From: newer, Body: msg.Ack{}}})
-	r := n.Step(t0, node.Join{Seeds: []string{"s"}})
+	r := n.Step(t0, node.Join{Seeds: []node.Seed{seed("s")}})
 	events := append(first.Events, r.Events...)
 	if len(r.Syncs) != 0 || !slices.ContainsFunc(events, func(e node.Event) bool { return e.Kind == node.Incompatible && e.Member == "s" }) {
 		t.Fatalf("syncs %v, events %v", r.Syncs, events)
@@ -1511,14 +1522,13 @@ func TestAClaimThatTheNodeDiedOrLeftIsRefuted(t *testing.T) {
 	}
 }
 
-// A sync names the member it is meant for: the sender of a sync it
-// answers, the member the view has at a drawn address, and nobody for a
-// seed it knows only by its address.
+// A sync names the member it is meant for: the seed it joins through, the
+// sender of a sync it answers, and the member drawn for a periodic sync.
 func TestASyncNamesTheMemberItIsMeantFor(t *testing.T) {
 	n := solo(nil)
-	r := n.Step(t0, node.Join{Seeds: []string{"seed"}})
-	if len(r.Syncs) != 1 || r.Syncs[0].To != "" || r.Syncs[0].Addr != "seed" {
-		t.Fatalf("join syncs %+v, want one to seed, unpinned", r.Syncs)
+	r := n.Step(t0, node.Join{Seeds: []node.Seed{{ID: "seed", Addr: "seed-addr"}}})
+	if len(r.Syncs) != 1 || r.Syncs[0].To != "seed" || r.Syncs[0].Addr != "seed-addr" {
+		t.Fatalf("join syncs %+v, want one to seed at seed-addr", r.Syncs)
 	}
 	b := peer("b")
 	b.Addr = "b-addr"
@@ -1526,7 +1536,7 @@ func TestASyncNamesTheMemberItIsMeantFor(t *testing.T) {
 	if len(r.Syncs) != 1 || r.Syncs[0].To != "b" || r.Syncs[0].Addr != "b-addr" {
 		t.Fatalf("answer %+v, want one to b at b-addr", r.Syncs)
 	}
-	// Periodic syncs go to b, the only member, drawn by its address.
+	// Periodic syncs go to b, the only member.
 	at := t0
 	for range 200 {
 		r = n.Step(at, node.Tick{})
@@ -1579,6 +1589,9 @@ func solo(edit func(c *node.Config)) *node.Node {
 	}
 	return node.New(c, wire.Sizer{}, t0)
 }
+
+// seed is the seed of the member id, at the address id.
+func seed(id string) node.Seed { return node.Seed{ID: member.ID(id), Addr: id} }
 
 // peer is a member that reads version 1 and has every capability.
 func peer(id string) member.Member {
@@ -1703,7 +1716,7 @@ func TestHealthChangedIsAnEvent(t *testing.T) {
 // later, give or take half.
 func TestJoinRetriesAfterRetryJoinEvery(t *testing.T) {
 	n := solo(func(c *node.Config) { c.SyncEvery = 0 })
-	n.Step(t0, node.Join{Seeds: []string{"seed"}})
+	n.Step(t0, node.Join{Seeds: []node.Seed{seed("seed")}})
 	now := t0
 	for range 100 {
 		r := n.Step(now, node.Tick{})
@@ -2041,13 +2054,656 @@ func TestSyncEntriesComingRoundAgainAreGossiped(t *testing.T) {
 func TestALateJoinerDoesNotGossipTheCluster(t *testing.T) {
 	tn := newNet(t, 12, nil)
 	for _, a := range tn.addrs[1:11] {
-		tn.step(a, node.Join{Seeds: []string{tn.addrs[0]}})
+		tn.step(a, node.Join{Seeds: []node.Seed{seed(tn.addrs[0])}})
 	}
 	tn.after(time.Minute)
 	before := tn.others["n11"]
-	tn.step("n11", node.Join{Seeds: []string{tn.addrs[0]}})
+	tn.step("n11", node.Join{Seeds: []node.Seed{seed(tn.addrs[0])}})
 	tn.after(30 * time.Second)
 	if got := tn.others["n11"] - before; got > 12 {
 		t.Fatalf("the late joiner sent %d gossip entries about others in 30 periods, want at most 12", got)
+	}
+}
+
+// A seed with no ID or no address, or with the node's own ID or address,
+// is skipped: only the named seed of another member is synced with, and
+// retried.
+func TestAJoinSkipsSeedsWithNoIDAndItself(t *testing.T) {
+	n := solo(func(c *node.Config) { c.SyncEvery = 0 })
+	r := n.Step(t0, node.Join{Seeds: []node.Seed{{Addr: "anon"}, {ID: "nowhere"}, {ID: "n", Addr: "elsewhere"}, {ID: "other", Addr: "n"}, {ID: "s", Addr: "s-addr"}}})
+	if len(r.Syncs) != 1 || r.Syncs[0].To != "s" || r.Syncs[0].Addr != "s-addr" {
+		t.Fatalf("join syncs %+v, want one to s at s-addr", r.Syncs)
+	}
+	now := t0
+	for range 20 {
+		r = n.Step(now, node.Tick{})
+		for _, s := range r.Syncs {
+			if s.To != "s" {
+				t.Fatalf("retried %+v", s)
+			}
+		}
+		now = r.Wake
+	}
+	if !n.Joining() {
+		t.Fatal("not joining")
+	}
+	// With only seeds it skips, there is nothing to join.
+	if r := n.Step(now, node.Join{Seeds: []node.Seed{{Addr: "anon"}}}); len(r.Syncs) != 0 || n.Joining() {
+		t.Fatalf("joined through an unnamed seed: %+v", r.Syncs)
+	}
+}
+
+// Forget takes a member out of the view at once, whatever its state, and
+// reports it. From then on the node neither probes it nor gossips it, and
+// ignores every entry of it, at any incarnation, from the member itself or
+// gossiped by another, until GraveTimeout; then it takes it back.
+func TestForgetRemovesAMemberAndKeepsItOutUntilGraveTimeout(t *testing.T) {
+	for _, st := range []member.State{member.Alive, member.Suspect, member.Dead, member.Left} {
+		n := soloWith(func(c *node.Config) { c.GraveTimeout = time.Hour }, "b", "c", "x")
+		if st != member.Alive {
+			x := peer("x")
+			x.State = st
+			hear(n, t0, peer("b"), msg.Ack{}, msg.Update{Member: x, By: "b"})
+		}
+		r := n.Step(t0, node.Forget{ID: "x"})
+		if len(r.Forgotten) != 1 || r.Forgotten[0].ID != "x" || r.Forgotten[0].State != st {
+			t.Fatalf("%v: forgotten %v", st, r.Forgotten)
+		}
+		if _, ok := n.Member("x"); ok || n.Suspected("x") {
+			t.Fatalf("%v: x still in the view, or suspected", st)
+		}
+		if err := n.Check(); err != nil {
+			t.Fatalf("%v: %v", st, err)
+		}
+		alive := peer("x")
+		alive.Incarnation = uint64(t0.UnixMilli())
+		at := t0
+		for at.Before(t0.Add(59 * time.Minute)) {
+			for _, r := range []node.Result{
+				hear(n, at, peer("b"), msg.Ping{Target: "n"}, msg.Update{Member: alive}),
+				hear(n, at, alive, msg.Ping{Target: "n"}),
+				n.Step(at, node.ReceiveSync{Addr: "c", Sync: msg.Sync{From: peer("c"), View: []member.Member{alive}}}),
+				n.Step(at, node.ReceiveSync{Addr: "x", Peer: "x", Sync: msg.Sync{From: alive, View: []member.Member{alive}, Reply: true}}),
+				hear(n, at, peer("b"), msg.PingReq{Seq: 7, Target: "x", TargetAddr: "x"}),
+				n.Step(at, node.Tick{}),
+			} {
+				if len(r.Changes) != 0 {
+					t.Fatalf("%v: at %v changed %v", st, at.Sub(t0), r.Changes)
+				}
+				for _, p := range r.Packets {
+					if p.To != "x" && slices.ContainsFunc(p.Packet.Gossip, func(u msg.Update) bool { return u.Member.ID == "x" }) {
+						t.Fatalf("%v: at %v gossiped x to %s", st, at.Sub(t0), p.To)
+					}
+					if b, ok := p.Packet.Body.(msg.PingReq); ok && b.Target == "x" || p.To == "x" && !isAck(p) {
+						t.Fatalf("%v: at %v probed x: %+v", st, at.Sub(t0), p)
+					}
+				}
+				for _, s := range r.Syncs {
+					if slices.ContainsFunc(s.Sync.View, func(m member.Member) bool { return m.ID == "x" }) {
+						t.Fatalf("%v: at %v synced an entry of x: %+v", st, at.Sub(t0), s)
+					}
+				}
+			}
+			if _, ok := n.Member("x"); ok {
+				t.Fatalf("%v: x back at %v", st, at.Sub(t0))
+			}
+			alive.Incarnation++
+			at = at.Add(time.Second)
+		}
+		at = t0.Add(time.Hour)
+		n.Step(at, node.Tick{})
+		if r := hear(n, at, alive, msg.Ping{Target: "n"}); len(r.Changes) != 1 {
+			t.Fatalf("%v: x not taken back after GraveTimeout: %v", st, r.Changes)
+		}
+	}
+}
+
+// The first entry of a buried member to arrive at GraveTimeout takes it
+// back, with no tick before it, and one a nanosecond before is ignored:
+// from itself, from another's gossip, and in a sync, for a grave Forget
+// holds and for the grave of a member forgotten at DeadTimeout, whose entry
+// is no newer than its tombstone.
+func TestABuriedMemberIsTakenBackByTheFirstEntryAtGraveTimeout(t *testing.T) {
+	const g = 100 * time.Millisecond
+	for _, grave := range []struct {
+		name string
+		dig  func(n *node.Node) time.Time
+		x    member.Member
+	}{
+		{"held", func(n *node.Node) time.Time { n.Step(t0, node.Forget{ID: "x"}); return t0 }, member.Member{ID: "x", Addr: "x", Incarnation: 1}},
+		{"of the dead", func(n *node.Node) time.Time {
+			dead := peer("x")
+			dead.State = member.Dead
+			hear(n, t0, peer("b"), msg.Ack{}, msg.Update{Member: dead, By: "b"})
+			n.Step(t0.Add(time.Minute), node.Tick{})
+			if _, ok := n.Member("x"); ok {
+				t.Fatal("x not forgotten at DeadTimeout")
+			}
+			return t0.Add(time.Minute)
+		}, peer("x")},
+	} {
+		x := grave.x
+		for name, receive := range map[string]func(n *node.Node, at time.Time) node.Result{
+			"its own ping": func(n *node.Node, at time.Time) node.Result { return hear(n, at, x, msg.Ping{Target: "n"}) },
+			"gossip": func(n *node.Node, at time.Time) node.Result {
+				return hear(n, at, peer("b"), msg.Ping{Target: "n"}, msg.Update{Member: x})
+			},
+			"a sync": func(n *node.Node, at time.Time) node.Result {
+				return n.Step(at, node.ReceiveSync{Addr: "c", Sync: msg.Sync{From: peer("c"), View: []member.Member{x}}})
+			},
+		} {
+			n := soloWith(func(c *node.Config) { c.GraveTimeout = g; c.DeadTimeout = time.Minute }, "b", "c", "x")
+			dug := grave.dig(n)
+			if r := receive(n, dug.Add(g-time.Nanosecond)); slices.ContainsFunc(r.Changes, func(m member.Member) bool { return m.ID == "x" }) {
+				t.Fatalf("%s grave, %s a nanosecond before GraveTimeout: changes %v, want x still out", grave.name, name, r.Changes)
+			}
+			if r := receive(n, dug.Add(g)); !slices.ContainsFunc(r.Changes, func(m member.Member) bool { return m.ID == "x" }) {
+				t.Fatalf("%s grave, %s at GraveTimeout: changes %v, want x taken back", grave.name, name, r.Changes)
+			}
+			if _, ok := n.Member("x"); !ok {
+				t.Fatalf("%s grave, %s at GraveTimeout: x not in the view", grave.name, name)
+			}
+		}
+	}
+}
+
+// A Forget at GraveTimeout holds the member afresh, for GraveTimeout from
+// then.
+func TestAForgetAtGraveTimeoutHoldsAfresh(t *testing.T) {
+	const g = 100 * time.Millisecond
+	n := soloWith(func(c *node.Config) { c.GraveTimeout = g }, "b", "c", "x")
+	n.Step(t0, node.Forget{ID: "x"})
+	n.Step(t0.Add(g), node.Forget{ID: "x"})
+	alive := peer("x")
+	alive.Incarnation = 5
+	if r := hear(n, t0.Add(2*g-time.Nanosecond), alive, msg.Ping{Target: "n"}); len(r.Changes) != 0 {
+		t.Fatalf("x taken back before the second hold ran out: %v", r.Changes)
+	}
+	if _, ok := n.Member("x"); ok {
+		t.Fatal("x in the view before the second hold ran out")
+	}
+	if hear(n, t0.Add(2*g), alive, msg.Ping{Target: "n"}); func() bool { _, ok := n.Member("x"); return !ok }() {
+		t.Fatal("x not taken back at the second hold's end")
+	}
+}
+
+// A gone member whose newer alive entry arrives at DeadTimeout is taken
+// back, not forgotten: the step reports the change alone, whether the
+// member is dead or left.
+func TestAGoneMemberBackAtDeadTimeoutIsNotForgotten(t *testing.T) {
+	for _, st := range []member.State{member.Dead, member.Left} {
+		n := soloWith(func(c *node.Config) { c.DeadTimeout = time.Minute }, "b", "x")
+		gone := peer("x")
+		gone.State = st
+		hear(n, t0, peer("b"), msg.Ack{}, msg.Update{Member: gone, By: "b"})
+		alive := peer("x")
+		alive.Incarnation = 1
+		r := hear(n, t0.Add(time.Minute), alive, msg.Ping{Target: "n"})
+		if len(r.Forgotten) != 0 || !slices.ContainsFunc(r.Changes, func(m member.Member) bool { return m.ID == "x" && m.State == member.Alive }) {
+			t.Fatalf("%v: forgotten %v, changes %v; want x alive and nothing forgotten", st, r.Forgotten, r.Changes)
+		}
+		if m, ok := n.Member("x"); !ok || m.State != member.Alive {
+			t.Fatalf("%v: x %v, %v; want alive", st, m, ok)
+		}
+	}
+}
+
+// A step's Forgotten lists the members out of the view at its end, each
+// once, with its last entry: one forgotten to make room and taken back by a
+// later entry of the same packet is reported changed alone, one changed and
+// then forgotten is reported in both, and one forgotten, taken back and
+// forgotten again is reported forgotten once.
+func TestAStepReportsForgottenOnlyWhatStaysForgotten(t *testing.T) {
+	has := func(ms []member.Member, id member.ID, st member.State) bool {
+		return slices.ContainsFunc(ms, func(m member.Member) bool { return m.ID == id && m.State == st })
+	}
+	n := soloWith(func(c *node.Config) { c.MaxMembers = 5 }, "b", "c", "d", "z")
+	d, z := peer("d"), peer("z")
+	d.State, z.State = member.Dead, member.Dead
+	hear(n, t0, peer("b"), msg.Ack{}, msg.Update{Member: d})
+	hear(n, t0.Add(time.Second), peer("b"), msg.Ack{}, msg.Update{Member: z})
+	back := peer("d")
+	back.Incarnation = 1
+	r := hear(n, t0.Add(2*time.Second), peer("b"), msg.Ack{}, msg.Update{Member: peer("e")}, msg.Update{Member: back})
+	if m, ok := n.Member("d"); !ok || m.State != member.Alive {
+		t.Fatalf("d %v, %v; want taken back alive", m, ok)
+	}
+	if !has(r.Changes, "d", member.Alive) || slices.ContainsFunc(r.Forgotten, func(m member.Member) bool { return m.ID == "d" }) {
+		t.Fatalf("forgotten and taken back: changes %v, forgotten %v; want d alive changed and not forgotten", r.Changes, r.Forgotten)
+	}
+
+	n = soloWith(func(c *node.Config) { c.MaxMembers = 5 }, "b", "c", "d", "z")
+	r = hear(n, t0, peer("b"), msg.Ack{}, msg.Update{Member: d}, msg.Update{Member: peer("e")})
+	if _, ok := n.Member("d"); ok {
+		t.Fatal("d still in the view after it died and made room")
+	}
+	if !has(r.Changes, "d", member.Dead) || !has(r.Forgotten, "d", member.Dead) {
+		t.Fatalf("changed and then forgotten: changes %v, forgotten %v; want d dead in both", r.Changes, r.Forgotten)
+	}
+	n = soloWith(func(c *node.Config) { c.MaxMembers = 5 }, "b", "c", "d", "z")
+	hear(n, t0, peer("b"), msg.Ack{}, msg.Update{Member: d})
+	hear(n, t0.Add(time.Second), peer("b"), msg.Ack{}, msg.Update{Member: z})
+	again := peer("d")
+	again.Incarnation, again.State = 2, member.Dead
+	r = hear(n, t0.Add(2*time.Second), peer("b"), msg.Ack{}, msg.Update{Member: peer("e")}, msg.Update{Member: back}, msg.Update{Member: again}, msg.Update{Member: peer("f")})
+	var ds []member.Member
+	for _, m := range r.Forgotten {
+		if m.ID == "d" {
+			ds = append(ds, m)
+		}
+	}
+	if _, ok := n.Member("d"); ok || len(ds) != 1 || ds[0] != again {
+		t.Fatalf("forgotten, taken back and forgotten again: forgotten %v; want d once, as %v", r.Forgotten, again)
+	}
+}
+
+// Forgetting the node itself, or the empty ID, does nothing. A member the
+// node doesn't know yet is reported nowhere but held out all the same: its
+// entry arriving after the Forget, from itself or from another, is
+// ignored.
+func TestForgetOfSelfOrAStranger(t *testing.T) {
+	n := soloWith(nil, "b")
+	self := n.Self()
+	for _, id := range []member.ID{"n", "", "x"} {
+		if r := n.Step(t0, node.Forget{ID: id}); len(r.Forgotten) != 0 || len(r.Changes) != 0 {
+			t.Fatalf("Forget(%q) = %+v", id, r)
+		}
+	}
+	if n.Self() != self || len(n.Members()) != 2 {
+		t.Fatalf("self %+v, members %v", n.Self(), n.Members())
+	}
+	// The node's refutation of a suspicion of it stays queued.
+	sn := n.Self()
+	sn.State = member.Suspect
+	hear(n, t0, peer("b"), msg.Ack{}, msg.Update{Member: sn, By: "b"})
+	refuted := n.Self()
+	n.Step(t0, node.Forget{ID: "n"})
+	n.Step(t0, node.Forget{ID: ""})
+	if r := hear(n, t0, peer("b"), msg.Ping{Seq: 1, Target: "n"}); !slices.ContainsFunc(r.Packets, func(p node.Packet) bool {
+		return slices.ContainsFunc(p.Packet.Gossip, func(u msg.Update) bool { return u.Member == refuted })
+	}) {
+		t.Fatalf("the refutation %+v didn't go out after forgetting the node itself: %+v", refuted, r.Packets)
+	}
+	x := peer("x")
+	x.Incarnation = uint64(t0.UnixMilli())
+	if r := hear(n, t0, peer("b"), msg.Ack{}, msg.Update{Member: x}); len(r.Changes) != 0 {
+		t.Fatalf("took x from b: %v", r.Changes)
+	}
+	if r := n.Step(t0, node.ReceiveSync{Addr: "x", Peer: "x", Sync: msg.Sync{From: x, View: []member.Member{x}}}); len(r.Changes) != 0 {
+		t.Fatalf("took x from its own sync: %v", r.Changes)
+	}
+	if err := n.Check(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A Join that names a forgotten member as a seed lifts its hold: the join
+// syncs with it, and its next entry is taken at once, whether or not the
+// node knew it before the Forget. A seed the join skips lifts nothing.
+func TestJoinTakesBackAForgottenSeed(t *testing.T) {
+	for _, known := range []bool{true, false} {
+		ids := []string{"b"}
+		if known {
+			ids = append(ids, "x")
+		}
+		n := soloWith(nil, ids...)
+		n.Step(t0, node.Forget{ID: "x"})
+		// A seed the join skips, at the node's own address, lifts nothing.
+		n.Step(t0, node.Join{Seeds: []node.Seed{{ID: "x", Addr: "n"}}})
+		early := peer("x")
+		early.Incarnation = uint64(t0.UnixMilli())
+		if r := n.Step(t0, node.ReceiveSync{Addr: "x", Peer: "x", Sync: msg.Sync{From: early, View: []member.Member{early}}}); len(r.Changes) != 0 {
+			t.Fatalf("known %v: a skipped seed lifted the hold", known)
+		}
+		r := n.Step(t0, node.Join{Seeds: []node.Seed{seed("x")}})
+		if len(r.Syncs) != 1 || r.Syncs[0].To != "x" {
+			t.Fatalf("known %v: join syncs %+v", known, r.Syncs)
+		}
+		x := peer("x")
+		x.Incarnation = uint64(t0.UnixMilli())
+		if r := n.Step(t0, node.ReceiveSync{Addr: "x", Peer: "x", Sync: msg.Sync{From: x, View: []member.Member{x}}}); len(r.Changes) == 0 {
+			t.Fatalf("known %v: x not taken back after Join named it", known)
+		}
+		if err := n.Check(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A forgotten seed is no seed: a joining node stops retrying it.
+func TestAForgottenSeedIsNotRetried(t *testing.T) {
+	n := solo(func(c *node.Config) { c.SyncEvery = 0 })
+	n.Step(t0, node.Join{Seeds: []node.Seed{seed("s"), seed("t")}})
+	n.Step(t0, node.Forget{ID: "s"})
+	now := t0
+	for range 20 {
+		r := n.Step(now, node.Tick{})
+		for _, s := range r.Syncs {
+			if s.To == "s" {
+				t.Fatalf("synced with a forgotten seed at %v", now.Sub(t0))
+			}
+		}
+		now = r.Wake
+	}
+	n.Step(now, node.Forget{ID: "t"})
+	if n.Joining() {
+		t.Fatal("still joining with every seed forgotten")
+	}
+}
+
+// In a cluster, a node that forgets a member keeps it out while the
+// member runs on and every other node still gossips it alive.
+func TestAForgottenMemberStaysOutWhileOthersGossipIt(t *testing.T) {
+	tn := newNet(t, 5, func(_ int, c *node.Config) { c.GraveTimeout = 2 * time.Minute })
+	tn.joinAll()
+	tn.after(10 * time.Second)
+	if !tn.everyone("n04", member.Alive) {
+		t.Fatal("not converged")
+	}
+	tn.step("n00", node.Forget{ID: "n04"})
+	forgot := tn.now
+	for tn.now.Sub(forgot) < 2*time.Minute-time.Second {
+		tn.after(500 * time.Millisecond)
+		if m, ok := tn.state("n00", "n04"); ok {
+			t.Fatalf("n04 back at n00 after %v: %+v", tn.now.Sub(forgot), m)
+		}
+		if !tn.everyone("n04", member.Alive, "n00") {
+			t.Fatalf("the others lost n04 at %v", tn.now.Sub(forgot))
+		}
+	}
+	tn.after(10 * time.Second)
+	if m, ok := tn.state("n00", "n04"); !ok || m.State != member.Alive {
+		t.Fatalf("n04 not back at n00 after GraveTimeout: %+v", m)
+	}
+}
+
+// A message from another member at a seed's address is no message from the
+// seed: it isn't answered as the seed.
+func TestAnUnreadableMessageFromAnotherAtASeedsAddressIsNotAnswered(t *testing.T) {
+	n := solo(nil)
+	n.Step(t0, node.Join{Seeds: []node.Seed{{ID: "s", Addr: "s-addr"}}})
+	if r := n.Step(t0, node.Unreadable{Addr: "s-addr", Peer: "other"}); len(r.Packets) != 0 {
+		t.Fatalf("answered %+v", r.Packets)
+	}
+	if r := n.Step(t0, node.Unreadable{Addr: "s-addr", Peer: "s"}); len(r.Packets) != 1 || r.Packets[0].To != "s" {
+		t.Fatalf("the seed answered %+v", r.Packets)
+	}
+}
+
+// A probe of a member under way when it is forgotten ends with no verdict:
+// no indirect probes about it, no failed probe and no change to the
+// node's health.
+func TestForgetEndsAProbeUnderWayWithNoVerdict(t *testing.T) {
+	for _, rule := range []health.Rule{health.RuleNoNack, health.RuleLifeguard} {
+		n := soloWith(func(c *node.Config) { c.HealthRule = rule }, "b", "c", "d", "x")
+		at := t0
+		for i := 0; ; i++ {
+			if id, ok := n.Probing(); ok && id == "x" {
+				break
+			}
+			if i > 100 {
+				t.Fatalf("%v: never probed x", rule)
+			}
+			at = n.Step(at, node.Tick{}).Wake
+		}
+		health := n.Health()
+		n.Step(at, node.Forget{ID: "x"})
+		for range 20 {
+			r := n.Step(at, node.Tick{})
+			for _, p := range r.Packets {
+				if b, ok := p.Packet.Body.(msg.PingReq); ok && b.Target == "x" {
+					t.Fatalf("%v: asked %s to ping a forgotten member", rule, p.To)
+				}
+			}
+			for _, e := range r.Events {
+				if e.Kind == node.ProbeFailed && e.Member == "x" {
+					t.Fatalf("%v: a failed probe of a forgotten member", rule)
+				}
+			}
+			if id, ok := n.Probing(); !ok || id != "x" {
+				break
+			}
+			at = r.Wake
+		}
+		if n.Health() != health {
+			t.Fatalf("%v: health %d, was %d", rule, n.Health(), health)
+		}
+	}
+}
+
+// A sync goes in the highest wire version the node and the member both
+// read, by the member's entry.
+func TestASyncGoesInTheHighestCommonVersion(t *testing.T) {
+	n := solo(func(c *node.Config) { c.MinVersion, c.Version = 1, 3 })
+	b := peer("b")
+	b.MinVersion, b.Version = 2, 2
+	r := n.Step(t0, node.ReceiveSync{Addr: "b", Sync: msg.Sync{From: b, View: []member.Member{b}, Reply: true}})
+	if len(r.Syncs) != 1 || r.Syncs[0].To != "b" || r.Syncs[0].Version != 2 {
+		t.Fatalf("answer %+v, want one to b in version 2", r.Syncs)
+	}
+	r = n.Step(t0, node.Join{Seeds: []node.Seed{seed("b")}})
+	if len(r.Syncs) != 1 || r.Syncs[0].Version != 2 {
+		t.Fatalf("join sync %+v, want version 2", r.Syncs)
+	}
+}
+
+func isAck(p node.Packet) bool { _, ok := p.Packet.Body.(msg.Ack); return ok }
+
+// Generated sequences of Forget, Join, gossip of one or two entries, a
+// member's own packets and ticks, half of them in a view capped at five
+// members, some landing at a hold's end or a nanosecond before it,
+// against a model of which members are held out: after every step a member
+// Forget held, which no Join has named since and whose GraveTimeout hasn't
+// passed, is not in the view, whatever was said of it; with no cap on the
+// view, one whose hold ended or was lifted, and that nobody gossiped since,
+// is taken back by its own ping; Forget reports exactly the members that
+// were in the view, and a step reports a member forgotten at most once,
+// and none in the view.
+func TestHeldMembersAgainstAModel(t *testing.T) {
+	r := rand.New(rand.NewPCG(17, 18))
+	ids := []string{"b", "c", "x", "y", "z"}
+	const graveTimeout = 2 * time.Minute
+	for run := range 200 {
+		n := soloWith(func(c *node.Config) {
+			c.GraveTimeout = graveTimeout
+			if run%2 == 1 {
+				c.MaxMembers = 5
+			}
+		}, "b", "c")
+		held := map[string]time.Time{}
+		free := map[string]bool{}
+		now := t0
+		for step := range 150 {
+			now = now.Add(time.Duration(r.IntN(4000)) * time.Millisecond)
+			if h := ids[r.IntN(len(ids))]; r.IntN(3) == 0 {
+				if at, ok := held[h]; ok {
+					end := at.Add(graveTimeout - time.Duration(r.IntN(2)))
+					if !end.Before(now) {
+						now = end
+					}
+				}
+			}
+			for h, at := range held {
+				if !now.Before(at.Add(graveTimeout)) {
+					delete(held, h)
+					free[h] = true
+				}
+			}
+			id := ids[r.IntN(len(ids))]
+			var what string
+			var res node.Result
+			switch r.IntN(6) {
+			case 0:
+				what = "Forget " + id
+				_, was := n.Member(member.ID(id))
+				res = n.Step(now, node.Forget{ID: member.ID(id)})
+				if got := len(res.Forgotten) == 1 && string(res.Forgotten[0].ID) == id; got != was || len(res.Forgotten) > 1 {
+					t.Fatalf("run %d step %d: %s reported %v, in the view before %v", run, step, what, res.Forgotten, was)
+				}
+				held[id] = now
+				delete(free, id)
+			case 1:
+				what = "Join " + id
+				res = n.Step(now, node.Join{Seeds: []node.Seed{seed(id)}})
+				if _, ok := held[id]; ok {
+					free[id] = true
+				}
+				delete(held, id)
+			case 2, 3:
+				from := peer(ids[r.IntN(2)])
+				var us []msg.Update
+				for k := range 1 + r.IntN(2) {
+					g := id
+					if k > 0 {
+						g = ids[2+r.IntN(len(ids)-2)]
+					}
+					m := peer(g)
+					m.Incarnation = uint64(t0.UnixMilli()) + r.Uint64N(1<<20)
+					m.State = member.State(r.IntN(4))
+					us = append(us, msg.Update{Member: m, By: from.ID})
+					delete(free, g)
+				}
+				what = fmt.Sprintf("%s gossips %v", from.ID, us)
+				res = hear(n, now, from, msg.Ack{}, us...)
+			case 4:
+				m := peer(id)
+				m.Incarnation = uint64(t0.UnixMilli()) + r.Uint64N(1<<20)
+				what = fmt.Sprintf("%s pings at %d", id, m.Incarnation)
+				res = hear(n, now, m, msg.Ping{Seq: 1, Target: "n"})
+				if _, ok := n.Member(m.ID); free[id] && !ok && run%2 == 0 {
+					t.Fatalf("run %d step %d, after %s: %s, no longer held, not taken back", run, step, what, id)
+				}
+				delete(free, id)
+			default:
+				what = "Tick"
+				res = n.Step(now, node.Tick{})
+			}
+			if err := n.Check(); err != nil {
+				t.Fatalf("run %d step %d, after %s: %v", run, step, what, err)
+			}
+			for i, f := range res.Forgotten {
+				if m, ok := n.Member(f.ID); ok {
+					t.Fatalf("run %d step %d, after %s: %s reported forgotten, in the view %+v", run, step, what, f.ID, m)
+				}
+				if slices.ContainsFunc(res.Forgotten[i+1:], func(o member.Member) bool { return o.ID == f.ID }) {
+					t.Fatalf("run %d step %d, after %s: %s reported forgotten twice: %v", run, step, what, f.ID, res.Forgotten)
+				}
+			}
+			for h, at := range held {
+				if m, ok := n.Member(member.ID(h)); ok {
+					t.Fatalf("run %d step %d, after %s: %s held since %v, in the view %+v", run, step, what, h, at.Sub(t0), m)
+				}
+				for _, c := range res.Changes {
+					if string(c.ID) == h {
+						t.Fatalf("run %d step %d, after %s: a change of %s, held", run, step, what, h)
+					}
+				}
+			}
+		}
+	}
+}
+
+// Whatever address, peer and version an unreadable message comes with, the
+// node answers with at most one packet, at the address it came from,
+// naming the proven peer, if there is one, as a member it knows or as the
+// seed at that address; with no peer, the member it knows at that address
+// or the seed there.
+func FuzzUnreadableIsAnsweredOnlyByName(f *testing.F) {
+	for _, s := range [][2]string{{"b", "b"}, {"b", ""}, {"s-addr", "s"}, {"s-addr", ""}, {"s-addr", "other"}, {"x", "x"}, {"", ""}, {"n", "n"}} {
+		f.Add(s[0], s[1], uint64(9))
+	}
+	f.Fuzz(func(t *testing.T, addr, peer string, version uint64) {
+		n := soloWith(nil, "b")
+		n.Step(t0, node.Join{Seeds: []node.Seed{{ID: "s", Addr: "s-addr"}}})
+		n.Step(t0, node.Forget{ID: "x"})
+		r := n.Step(t0, node.Unreadable{Addr: addr, Peer: member.ID(peer), Version: version})
+		if err := n.Check(); err != nil {
+			t.Fatal(err)
+		}
+		if len(r.Packets) > 1 {
+			t.Fatalf("%d answers", len(r.Packets))
+		}
+		for _, p := range r.Packets {
+			m, known := n.Member(p.To)
+			seed := p.To == "s" && addr == "s-addr"
+			if p.Addr != addr || p.To == "" || p.To == "n" || peer != "" && string(p.To) != peer || !seed && (!known || peer == "" && m.Addr != addr) {
+				t.Fatalf("Unreadable{%q, %q} answered %+v", addr, peer, p)
+			}
+		}
+	})
+}
+
+// Forget of a member already buried drops what the node still has queued
+// of it: a newer tombstone the grave took is gossiped no more.
+func TestForgetOfABuriedMemberDropsItsQueuedGossip(t *testing.T) {
+	n := soloWith(func(c *node.Config) { c.DeadTimeout = time.Second }, "b", "x")
+	dead := peer("x")
+	dead.State = member.Dead
+	hear(n, t0, peer("b"), msg.Ack{}, msg.Update{Member: dead, By: "b"})
+	at := t0.Add(2 * time.Second)
+	n.Step(at, node.Tick{})
+	if _, ok := n.Member("x"); ok {
+		t.Fatal("x not forgotten at DeadTimeout")
+	}
+	newer := dead
+	newer.Incarnation++
+	hear(n, at, peer("b"), msg.Ack{}, msg.Update{Member: newer, By: "b"})
+	n.Step(at, node.Forget{ID: "x"})
+	for range 50 {
+		r := n.Step(at, node.Tick{})
+		for _, p := range r.Packets {
+			if slices.ContainsFunc(p.Packet.Gossip, func(u msg.Update) bool { return u.Member.ID == "x" }) {
+				t.Fatalf("gossiped x to %s after it was forgotten", p.To)
+			}
+		}
+		at = r.Wake
+	}
+}
+
+// A Join that lifts a hold drops what the hold kept: the round-trip time a
+// direct ack of the abandoned probe left.
+func TestALiftedHoldKeepsNothing(t *testing.T) {
+	n := soloWith(nil, "b", "c", "x")
+	at := t0
+	for i := 0; ; i++ {
+		if id, ok := n.Probing(); ok && id == "x" {
+			break
+		}
+		if i > 100 {
+			t.Fatal("never probed x")
+		}
+		at = n.Step(at, node.Tick{}).Wake
+	}
+	n.Step(at, node.Forget{ID: "x"})
+	var seq uint32
+	for s := uint32(1); s < 200; s++ {
+		before := n.RTT("x")
+		hear(n, at.Add(5*time.Millisecond), peer("x"), msg.Ack{Seq: s})
+		if n.RTT("x") != before {
+			seq = s
+			break
+		}
+	}
+	if seq == 0 {
+		t.Fatal("no round-trip time from the abandoned probe's ack")
+	}
+	n.Step(at.Add(10*time.Millisecond), node.Join{Seeds: []node.Seed{seed("x")}})
+	if rtt := n.RTT("x"); rtt != 0 {
+		t.Fatalf("a round-trip time of %v kept after the hold was lifted", rtt)
+	}
+	if err := n.Check(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Forget of a member the node learned of from a sync and hasn't gossiped
+// on leaves no unspread entry of it.
+func TestForgetOfAnUnspreadMember(t *testing.T) {
+	n := solo(nil)
+	b, x := peer("b"), peer("x")
+	n.Step(t0, node.ReceiveSync{Addr: "b", Sync: msg.Sync{From: b, View: []member.Member{b, x}}})
+	n.Step(t0, node.Forget{ID: "x"})
+	if err := n.Check(); err != nil {
+		t.Fatal(err)
 	}
 }

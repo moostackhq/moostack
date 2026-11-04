@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/moostackhq/moostack/pkg/hivemind/membership/transport"
+	"github.com/moostackhq/moostack/pkg/hivemind/membership/transport/transporttest"
 )
 
 func recv(t *testing.T, e *Endpoint, within time.Duration) (transport.Message, bool) {
@@ -45,14 +46,15 @@ func TestListenAsCarriesThePeer(t *testing.T) {
 			t.Fatalf("got %+v, %v", m, ok)
 		}
 	}
-	b.SendPacket(transport.Dest{Addr: "a"}, []byte("p"))
+	b.SendPacket(transport.Dest{Addr: "a", Peer: "node-a"}, []byte("p"))
 	if m, ok := recv(t, a, time.Second); !ok || m.Peer != "" {
 		t.Fatalf("got %+v, %v", m, ok)
 	}
 }
 
-// An endpoint listening as a peer takes no message meant for another; one
-// meant for it, or for nobody in particular, it takes. An endpoint listening as nobody takes all.
+// An endpoint listening as a peer takes only a message meant for it, not
+// one meant for another or for nobody. An endpoint listening as nobody
+// takes all.
 func TestAMessageMeantForAnotherPeerIsDropped(t *testing.T) {
 	n := New(1, 0)
 	a, b, c := n.Listen("a"), n.ListenAs("b", "node-b"), n.Listen("c")
@@ -64,19 +66,22 @@ func TestAMessageMeantForAnotherPeerIsDropped(t *testing.T) {
 	a.SendStream(transport.Dest{Addr: "b"}, []byte("unpinned"))
 	got := map[string]bool{}
 	for range 2 {
-		if m, ok := recv(t, b, time.Second); ok {
+		if m, ok := recv(t, b, 100*time.Millisecond); ok {
 			got[string(m.Data)] = true
 		}
 	}
-	if !got["right"] || !got["unpinned"] {
-		t.Fatalf("got %v, want the pinned and the unpinned message", got)
+	if !got["right"] || got["unpinned"] {
+		t.Fatalf("got %v, want the pinned message alone", got)
 	}
 	a.SendPacket(transport.Dest{Addr: "c", Peer: "node-x"}, []byte("any"))
-	if _, ok := recv(t, c, time.Second); !ok {
-		t.Fatal("an endpoint listening as nobody dropped a pinned message")
+	a.SendPacket(transport.Dest{Addr: "c"}, []byte("unpinned"))
+	for range 2 {
+		if _, ok := recv(t, c, time.Second); !ok {
+			t.Fatal("an endpoint listening as nobody dropped a message")
+		}
 	}
-	if n.Lost() != 1 {
-		t.Fatalf("Lost = %d, want 1", n.Lost())
+	if n.Lost() != 2 {
+		t.Fatalf("Lost = %d, want 2", n.Lost())
 	}
 }
 
@@ -216,4 +221,14 @@ func TestLossIsTheShareDropped(t *testing.T) {
 	if got < 320 {
 		t.Fatalf("%d of 400 arrived at loss 0.1", got)
 	}
+}
+
+// Endpoints listening as members keep the port's promises.
+func TestThePortContract(t *testing.T) {
+	transporttest.Run(t, func(t *testing.T) transporttest.Pair {
+		n := New(1, 0)
+		a, b := n.ListenAs("addr-a", "a"), n.ListenAs("addr-b", "b")
+		t.Cleanup(func() { a.Close(); b.Close() })
+		return transporttest.Pair{A: a, B: b}
+	})
 }

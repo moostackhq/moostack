@@ -11,28 +11,10 @@ import (
 	"github.com/moostackhq/moostack/pkg/hivemind/membership/member"
 	"github.com/moostackhq/moostack/pkg/hivemind/membership/node"
 	"github.com/moostackhq/moostack/pkg/hivemind/membership/runtime"
-	"github.com/moostackhq/moostack/pkg/hivemind/membership/transport"
 	. "github.com/moostackhq/moostack/pkg/hivemind/membership/transport/quic"
 )
 
 var measure = flag.Duration("measure", time.Minute, "how long BenchmarkMembership measures a converged cluster")
-
-// namedSeeds sets the Peer of a destination that has none to the member
-// named at its address.
-type namedSeeds struct {
-	*Transport
-	names map[string]string
-}
-
-func (s namedSeeds) SendPacket(to transport.Dest, b []byte) { s.Transport.SendPacket(s.pin(to), b) }
-func (s namedSeeds) SendStream(to transport.Dest, b []byte) { s.Transport.SendStream(s.pin(to), b) }
-
-func (s namedSeeds) pin(to transport.Dest) transport.Dest {
-	if to.Peer == "" {
-		to.Peer = s.names[to.Addr]
-	}
-	return to
-}
 
 type benchCluster struct {
 	ids   []ident
@@ -41,31 +23,27 @@ type benchCluster struct {
 }
 
 // startCluster starts n membership runtimes over transports on loopback,
-// each joining the first, with the options opts gives the ith.
+// each joining the first through its named seed, with the options opts gives the ith.
 func startCluster(b testing.TB, n int, opts func(i int) runtime.Options) *benchCluster {
 	b.Helper()
 	ca := newCluster(b)
 	c := &benchCluster{}
-	seed := map[string]string{}
 	for i := range n {
 		id := ca.Node(fmt.Sprintf("node-%03d", i))
 		tr, err := Listen(id.Config("127.0.0.1:0"))
 		if err != nil {
 			b.Fatal(err)
 		}
-		if i == 0 {
-			seed[tr.Addr()] = id.Name
-		}
 		var o runtime.Options
 		if opts != nil {
 			o = opts(i)
 		}
-		rt, err := runtime.Start(b.Context(), node.Defaults(member.ID(id.Name), ""), namedSeeds{tr, seed}, o)
+		rt, err := runtime.Start(b.Context(), node.Defaults(member.ID(id.Name), ""), tr, o)
 		if err != nil {
 			b.Fatal(err)
 		}
 		if i > 0 {
-			if err := rt.Join(c.trs[0].Addr()); err != nil {
+			if err := rt.Join(node.Seed{ID: member.ID(c.ids[0].Name), Addr: c.trs[0].Addr()}); err != nil {
 				b.Fatal(err)
 			}
 		}

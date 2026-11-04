@@ -70,3 +70,45 @@ func BenchmarkReceive(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkReceiveWithGraves: the cost of a ping with ten updates on it,
+// at a node of 100 live members holding n graves, none due.
+func BenchmarkReceiveWithGraves(b *testing.B) {
+	for _, n := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprint(n), func(b *testing.B) {
+			c := node.Defaults("self", "self")
+			c.MaxMembers = 0
+			nd := node.New(c, wire.Sizer{}, t0)
+			var ups []msg.Update
+			for _, dead := range []bool{false, true} {
+				for i := range 100 + n {
+					m := member.Member{ID: member.ID(fmt.Sprintf("m%06d", i)), Addr: fmt.Sprintf("a%06d", i), Caps: c.Caps, MinVersion: 1, Version: 1}
+					if dead && i < 100 {
+						continue
+					}
+					if dead {
+						m.State = member.Dead
+					}
+					ups = append(ups, msg.Update{Member: m})
+					if len(ups) == 500 || i == 99+n {
+						nd.Step(t0, node.Receive{Addr: "a000000", Packet: msg.Packet{From: ups[0].Member, Body: msg.Ack{}, Gossip: ups}})
+						ups = nil
+					}
+				}
+			}
+			now := t0.Add(c.DeadTimeout)
+			if r := nd.Step(now, node.Tick{}); len(r.Forgotten) != n {
+				b.Fatalf("%d forgotten, want %d graves", len(r.Forgotten), n)
+			}
+			from := member.Member{ID: "m000001", Addr: "a000001", Caps: member.Of(member.CapNack, member.CapGossip), MinVersion: 1, Version: 1}
+			for i := range 10 {
+				ups = append(ups, msg.Update{Member: member.Member{ID: member.ID(fmt.Sprintf("m%06d", i+2)), Addr: fmt.Sprintf("a%06d", i+2), Incarnation: 1}})
+			}
+			p := msg.Packet{From: from, Body: msg.Ping{Seq: 1, Target: "self"}, Gossip: ups}
+			b.ResetTimer()
+			for i := range b.N {
+				nd.Step(now.Add(time.Duration(i)*time.Microsecond), node.Receive{Addr: "a000001", Packet: p})
+			}
+		})
+	}
+}

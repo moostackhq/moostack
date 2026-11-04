@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -66,13 +67,13 @@ func TestHooksMayCallTheRuntime(t *testing.T) {
 	}
 	other, _ := hmruntime.Start(context.Background(), fast("n1", 2), net.ListenAs("n1", "n1"), hmruntime.Options{})
 	t.Cleanup(other.Close)
-	other.Join("n0")
+	other.Join(seed("n0"))
 	select {
 	case <-left:
 	case <-time.After(5 * time.Second):
 		t.Fatal("a hook calling Leave and Close never returned")
 	}
-	if err := r.Join("n1"); !errors.Is(err, hmruntime.ErrClosed) {
+	if err := r.Join(seed("n1")); !errors.Is(err, hmruntime.ErrClosed) {
 		t.Fatalf("Join after Close: %v", err)
 	}
 }
@@ -113,8 +114,8 @@ func TestNothingIsLeftAfterClose(t *testing.T) {
 		}
 		rs = append(rs, r)
 	}
-	rs[1].Join("a")
-	rs[2].Join("a")
+	rs[1].Join(seed("a"))
+	rs[2].Join(seed("a"))
 	time.Sleep(300 * time.Millisecond)
 	for _, r := range rs {
 		r.Close()
@@ -186,12 +187,12 @@ func TestVersionsThroughTheRuntime(t *testing.T) {
 	b := start("b", 1, 2, 2)
 	c := start("c", 1, 1, 3)
 	d := start("d", 2, 2, 4)
-	b.Join("a")
-	c.Join("a")
+	b.Join(seed("a"))
+	c.Join(seed("a"))
 	waitFor(t, "a, b and c converge", 5*time.Second, func() bool {
 		return sees(a, "c", member.Alive) && sees(c, "b", member.Alive) && sees(b, "c", member.Alive)
 	})
-	d.Join("c") // c reads only 1, d only 2
+	d.Join(seed("c")) // c reads only 1, d only 2
 	waitFor(t, "c counts what it can't read", 5*time.Second, func() bool { return c.Counts().WrongVersion > 0 })
 	if got := a.Counts(); got.Malformed != 0 {
 		t.Fatalf("a counted %+v", got)
@@ -237,7 +238,7 @@ func TestAnUnauthenticatedClusterFormsWhenAllowed(t *testing.T) {
 		rs = append(rs, r)
 	}
 	for _, r := range rs[1:] {
-		r.Join("n0")
+		r.Join(seed("n0"))
 	}
 	waitFor(t, "the cluster formed", 10*time.Second, func() bool {
 		return len(rs[0].Members()) == 3 && len(rs[1].Members()) == 3 && len(rs[2].Members()) == 3
@@ -263,7 +264,7 @@ func TestWhatIsMeantForAMemberReachesNoOtherAtItsAddress(t *testing.T) {
 		t.Cleanup(r.Close)
 		rs = append(rs, r)
 	}
-	rs[1].Join("n0")
+	rs[1].Join(seed("n0"))
 	waitFor(t, "n0 sees n1", 10*time.Second, func() bool { return sees(rs[0], "n1", member.Alive) })
 	// n1 stops, and another identity takes its address.
 	rs[1].Close()
@@ -301,7 +302,7 @@ func TestAnAuthenticatedClusterDropsImpersonation(t *testing.T) {
 		rs = append(rs, r)
 	}
 	for _, r := range rs[1:] {
-		r.Join("n0")
+		r.Join(seed("n0"))
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for len(rs[0].Members()) < 3 || len(rs[1].Members()) < 3 || len(rs[2].Members()) < 3 {
@@ -360,8 +361,44 @@ func TestForgetHookAndClockIncarnation(t *testing.T) {
 		t.Fatalf("incarnation %d, not from the clock", inc)
 	}
 	b, _ := hmruntime.Start(context.Background(), fast("b", 2), net.ListenAs("b", "b"), hmruntime.Options{})
-	b.Join("a")
+	b.Join(seed("a"))
 	waitFor(t, "b joined", 5*time.Second, func() bool { return sees(a, "b", member.Alive) })
 	b.Close()
 	waitFor(t, "b forgotten", 10*time.Second, forgot.Load)
+}
+
+// counted is a transport that counts the streams sent to each member.
+type counted struct {
+	transport.Transport
+	mu   sync.Mutex
+	sent map[string]int
+}
+
+func (c *counted) SendStream(to transport.Dest, b []byte) {
+	c.mu.Lock()
+	c.sent[to.Peer]++
+	c.mu.Unlock()
+	c.Transport.SendStream(to, b)
+}
+
+// A Join that races Close returns nil exactly when it took effect, its
+// sync to the seed handed to the transport, and ErrClosed otherwise.
+func TestAJoinRacingCloseSaysWhetherItTookEffect(t *testing.T) {
+	net := memnet.New(1, time.Millisecond)
+	for i := range 300 {
+		tr := &counted{Transport: net.ListenAs("a", "a"), sent: map[string]int{}}
+		r, err := hmruntime.Start(context.Background(), fast("a", uint64(i+1)), tr, hmruntime.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		go r.Close()
+		err = r.Join(seed("s"))
+		r.Close()
+		tr.mu.Lock()
+		sent := tr.sent["s"]
+		tr.mu.Unlock()
+		if err == nil && sent == 0 || errors.Is(err, hmruntime.ErrClosed) && sent != 0 {
+			t.Fatalf("run %d: Join = %v with %d syncs to the seed sent", i, err, sent)
+		}
+	}
 }

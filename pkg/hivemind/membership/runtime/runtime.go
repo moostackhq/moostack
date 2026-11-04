@@ -25,8 +25,10 @@ import (
 type Options struct {
 	// OnChange is called with each entry of another member that changed.
 	OnChange func(member.Member)
-	// OnForget is called with each member the node forgot, DeadTimeout
-	// after it died or left.
+	// OnForget is called with each member the node forgot from its view:
+	// DeadTimeout after it died or left, to make room in a full view, or
+	// on Forget. It comes once per member and step, after the step's
+	// OnChange calls, and not for a member taken back in that step.
 	OnForget func(member.Member)
 	OnEvent  func(node.Event)
 	// Formats are the wire formats of versions after 1 that the node's
@@ -299,7 +301,8 @@ func (r *Runtime) snapshot(n *node.Node) {
 }
 
 // do hands the loop an input and waits until the node has stepped with it
-// and its messages are handed to the transport.
+// and its messages are handed to the transport. It returns ErrClosed when
+// the runtime closed before the node took the input.
 func (r *Runtime) do(in node.Input) error {
 	c := call{in: in, done: make(chan struct{})}
 	select {
@@ -309,14 +312,40 @@ func (r *Runtime) do(in node.Input) error {
 	}
 	select {
 	case <-c.done:
-		return nil
 	case <-r.done:
-		return ErrClosed
+		select {
+		case <-c.done:
+		default:
+			return ErrClosed
+		}
 	}
+	return nil
 }
 
-// Join contacts the seeds, given by address. A node that left joins again.
-func (r *Runtime) Join(seeds ...string) error { return r.do(node.Join{Seeds: slices.Clone(seeds)}) }
+// Join contacts the seeds, each named by its member ID beside its address,
+// keeps them for the periodic seed syncs, and lifts the hold Forget put on
+// each seed: entries of it are taken again. A node that left joins again.
+// A seed with no ID or no address is refused, and the call does nothing.
+func (r *Runtime) Join(seeds ...node.Seed) error {
+	for _, s := range seeds {
+		if s.ID == "" || s.Addr == "" {
+			return fmt.Errorf("runtime: a seed %q at %q, want both a member ID and an address", s.ID, s.Addr)
+		}
+	}
+	return r.do(node.Join{Seeds: slices.Clone(seeds)})
+}
+
+// Forget removes the member id from the view at once, reports it to
+// OnForget if it was in the view, and ignores every entry of it, at any
+// incarnation and from anyone, until GraveTimeout or until Join names it
+// as a seed (node.Forget). A member the node doesn't know yet is held out
+// too. Forgetting the node itself, or the empty ID, is refused.
+func (r *Runtime) Forget(id member.ID) error {
+	if id == "" || id == r.Self().ID {
+		return fmt.Errorf("runtime: can't forget %q, the node itself or no member", id)
+	}
+	return r.do(node.Forget{ID: id})
+}
 
 // Leave tells the cluster the node is leaving. It returns once the
 // goodbyes are handed to the transport; Close may follow at once.

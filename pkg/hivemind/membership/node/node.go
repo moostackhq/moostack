@@ -7,13 +7,15 @@
 //
 // How the components fit together, per input:
 //
+//	any input  → view, first after the pause check: graves at GraveTimeout go
 //	packet in  → view (sender's entry, gossip) → probe (ack, nack, ping-req)
 //	tick       → probe: next probe, indirect probe, failed probe
 //	failed     → health (score) and view (suspect) → suspicion (timer)
 //	suspicion  → expired → view (dead)
 //	view       → changed entries → gossip queue, piggybacked on what probe sends
+//	tick       → view: gone members at DeadTimeout are forgotten
 //	tick       → pushpull: join retries and periodic whole-view syncs
-//	any input  → pause: a call long after its wake-up shifts every deadline
+//	any input  → pause: a call long after its wake-up shifts the probe, suspicion, sync and pacer deadlines
 //
 // Each part owns its own state; the node owns every transition that
 // touches more than one, and keeps them in one place each:
@@ -21,13 +23,15 @@
 //   - Applying an entry (apply) may change the view, the probe order, the
 //     suspicion timers and the gossip queue; a full view makes room first,
 //     and only for an entry it would take.
-//   - Forgetting a member, at DeadTimeout or to make room (forgot), drops
-//     its round-trip time, queued gossip, incompatibility and unspread
-//     entry, and reports it.
-//   - A grave going, expired or over the cap (end of Step), drops what is
-//     still kept of a member the node no longer remembers.
-//   - A pause (stall) shifts every deadline: probe, suspicions, syncs and
-//     the gossip pacer.
+//   - Forgetting a member, at DeadTimeout, to make room or on Forget
+//     (forgot), drops its round-trip time, queued gossip, incompatibility
+//     and unspread entry (discard), and reports it unless the step takes
+//     it back; Forget of a member not in the view drops the same and
+//     reports nothing.
+//   - A grave going, expired, over the cap or lifted (end of Step), drops
+//     what is still kept of a member the node no longer remembers.
+//   - A pause (stall) shifts the probe's, the suspicions', the syncs' and
+//     the gossip pacer's deadlines; graves and DeadTimeout keep theirs.
 //   - A packet (sendTo) is sized with the Sizer of the codec that encodes
 //     it, and within MaxPacket and msg's limits.
 //
@@ -124,6 +128,7 @@ func (n *Node) Step(now time.Time, in Input) Result {
 	var r Result
 	score := n.health.Value()
 	n.stall(now, &r)
+	n.view.Expire(now, n.cfg.GraveTimeout)
 	switch in := in.(type) {
 	case Receive:
 		n.receive(now, in, &r)
@@ -133,6 +138,8 @@ func (n *Node) Step(now time.Time, in Input) Result {
 		n.join(now, in, &r)
 	case Leave:
 		n.leave(&r)
+	case Forget:
+		n.forget(now, in, &r)
 	case Unreadable:
 		n.unreadable(now, in, &r)
 	}
@@ -140,9 +147,10 @@ func (n *Node) Step(now time.Time, in Input) Result {
 	if v := n.health.Value(); v != score {
 		r.Events = append(r.Events, Event{Kind: HealthChanged, Value: v})
 	}
-	// A member whose grave went may still have a newer tombstone queued,
-	// or a round-trip time from a healing probe, unless it was taken back
-	// or buried again since.
+	r.Forgotten = n.stillForgotten(r.Forgotten)
+	// Of each member whose grave went: expired, over the cap or lifted,
+	// and that wasn't taken back or buried again since, drops the queued
+	// gossip, round-trip time and incompatibility.
 	for _, id := range n.view.Unburied() {
 		if !n.keeps(id) {
 			n.probe.Forget(id)
@@ -278,8 +286,30 @@ func (n *Node) join(now time.Time, in Join, r *Result) {
 		n.view.SetSelf(self)
 		n.gossip.Add(msg.Update{Member: self})
 	}
-	for _, a := range n.syncs.Join(now, n.cfg.Addr, in.Seeds) {
-		n.sync(a, "", true, r)
+	var seeds []member.Member
+	for _, s := range in.Seeds {
+		if s.ID != "" && s.Addr != "" {
+			seeds = append(seeds, member.Member{ID: s.ID, Addr: s.Addr})
+		}
+	}
+	for _, s := range n.syncs.Join(now, n.view.Self(), seeds) {
+		n.view.Lift(s.ID)
+		n.sync(s.Addr, s.ID, true, r)
+	}
+}
+
+// forget removes a member at once and holds its grave.
+func (n *Node) forget(now time.Time, in Forget, r *Result) {
+	if in.ID == n.cfg.ID || in.ID == "" {
+		return
+	}
+	n.syncs.Forget(in.ID)
+	n.probe.Abandon(in.ID)
+	n.susp.Stop(in.ID)
+	if m, ok := n.view.Drop(now, in.ID, n.cfg.GraveTimeout); ok {
+		n.forgot(m, r)
+	} else {
+		n.discard(in.ID)
 	}
 }
 
@@ -298,7 +328,9 @@ func (n *Node) unreadable(now time.Time, in Unreadable, r *Result) {
 		m, known = n.view.At(in.Addr)
 		key = "addr " + in.Addr
 	}
-	if (!known || m.ID == n.cfg.ID) && !n.syncs.IsSeed(in.Addr) {
+	known = known && m.ID != n.cfg.ID
+	seed, isSeed := n.syncs.Seed(in.Peer, in.Addr)
+	if !known && !isSeed {
 		return
 	}
 	if t, ok := n.told[key]; ok && now.Sub(t) < n.cfg.Probe.Interval {
@@ -313,7 +345,7 @@ func (n *Node) unreadable(now time.Time, in Unreadable, r *Result) {
 		}
 	}
 	n.told[key] = now
-	v, to := n.cfg.MinVersion, in.Peer
+	v, to := n.cfg.MinVersion, seed.ID
 	if known {
 		to = m.ID
 		if w, ok := n.versionFor(m); ok {
@@ -508,20 +540,40 @@ func (n *Node) tick(now time.Time, r *Result) {
 		n.gossipRound(r)
 	}
 	if !n.left && !n.syncs.Due().IsZero() && !now.Before(n.syncs.Due()) {
-		for _, a := range n.syncs.Tick(now, n.view.Live() > 1, n.randomLive(nil)) {
-			n.sync(a, "", true, r)
+		for _, m := range n.syncs.Tick(now, n.view.Live() > 1, n.randomLive(nil)) {
+			n.sync(m.Addr, m.ID, true, r)
 		}
 	}
 }
 
+// stillForgotten returns the members of forgotten out of the view, each
+// once, as last forgotten, in the order of their last report.
+func (n *Node) stillForgotten(forgotten []member.Member) []member.Member {
+	var out []member.Member
+	for i, m := range forgotten {
+		_, back := n.view.Get(m.ID)
+		later := slices.ContainsFunc(forgotten[i+1:], func(o member.Member) bool { return o.ID == m.ID })
+		if !back && !later {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // forgot drops what the node keeps of a member the view forgot, at
-// DeadTimeout or to make room, and reports it.
+// DeadTimeout, to make room or on Forget, and reports it.
 func (n *Node) forgot(m member.Member, r *Result) {
-	n.probe.Forget(m.ID)
-	n.gossip.Forget(m.ID)
-	delete(n.incompatible, string(m.ID))
-	delete(n.unspread, m.ID)
+	n.discard(m.ID)
 	r.Forgotten = append(r.Forgotten, m)
+}
+
+// discard drops the round-trip time, queued gossip, incompatibility and
+// unspread entry the node keeps of id.
+func (n *Node) discard(id member.ID) {
+	n.probe.Forget(id)
+	n.gossip.Forget(id)
+	delete(n.incompatible, string(id))
+	delete(n.unspread, id)
 }
 
 // gossipRound sends the queued updates to a few random members that read
@@ -605,31 +657,25 @@ func (n *Node) keeps(id member.ID) bool {
 	return ok || buried
 }
 
-// sync adds a whole-view sync to addr, unless the member there reads no
+// sync adds a whole-view sync to the member to at addr, unless it reads no
 // version the node writes.
 func (n *Node) sync(addr string, to member.ID, reply bool, r *Result) {
 	v := n.cfg.MinVersion
-	m, ok := n.view.Get(to)
-	if to == "" {
-		// A seed or a member drawn by its address: the member the view has
-		// there, if any.
-		m, ok = n.view.At(addr)
-	}
-	if ok && m.ID != n.cfg.ID {
+	if m, ok := n.view.Get(to); ok && m.ID != n.cfg.ID {
 		w, ok := n.versionFor(m)
 		if !ok {
 			n.incompatibleWith(string(m.ID), m, r)
 			return
 		}
-		v, to = w, m.ID
+		v = w
 	}
 	r.Syncs = append(r.Syncs, Sync{To: to, Addr: addr, Version: v, Sync: n.syncMsg(reply)})
 }
 
 // send builds a packet to to: the node's own entry, the probe message, and
-// as much gossip as fits. An entry saying to is not alive goes first, so
-// the member learns at once what it must refute: a suspicion with Buddy
-// on, and always the entry of a gone or forgotten member. The entries in first go before the gossip queue's, as far as
+// as much gossip as fits. An entry saying to is not alive goes first: a
+// suspicion with Buddy on, and always the entry of a gone or forgotten
+// member. The entries in first go before the gossip queue's, as far as
 // they fit. Only a member gets the gossip queue's updates: a packet to
 // anyone else spends none of their sends.
 //
@@ -705,10 +751,11 @@ func (n *Node) wake() time.Time {
 	return wake
 }
 
-// Check reports a broken invariant of the node: queued gossip, round-trip
-// times or a reported incompatibility of a member the node keeps nothing of, a suspicion timer
-// of a member not suspect, an unspread entry of a member not in the view,
-// or a view past MaxMembers.
+// Check reports a broken invariant of the node or its view (view.Check):
+// queued gossip, round-trip times or a reported incompatibility of a
+// member the node keeps nothing of, a suspicion timer of a member not
+// suspect, an unspread entry of a member not in the view, or a view past
+// MaxMembers.
 func (n *Node) Check() error {
 	if err := n.view.Check(); err != nil {
 		return err

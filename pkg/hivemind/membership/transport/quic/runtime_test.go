@@ -92,3 +92,15 @@ func TestAMemberSpeakingAsAnotherIsDropped(t *testing.T) {
 		t.Fatalf("node-000 has node-001 %v", s)
 	}
 }
+
+// Runtimes over QUIC form a cluster through named seeds, and nothing they
+// send names no member.
+func TestAClusterJoinsThroughNamedSeeds(t *testing.T) {
+	c := startCluster(t, 4, nil)
+	waitConverged(t, c)
+	for i, tr := range c.trs {
+		if st := tr.Stats(); st.Dropped.Unpinned != 0 {
+			t.Fatalf("node %d sent %d messages naming no member", i, st.Dropped.Unpinned)
+		}
+	}
+}

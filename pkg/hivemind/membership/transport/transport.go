@@ -27,9 +27,8 @@ type Message struct {
 // Dest is where a message goes: Addr, and Peer, the member the node means
 // it for. An authenticating transport must hand it only to an other end
 // that proves it is Peer, as by its certificate, and drop it otherwise, as
-// a lost packet. Peer is empty for a seed the node knows only by its
-// address: an authenticating transport drops the message, and one that
-// proves no identity hands it to whoever is at Addr.
+// a lost packet, as it drops one with no Peer. A transport that proves no
+// identity hands it to whoever is at Addr.
 type Dest struct {
 	Addr string
 	Peer string
@@ -43,8 +42,9 @@ type Transport interface {
 	Addr() string
 	SendPacket(to Dest, b []byte)
 	SendStream(to Dest, b []byte)
-	// Receive delivers what arrives, until Close. A transport that can
-	// receive no more closes the channel; the runtime then stops receiving.
+	// Receive delivers what arrives. The transport closes the channel at
+	// Close, or when it can receive no more; the runtime then stops
+	// receiving.
 	Receive() <-chan Message
 	Close() error
 }
