@@ -251,7 +251,7 @@ func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Rele
 // says so, and says what to stop and remove by hand.
 func Rollback(ctx context.Context, c *sshclient.Client, err error) error {
 	if rbErr := Uninstall(ctx, c); rbErr != nil {
-		return fmt.Errorf("%w; removing what was installed failed too, so %s: %v", err, CleanByHand, rbErr)
+		return fmt.Errorf("%w\nRemoving what was installed failed too, so %s: %v", err, CleanByHand, rbErr)
 	}
 	return err
 }

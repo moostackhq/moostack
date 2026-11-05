@@ -24,6 +24,9 @@ import (
 
 // node is a fake node in direct mode.
 type node struct {
+	// view, if set, says which members the node holds in which state, at
+	// each status call, or nil for a status that has no membership.
+	view       func() map[string]nodev1.MemberState
 	generation int64
 	// nodes are the nodes of the cluster directory at generation.
 	nodes []string
@@ -169,7 +172,10 @@ func (n *node) removedIdentities() []hostlayout.RemovedIdentity {
 }
 
 func (n *node) Status(ctx context.Context) nodeclient.Status {
-	if n.hangs {
+	n.mu.Lock()
+	hangs := n.hangs || n.hanging
+	n.mu.Unlock()
+	if hangs {
 		<-ctx.Done()
 		return nodeclient.Status{AgentErr: ctx.Err(), UpdaterErr: ctx.Err()}
 	}
@@ -184,7 +190,23 @@ func (n *node) Status(ctx context.Context) nodeclient.Status {
 		generation = n.laterGeneration
 	}
 	n.mu.Unlock()
-	return nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock(), Components: n.components, Containers: n.containers()}
+	s := nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock(), Components: n.components, Containers: n.containers()}
+	if n.view != nil {
+		if view := n.view(); view != nil {
+			s.Membership = &nodev1.Membership{}
+			for member, state := range view {
+				s.Membership.Members = append(s.Membership.Members, &nodev1.Member{Node: member, State: state})
+			}
+		}
+	}
+	return s
+}
+
+// stopAnswering has the node stop answering.
+func (n *node) stopAnswering() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.hanging = true
 }
 
 func (n *node) RecordGeneration(ctx context.Context, g int64, nodes []*nodev1.GenerationNode, lease string) error {

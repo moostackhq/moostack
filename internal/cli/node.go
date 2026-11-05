@@ -86,6 +86,9 @@ func nodeCommand(env Env) *cli.Command {
 	}
 }
 
+// aliveTimeout bounds node add's wait for a new node to be alive.
+const aliveTimeout = 30 * time.Second
+
 // nodeAdd is mooctl node add. It checks every target before it installs
 // on any, then adds them one at a time, in order, and stops at the first
 // that fails.
@@ -112,9 +115,10 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 		return err
 	}
 	// From here on, a signal ends the preflight, the reach of a host or
-	// the install under way, which then rolls back, and node add gives
-	// the lock back, rather than ending mooctl. Once an install has
-	// finished, its node is recorded all the same.
+	// the install or the check that the node is alive, which then roll
+	// back, and node add gives the lock back, rather than ending mooctl.
+	// Once the check has passed, or a first node's install has finished,
+	// its node is recorded all the same.
 	ctx, stop := interrupt.Context(ctx, env.Exit)
 	defer stop()
 	cl, err := preflight(ctx, env, cmd, d, nil, nil)
@@ -274,9 +278,11 @@ func reachHosts(ctx context.Context, env Env, d *cluster.Dir, targets []nodeTarg
 // whose connection has sat idle through the installs before it.
 const recheckTimeout = time.Minute
 
-// addNode installs the release on h, records it in the cluster directory
-// at the next generation, and has every node record that generation.
-// A host that comes later, after another, it checks again first.
+// addNode installs the release on h, waits for the new node to be alive
+// in the cluster, but for a cluster's first node, records it in the
+// cluster directory at the next generation, and has every node record
+// that generation. If the node isn't alive in time, it rolls the install
+// back. A host that comes later, after another, it checks again first.
 func addNode(ctx context.Context, env Env, cl *orchestrate.Cluster, d *cluster.Dir, rel *release.Release, ca *identity.CA, removed []cluster.RemovedIdentity, h *newHost, later bool) error {
 	n, name := h.n, h.n.Name
 	adding := fmt.Sprintf("adding %s as %s", h.target, name)
@@ -308,18 +314,37 @@ func addNode(ctx context.Context, env Env, cl *orchestrate.Cluster, d *cluster.D
 	if err != nil {
 		return stopped(ctx, adding, err)
 	}
+	// undo rolls the install back, and leaves the node out of the
+	// operation, if it was added to it.
+	undo := func(err error) error {
+		err = bootstrap.Rollback(ctx, h.c, err)
+		if h.added {
+			cl.Remove(name)
+		}
+		return err
+	}
 	generation := cl.Next(d.Cluster.Generation)
+	first := cl.Empty()
+	if !first {
+		// The nodes may hold out a removed name, and any name from a
+		// directory forced past a generation.
+		heldOut := namesRemoved(removed, name) || len(cl.Forced) > 0
+		if err := waitAlive(ctx, env, cl, h, generation, heldOut); err != nil {
+			return undo(stopped(ctx, adding, err))
+		}
+	}
 	if err := d.AddNode(n, generation); err != nil {
-		return bootstrap.Rollback(ctx, h.c, fmt.Errorf("recording %s: %w", name, err))
+		return undo(fmt.Errorf("recording %s: %w", name, err))
 	}
 	fmt.Fprintf(env.Stdout, "Added node %s, at generation %d of the cluster directory\n", name, generation)
-	// The other nodes record the generation even if the new node can't
-	// be reached to.
-	if node, err := nodeclient.Dial(h.c); err != nil {
-		cl.Add(name, n.PrivateAddress, unreachedNode{err})
-	} else {
-		cl.Add(name, n.PrivateAddress, sshNode{node, h.c})
-		h.added = true
+	if first {
+		// The node records the generation only if it can be reached.
+		if node, err := nodeclient.Dial(h.c); err != nil {
+			cl.Add(name, n.PrivateAddress, unreachedNode{err})
+		} else {
+			cl.Add(name, n.PrivateAddress, sshNode{node, h.c})
+			h.added = true
+		}
 	}
 	interrupted, err := tellNodes(ctx, env, cl, h.target+" is added as "+name, func(ctx context.Context) error {
 		return cl.Record(ctx, generation)
@@ -330,6 +355,29 @@ func addNode(ctx context.Context, env Env, cl *orchestrate.Cluster, d *cluster.D
 	if interrupted {
 		return &addedError{fmt.Errorf("node add interrupted once %s was added as %s, which the nodes recorded", h.target, name)}
 	}
+	return nil
+}
+
+// waitAlive adds the installed node of h to the operation cl, has it
+// record generation, which gives it its seeds, and waits until it and
+// another node hold each other alive. If heldOut, the other nodes may
+// hold its name out until they record it.
+func waitAlive(ctx context.Context, env Env, cl *orchestrate.Cluster, h *newHost, generation int64, heldOut bool) error {
+	name := h.n.Name
+	node, err := nodeclient.Dial(h.c)
+	if err != nil {
+		return err
+	}
+	cl.Add(name, h.n.PrivateAddress, sshNode{node, h.c})
+	h.added = true
+	if err := cl.RecordOn(ctx, name, generation); err != nil {
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "Waiting for %s to be alive in the cluster\n", name)
+	if err := cl.WaitAlive(ctx, name, aliveTimeout, heldOut); err != nil {
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "%s is alive in the cluster\n", name)
 	return nil
 }
 

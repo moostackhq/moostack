@@ -693,11 +693,38 @@ func (c *Cluster) Record(ctx context.Context, generation int64) error {
 	c.mu.Lock()
 	conns := slices.Clone(c.conns)
 	c.mu.Unlock()
+	return errors.Join(c.record(ctx, conns, generation, generationNodes(conns))...)
+}
+
+// RecordOn has the node called name alone record generation, of a cluster
+// directory of every node the cluster has a connection to, as Record does.
+func (c *Cluster) RecordOn(ctx context.Context, name string, generation int64) error {
+	c.mu.Lock()
+	conns := slices.Clone(c.conns)
+	c.mu.Unlock()
+	i, err := connIndex(conns, name)
+	if err != nil {
+		return err
+	}
+	return c.record(ctx, conns[i:i+1], generation, generationNodes(conns))[0]
+}
+
+// connIndex is the index of the node called name in conns.
+func connIndex(conns []*namedConn, name string) (int, error) {
+	i := slices.IndexFunc(conns, func(n *namedConn) bool { return n.name == name })
+	if i < 0 {
+		return 0, fmt.Errorf("the operation has no node %s", name)
+	}
+	return i, nil
+}
+
+// generationNodes are conns as a generation lists them.
+func generationNodes(conns []*namedConn) []*nodev1.GenerationNode {
 	nodes := make([]*nodev1.GenerationNode, len(conns))
 	for i, n := range conns {
 		nodes[i] = &nodev1.GenerationNode{Name: n.name, PrivateAddress: n.privateAddress.String()}
 	}
-	return errors.Join(c.record(ctx, conns, generation, nodes)...)
+	return nodes
 }
 
 // record has each of conns record generation, of a cluster directory of
