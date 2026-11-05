@@ -259,14 +259,17 @@ func (v *View) Forget(now time.Time, after, graves time.Duration) []member.Membe
 	return out
 }
 
-// Expire digs up the graves, held or not, dug at least graves before now,
-// and reports them in Unburied.
+// Expire digs up the graves that aren't held, dug at least graves before
+// now, and reports them in Unburied.
 func (v *View) Expire(now time.Time, graves time.Duration) {
-	if len(v.graves) == 0 || !v.firstDug.IsZero() && now.Before(v.firstDug.Add(graves)) {
+	if len(v.graves) == v.held || !v.firstDug.IsZero() && now.Before(v.firstDug.Add(graves)) {
 		return
 	}
 	v.firstDug = time.Time{}
 	for id, g := range v.graves {
+		if g.held {
+			continue
+		}
 		if !now.Before(g.at.Add(graves)) {
 			v.unbury(id)
 		} else if v.firstDug.IsZero() || g.at.Before(v.firstDug) {
@@ -292,9 +295,9 @@ func (v *View) remove(id member.ID) member.Member {
 	return e.Member
 }
 
-// Drop forgets id at now, whatever its state, and holds its grave for
-// graves: every entry of it, at any incarnation, is ignored until the
-// grave goes or Lift lifts it. A member already buried has its grave held
+// Drop forgets id at now, whatever its state, and holds its grave: every
+// entry of it, at any incarnation, is ignored until Lift lifts it. A
+// member already buried has its grave held
 // from now on, and one the view keeps nothing of gets a held grave of its
 // own. With graves 0, Drop digs and holds no grave. Self and the empty ID
 // are never dropped. It returns the entry it took out of the view, if
@@ -334,7 +337,7 @@ func (v *View) unbury(id member.ID) {
 
 // bury keeps m as the grave of a member forgotten at now, held if held.
 // Beyond maxGraves graves that aren't held, the ones dug first go,
-// whichever way they were dug; held graves go only when they expire or are
+// whichever way they were dug; held graves go only when they are
 // lifted.
 func (v *View) bury(m member.Member, now time.Time, held bool) {
 	v.dug++
@@ -405,7 +408,7 @@ func (v *View) Unburied() []member.ID {
 
 // Check reports a broken invariant of the view: the sorted IDs, the
 // address index, the counts of live and gone members, and the graves: none
-// of a member in the view, none dug before firstDug, those not held within
+// of a member in the view, none not held dug before firstDug, those not held within
 // maxGraves, gone and in the order dug once, and the held ones counted and
 // not in that order.
 func (v *View) Check() error {
@@ -453,7 +456,7 @@ func (v *View) Check() error {
 	}
 	held := 0
 	for id, g := range v.graves {
-		if !v.firstDug.IsZero() && g.at.Before(v.firstDug) {
+		if !g.held && !v.firstDug.IsZero() && g.at.Before(v.firstDug) {
 			return fmt.Errorf("view: the grave of %s was dug at %v, before the first, %v", id, g.at, v.firstDug)
 		}
 		if g.held {

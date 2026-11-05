@@ -219,9 +219,7 @@ type sshNode struct {
 	ssh *sshclient.Client
 }
 
-// Close closes the SSH connection first. Closing the node API's
-// connections waits for what they are reading, which only a closed SSH
-// connection ends when the node has stopped answering.
+// Close closes the SSH connection first, then the node API's connections.
 func (n sshNode) Close() error { return errors.Join(n.ssh.Close(), n.Node.Close()) }
 
 // clusterDir is the cluster directory that cmd names with -C, or else
@@ -274,19 +272,19 @@ var forceFlag = &cli.BoolFlag{
 	Usage: "go on from this cluster directory even if a node has applied a later generation of it, or can't tell which generation it applied",
 }
 
-// preflight runs the preflight on the nodes of d, apart from the node
-// called skip if one is, for an operation on them: it refuses a
+// preflight runs the preflight on the nodes of d, apart from the nodes
+// called skip, for an operation on them: it refuses a
 // node on a release this mooctl doesn't operate, and one that check, if
 // set, fails, takes the operation lock for the operator on this machine
-// and for cmd, and pushes d's removed identities to every node. The
-// operation runs in the returned cluster's context, which ends if it
+// and for cmd, brings up a node behind d, unless force or skip, and
+// pushes d's removed identities to every node. The operation runs in the returned cluster's context, which ends if it
 // loses the lock.
-func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir, skip string, check func(s nodeclient.Status, all []nodeclient.Status) error) (*orchestrate.Cluster, error) {
+func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir, skip []string, check func(s nodeclient.Status, all []nodeclient.Status) error) (*orchestrate.Cluster, error) {
 	nodes, err := d.Nodes()
 	if err != nil {
 		return nil, err
 	}
-	nodes = slices.DeleteFunc(nodes, func(n cluster.Node) bool { return n.Name == skip })
+	nodes = slices.DeleteFunc(nodes, func(n cluster.Node) bool { return slices.Contains(skip, n.Name) })
 	removed, err := d.RemovedIdentities()
 	if err != nil {
 		return nil, err
@@ -299,7 +297,8 @@ func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir, s
 	toDial := nodesToDial(env, nodes)
 	toDial.LeaseTTL = ttl
 	toDial.StartCheck = env.StartCheck
-	toDial.Removed = cluster.Fingerprints(removed)
+	toDial.Removed = removed
+	toDial.Partial = len(skip) > 0
 	toDial.Check = func(s nodeclient.Status, all []nodeclient.Status) error {
 		if err := operated(env, s); err != nil {
 			return err
@@ -337,14 +336,29 @@ func preflight(ctx context.Context, env Env, cmd *cli.Command, d *cluster.Dir, s
 			fmt.Fprintf(env.Stderr, "  %v\n", f)
 		}
 	}
-	// The node skipped is in the cluster directory, but not among those
-	// reached.
-	c.Unlisted = slices.DeleteFunc(c.Unlisted, func(n string) bool { return n == skip })
+	for _, name := range c.CaughtUp {
+		fmt.Fprintf(env.Stderr, "%s was behind this cluster directory, and recorded its generation, %d.\n", name, d.Cluster.Generation)
+	}
+	for _, err := range c.Behind {
+		fmt.Fprintf(env.Stderr, "Going on, but %v.\n", err)
+	}
+	// The nodes skipped don't count as unlisted.
+	c.Unlisted = slices.DeleteFunc(c.Unlisted, func(n string) bool { return slices.Contains(skip, n) })
 	if len(c.Unlisted) > 0 {
 		fmt.Fprintf(env.Stderr, "Generation %d lists %s, which this cluster directory doesn't, so mooctl can't reach them, and they keep the generation they have applied.\n",
 			c.Latest, strings.Join(c.Unlisted, ", "))
+		for _, name := range c.Unlisted {
+			if namesRemoved(removed, name) {
+				fmt.Fprintf(env.Stderr, "A removed identity has the name %s, so a node that records a generation from this directory forgets the node of that name until a generation lists it.\n", name)
+			}
+		}
 	}
 	return c, nil
+}
+
+// namesRemoved says whether a removed identity has the name.
+func namesRemoved(removed []cluster.RemovedIdentity, name string) bool {
+	return slices.ContainsFunc(removed, func(r cluster.RemovedIdentity) bool { return r.Node == name })
 }
 
 // remindToCommit reminds the operator to commit the cluster directory,
@@ -504,11 +518,10 @@ func (e *unoperatedError) Hint() string {
 // status is s may be updated to pinned, given what every node says, all.
 // pinned updates nodes on itself and on the release before it, and, by
 // this mooctl, moves nodes on this mooctl's release back to pinned, the
-// release before it, while a node still runs pinned: until an update has
-// finished, it can go back. Each part of the node that runs a release,
-// its updater and each cluster service pinned has as well as its agent,
-// must be one pinned updates, so that a node an update stopped partway
-// skips no release for any of them; and any of them on pinned counts as
+// release before it, while a node still runs pinned. Each part of the
+// node that runs a release, its updater and each cluster service pinned
+// has as well as its agent, must be one pinned updates; and any of them
+// on pinned counts as
 // a node that still runs it. A part that doesn't say which release it
 // runs, as a service whose container the node can't read, may be on any:
 // only the release the node's agent runs updates it, which repairs it, or
@@ -553,7 +566,7 @@ func updates(env Env, pinned release.Manifest, s nodeclient.Status, all []nodecl
 type ofRelease struct{ what, service, release string }
 
 // releasesOf are the parts of the node whose status is s that run a
-// release. containerd and runc have versions of their own.
+// release, which leaves out containerd and runc.
 func releasesOf(s nodeclient.Status) []ofRelease {
 	var rs []ofRelease
 	for _, c := range s.Components {

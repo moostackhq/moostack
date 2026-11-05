@@ -82,11 +82,14 @@ var ErrStopped = errors.New("membership: stopped")
 
 // Membership is membership as Start runs it, until Stop.
 type Membership struct {
-	rt *runtime.Runtime
+	rt  *runtime.Runtime
+	ctx context.Context
 	// transportDrops are the transport's drop counts, by reason.
 	transportDrops func() map[string]uint64
+	cutOff         func(match func(*x509.Certificate) bool)
 	impersonated   atomic.Uint64
-	// mu guards stopped, and is held through a SetSeeds or a Forget.
+	// mu guards stopped, and is held through a SetSeeds, a Forget or a
+	// CutOff.
 	mu      sync.Mutex
 	stopped bool
 }
@@ -98,8 +101,16 @@ func Start(ctx context.Context, cfg Config) (*Membership, error) {
 	if err != nil {
 		return nil, fmt.Errorf("membership: listening on UDP %s: %w", cfg.Address, err)
 	}
-	return start(ctx, cfg.Identity.Node, tr, func() map[string]uint64 { return quicDrops(tr.Stats().Dropped) })
+	m, err := start(ctx, cfg.Identity.Node, tr, func() map[string]uint64 { return quicDrops(tr.Stats().Dropped) })
+	if err != nil {
+		return nil, err
+	}
+	m.cutOff = tr.CutOff
+	return m, nil
 }
+
+// cutNothing is the cutOff of a transport with no connections to close.
+func cutNothing(func(*x509.Certificate) bool) {}
 
 // transportConfig is the QUIC transport's configuration for cfg: its
 // TLS from the node identity, refusing removed identities, and its reset
@@ -126,7 +137,7 @@ func peerID(cert *x509.Certificate) (string, error) {
 // start runs membership for nodeID over tr, whose drop counts
 // transportDrops returns, nil for none.
 func start(ctx context.Context, nodeID string, tr transport.Transport, transportDrops func() map[string]uint64) (*Membership, error) {
-	m := &Membership{transportDrops: transportDrops}
+	m := &Membership{ctx: ctx, transportDrops: transportDrops, cutOff: cutNothing}
 	rt, err := runtime.Start(ctx, node.Defaults(member.ID(nodeID), ""), tr, runtime.Options{
 		OnEvent: func(e node.Event) {
 			if e.Kind == node.Impersonated {
@@ -186,8 +197,8 @@ func (m *Membership) SetSeeds(seeds []Seed) error {
 }
 
 // Forget removes the node called nodeID from the view at once, and
-// ignores what the others say of it until a SetSeeds names it, a day
-// passes, or membership starts again.
+// ignores what the others say of it until a SetSeeds names it or
+// membership starts again.
 func (m *Membership) Forget(nodeID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -197,8 +208,21 @@ func (m *Membership) Forget(nodeID string) error {
 	return stoppedIfClosed(m.rt.Forget(member.ID(nodeID)))
 }
 
+// CutOff closes every connection to the peer that proves the identity
+// of fingerprint, and refuses that identity from then on. A connection
+// of another identity under the same name stays.
+func (m *Membership) CutOff(fingerprint string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped || m.ctx.Err() != nil {
+		return ErrStopped
+	}
+	m.cutOff(func(cert *x509.Certificate) bool { return identity.CertFingerprint(cert) == fingerprint })
+	return nil
+}
+
 // Stop leaves the cluster, and the others hold the node as left, and
-// then stops. SetSeeds and Forget are refused from its start. A Stop
+// then stops. SetSeeds, Forget and CutOff are refused from its start. A Stop
 // after the first returns at once.
 func (m *Membership) Stop() {
 	m.mu.Lock()

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/moostackhq/moostack/internal/cluster"
@@ -27,10 +28,10 @@ func clusterOf(t *testing.T, names ...string) *cluster.Dir {
 
 func TestRemoveNodeListsItsIdentityAsRemoved(t *testing.T) {
 	d := clusterOf(t, "web-1", "web-2", "web-3")
-	if err := d.RemoveNode("web-2", 3); err != nil {
+	if err := d.RemoveNodes([]string{"web-2"}, 3); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.RemoveNode("web-1", 4); err != nil {
+	if err := d.RemoveNodes([]string{"web-1"}, 4); err != nil {
 		t.Fatal(err)
 	}
 	reopened, err := cluster.Open(d.Path())
@@ -74,7 +75,7 @@ func TestANewClusterHasNoRemovedIdentities(t *testing.T) {
 func TestRemoveNodeOfAnUnknownNodeIsNotExist(t *testing.T) {
 	d := clusterOf(t, "web-1")
 	before := snapshot(t, d.Path())
-	if err := d.RemoveNode("web-2", 3); !errors.Is(err, fs.ErrNotExist) {
+	if err := d.RemoveNodes([]string{"web-2"}, 3); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("RemoveNode of an unknown node: %v, want an error that is fs.ErrNotExist", err)
 	}
 	if after := snapshot(t, d.Path()); !maps.Equal(before, after) {
@@ -84,7 +85,7 @@ func TestRemoveNodeOfAnUnknownNodeIsNotExist(t *testing.T) {
 
 func TestRemoveNodeThatCantWriteTheGenerationLeavesTheDirectoryAsItWas(t *testing.T) {
 	d := clusterOf(t, "web-1", "web-2")
-	if err := d.RemoveNode("web-1", 3); err != nil {
+	if err := d.RemoveNodes([]string{"web-1"}, 3); err != nil {
 		t.Fatal(err)
 	}
 	// A directory in the cluster file's place can't be replaced by it.
@@ -95,7 +96,7 @@ func TestRemoveNodeThatCantWriteTheGenerationLeavesTheDirectoryAsItWas(t *testin
 	}
 	writeFile(t, filepath.Join(clusterFile, "keep"), content)
 	before := snapshot(t, d.Path())
-	if err := d.RemoveNode("web-2", 4); err == nil {
+	if err := d.RemoveNodes([]string{"web-2"}, 4); err == nil {
 		t.Fatal("RemoveNode succeeded without writing the cluster file")
 	}
 	if after := snapshot(t, d.Path()); !maps.Equal(before, after) {
@@ -111,7 +112,7 @@ func TestRemoveNodeThatCantRemoveTheNodeFileLeavesTheDirectoryAsItWas(t *testing
 		t.Skip("root writes to read-only directories")
 	}
 	d := clusterOf(t, "web-1", "web-2")
-	if err := d.RemoveNode("web-1", 3); err != nil {
+	if err := d.RemoveNodes([]string{"web-1"}, 3); err != nil {
 		t.Fatal(err)
 	}
 	nodes := filepath.Join(d.Path(), "nodes")
@@ -120,7 +121,7 @@ func TestRemoveNodeThatCantRemoveTheNodeFileLeavesTheDirectoryAsItWas(t *testing
 	}
 	t.Cleanup(func() { os.Chmod(nodes, 0o755) })
 	before := snapshot(t, d.Path())
-	if err := d.RemoveNode("web-2", 4); err == nil {
+	if err := d.RemoveNodes([]string{"web-2"}, 4); err == nil {
 		t.Fatal("RemoveNode succeeded without removing the node file")
 	}
 	if after := snapshot(t, d.Path()); !maps.Equal(before, after) {
@@ -148,4 +149,143 @@ func snapshot(t *testing.T, dir string) map[string]string {
 		t.Fatal(err)
 	}
 	return files
+}
+
+func TestARemovedIdentitiesFileItCantUseIsRefused(t *testing.T) {
+	fp := "sha256:" + strings.Repeat("a", 64)
+	for name, c := range map[string]struct{ content, says string }{
+		"no node":        {"- identity: " + fp + "\n", "names no node"},
+		"a bad name":     {"- node: Web_1\n  identity: " + fp + "\n", "Web_1"},
+		"no fingerprint": {"- node: web-1\n", "isn't sha256:"},
+		"a bad one":      {"- node: web-1\n  identity: sha256:aa\n", "isn't sha256:"},
+		"two names":      {"- node: web-1\n  identity: " + fp + "\n- node: web-2\n  identity: " + fp + "\n", "edit the file"},
+		"an odd field":   {"- node: web-1\n  identity: " + fp + "\n  address: x\n", "address"},
+		"garbage":        {"{", "removed-identities.yml"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := newCluster(t)
+			if err := os.WriteFile(filepath.Join(d.Path(), cluster.RemovedFileName), []byte(c.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if removed, err := d.RemovedIdentities(); err == nil || !strings.Contains(err.Error(), c.says) {
+				t.Errorf("RemovedIdentities: %v, %v, want an error saying %q", removed, err, c.says)
+			}
+		})
+	}
+}
+
+func TestRemoveNodesTakesSeveralAtOneGeneration(t *testing.T) {
+	d := clusterOf(t, "web-1", "web-2", "web-3")
+	if err := d.RemoveNodes([]string{"web-1", "web-3"}, 3); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := cluster.Open(d.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.Cluster.Generation != 3 {
+		t.Errorf("the directory is at generation %d, want 3", reopened.Cluster.Generation)
+	}
+	nodes, err := reopened.Nodes()
+	if err != nil || len(nodes) != 1 || nodes[0].Name != "web-2" {
+		t.Errorf("the nodes are %v, %v, want web-2 alone", nodes, err)
+	}
+	removed, err := reopened.RemovedIdentities()
+	if err != nil || len(removed) != 2 || removed[0].Node != "web-1" || removed[1].Node != "web-3" {
+		t.Errorf("the removed identities are %v, %v, want web-1's and web-3's", removed, err)
+	}
+}
+
+func TestRemoveNodesOfANameItLacksChangesNothing(t *testing.T) {
+	d := clusterOf(t, "web-1", "web-2")
+	before := snapshot(t, d.Path())
+	if err := d.RemoveNodes([]string{"web-1", "web-9"}, 3); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("RemoveNodes: %v, want fs.ErrNotExist", err)
+	}
+	if after := snapshot(t, d.Path()); !maps.Equal(before, after) {
+		t.Errorf("the failed RemoveNodes changed the directory from\n%v\nto\n%v", before, after)
+	}
+}
+
+func TestRemoveNodesThatCantWriteTheGenerationPutsEveryNodeBack(t *testing.T) {
+	d := clusterOf(t, "web-1", "web-2", "web-3")
+	clusterFile := filepath.Join(d.Path(), "cluster.yml")
+	content := readFile(t, clusterFile)
+	if err := os.Remove(clusterFile); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(clusterFile, "keep"), content)
+	before := snapshot(t, d.Path())
+	if err := d.RemoveNodes([]string{"web-1", "web-2"}, 4); err == nil {
+		t.Fatal("RemoveNodes succeeded without writing the cluster file")
+	}
+	if after := snapshot(t, d.Path()); !maps.Equal(before, after) {
+		t.Errorf("the failed RemoveNodes changed the directory from\n%v\nto\n%v", before, after)
+	}
+}
+
+// The second removal of a name fails, with the first gone.
+func TestRemoveNodesThatFailsPartwayPutsBackWhatItRemoved(t *testing.T) {
+	d := clusterOf(t, "web-1", "web-2")
+	before := snapshot(t, d.Path())
+	if err := d.RemoveNodes([]string{"web-1", "web-1"}, 3); err == nil {
+		t.Fatal("RemoveNodes of a name twice succeeded")
+	}
+	if after := snapshot(t, d.Path()); !maps.Equal(before, after) {
+		t.Errorf("the failed RemoveNodes changed the directory from\n%v\nto\n%v", before, after)
+	}
+}
+
+// A crash between the list's write and the node file's removal leaves
+// the identity listed with the node still there.
+func TestARerunOfARemovalCutShortListsTheIdentityOnce(t *testing.T) {
+	d := clusterOf(t, "web-1", "web-2")
+	n, err := d.Node("web-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := "- node: web-2\n  identity: " + n.Identity + "\n"
+	if err := os.WriteFile(filepath.Join(d.Path(), cluster.RemovedFileName), []byte(entry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RemoveNodes([]string{"web-2"}, 5); err != nil {
+		t.Fatalf("the rerun: %v", err)
+	}
+	removed, err := d.RemovedIdentities()
+	if err != nil || !slices.Equal(removed, []cluster.RemovedIdentity{{Node: "web-2", Identity: n.Identity}}) {
+		t.Errorf("the removed identities are %v, %v", removed, err)
+	}
+}
+
+// A file a crash or a merge left with one entry twice is read as it is.
+func TestAnIdentityListedTwiceUnderItsNameIsRead(t *testing.T) {
+	d := newCluster(t)
+	entry := "- node: web-1\n  identity: sha256:" + strings.Repeat("a", 64) + "\n"
+	if err := os.WriteFile(filepath.Join(d.Path(), cluster.RemovedFileName), []byte(entry+entry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.RemovedIdentities(); err != nil {
+		t.Errorf("RemovedIdentities: %v", err)
+	}
+}
+
+func FuzzRemovedIdentities(f *testing.F) {
+	f.Add("- node: web-1\n  identity: sha256:" + strings.Repeat("a", 64) + "\n")
+	f.Add("- {}\n")
+	f.Add("- node: !!binary /w==\n")
+	f.Fuzz(func(t *testing.T, content string) {
+		d := newCluster(t)
+		if err := os.WriteFile(filepath.Join(d.Path(), cluster.RemovedFileName), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		removed, err := d.RemovedIdentities()
+		if err != nil {
+			return
+		}
+		for _, r := range removed {
+			if err := cluster.CheckName(r.Node); err != nil {
+				t.Fatalf("read the node %q: %v", r.Node, err)
+			}
+		}
+	})
 }

@@ -183,9 +183,11 @@ func Serve(ctx context.Context, cfg Config) error {
 	}
 	agent := &agentServer{node: node, nodeFile: cfg.NodeFile, containerd: client, shim: filepath.Join(cfg.ContainerdBinDir, hostlayout.ContainerdShim), runc: cfg.Runc, containers: containers, generationFile: cfg.GenerationFile, lock: loadLock(cfg.LockFile), removed: removed, members: members, peerPort: cfg.PeerPort, updater: updater, version: cfg.Version}
 	agent.controlPlane.Store(node.Mode == hostlayout.ModeControlPlane)
+	removed.onAdd = agent.applyRemoval
 	// A generation file the agent can't read gives no seeds; status says
 	// why, and the next recording repairs it.
 	if applied, err := agent.applied(); err == nil {
+		agent.forgetRemoved(applied)
 		agent.seed(applied.Nodes)
 	}
 	agent.containerdBinaries = &containerdBinaries{dir: cfg.ContainerdBinDir, files: cfg.ContainerdFiles, restart: cfg.RestartContainerd, wait: agent.waitContainerd}
@@ -279,7 +281,7 @@ type agentServer struct {
 	generationFile string
 	lock           *operationLock
 	removed        *removedIdentities
-	members        *hivemindadapter.Membership
+	members        membership
 	// peerPort is the port the nodes listen for peers on.
 	peerPort           uint16
 	updater            *abslot.Component
@@ -311,6 +313,14 @@ func (s *agentServer) Status(ctx context.Context, _ *nodev1.StatusRequest) (*nod
 	return res, nil
 }
 
+// membership is the node's membership, as the agent calls it.
+type membership interface {
+	Status() hivemindadapter.Status
+	SetSeeds([]hivemindadapter.Seed) error
+	Forget(nodeID string) error
+	CutOff(fingerprint string) error
+}
+
 // memberStates are membership's states as the node API names them.
 var memberStates = map[hivemindadapter.State]nodev1.MemberState{
 	hivemindadapter.Alive:   nodev1.MemberState_MEMBER_STATE_ALIVE,
@@ -339,13 +349,15 @@ func (s *agentServer) RecordGeneration(_ context.Context, req *nodev1.RecordGene
 		if recorded, err := s.applied(); err == nil && req.Generation < recorded.Generation {
 			return status.Errorf(codes.FailedPrecondition, "the node has applied generation %d, later than %d", recorded.Generation, req.Generation)
 		}
-		data, err := json.Marshal(appliedGeneration{Generation: req.Generation, Nodes: nodes})
+		recording := appliedGeneration{Generation: req.Generation, Nodes: nodes}
+		data, err := json.Marshal(recording)
 		if err == nil {
 			err = writeFile(s.generationFile, append(data, '\n'))
 		}
 		if err != nil {
 			return status.Errorf(codes.Internal, "recording the generation: %v", err)
 		}
+		s.forgetRemoved(recording)
 		s.seed(nodes)
 		return nil
 	})
@@ -576,8 +588,7 @@ func (s *agentServer) ImportImage(stream nodev1.Agent_ImportImageServer) error {
 	if err := fence(); err != nil {
 		return err
 	}
-	// The archive is read whole before the import waits for its turn, so
-	// that a client that stalls holds up no change of the containers.
+	// The archive is read whole before the import waits for its turn.
 	archive, err := spool(filepath.Dir(s.containers.file), first, stream)
 	if err != nil {
 		return err

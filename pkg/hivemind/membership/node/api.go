@@ -197,8 +197,8 @@ type Seed struct {
 }
 
 // Forget removes the member ID from the view at once, reports it in
-// Result.Forgotten and holds its grave for GraveTimeout: until then, or
-// until a Join names it as a seed, the node ignores every entry of it, at
+// Result.Forgotten and holds its grave: until a Join names it as a seed,
+// past GraveTimeout too, the node ignores every entry of it, at
 // any incarnation, probes it no more, and it is no longer a seed. A probe
 // of it under way runs out its period with no verdict. A member already
 // buried, or one the node keeps nothing of, gets a held grave too, and

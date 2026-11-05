@@ -425,7 +425,11 @@ func printStatus(env Env, view statusView) error {
 			t.problem(p)
 		}
 	}
-	t.print(&b)
+	if len(view.Nodes) == 0 {
+		b.WriteString("The cluster has no nodes: add one with mooctl node add\n")
+	} else {
+		t.print(&b)
+	}
 	if len(t.problems) > 0 {
 		fmt.Fprintf(&b, "\n%s\n", strings.Join(t.problems, "\n"))
 	}
@@ -725,7 +729,7 @@ func clusterUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 // rerun is the command line that runs cluster update as cmd ran it: in
 // its cluster directory, from its release source, with --force and its
 // --source and the components it names, if it has them, each quoted for
-// a shell. A release source with a user or a password in it is left out.
+// a shell, but for a release source mooctlIn leaves out.
 func rerun(cmd *cli.Command) string {
 	args := append(mooctlIn(cmd), "cluster", "update")
 	if cmd.Bool("force") {
@@ -741,14 +745,15 @@ func rerun(cmd *cli.Command) string {
 }
 
 // mooctlIn is mooctl, run in cmd's cluster directory, from its release
-// source, which it leaves out if it holds a user or a password.
+// source, which it leaves out if it is a URL that holds a user or a
+// query, or that doesn't parse.
 func mooctlIn(cmd *cli.Command) []string {
 	args := []string{"mooctl"}
 	if dir := clusterDir(cmd); dir != "." {
 		args = append(args, "-C", dir)
 	}
 	if source := cmd.String("release-source"); source != "" {
-		if u, err := url.Parse(source); err != nil || u.User == nil {
+		if u, err := url.Parse(source); !strings.Contains(source, "://") || err == nil && u.User == nil && u.RawQuery == "" {
 			args = append(args, "--release-source", source)
 		}
 	}
@@ -829,6 +834,10 @@ func runClusterUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	nodes, err := nodesToUpdate(d)
+	if err != nil {
+		return err
+	}
 	if err := installable(env, d.Cluster.Release); err != nil {
 		return err
 	}
@@ -853,10 +862,6 @@ func runClusterUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 		}
 		pinned[name] = pc
 	}
-	nodes, err := d.Nodes()
-	if err != nil {
-		return err
-	}
 	arch := map[string]string{}
 	releases := map[string]orchestrate.NodeRelease{}
 	for _, n := range nodes {
@@ -868,7 +873,7 @@ func runClusterUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 			return err
 		}
 	}
-	c, err := preflight(ctx, env, cmd, d, "", func(s nodeclient.Status, all []nodeclient.Status) error {
+	c, err := preflight(ctx, env, cmd, d, nil, func(s nodeclient.Status, all []nodeclient.Status) error {
 		return updates(env, rel.Manifest, s, all)
 	})
 	if err != nil {
@@ -886,6 +891,15 @@ func runClusterUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 	}
 	fmt.Fprintf(env.Stdout, "Every node runs release %s.\n", rel.Version)
 	return nil
+}
+
+// nodesToUpdate is d's nodes, or orchestrate.ErrNoNodes if it has none.
+func nodesToUpdate(d *cluster.Dir) ([]cluster.Node, error) {
+	nodes, err := d.Nodes()
+	if err == nil && len(nodes) == 0 {
+		return nil, orchestrate.ErrNoNodes
+	}
+	return nodes, err
 }
 
 // nodeRelease is what an update installs on a node of arch from rel: the

@@ -77,7 +77,7 @@ func (md *model) drop(now time.Time, self, id member.ID, graves time.Duration) (
 
 func (md *model) expire(now time.Time, graves time.Duration) {
 	for id, g := range md.graves {
-		if !now.Before(g.at.Add(graves)) {
+		if !g.held && !now.Before(g.at.Add(graves)) {
 			delete(md.graves, id)
 		}
 	}

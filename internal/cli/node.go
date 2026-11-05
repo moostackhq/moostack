@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/netip"
 	"path/filepath"
 	"slices"
@@ -29,7 +30,6 @@ import (
 	"github.com/moostackhq/moostack/internal/sshconfig"
 )
 
-// nodeCommand is mooctl node.
 func nodeCommand(env Env) *cli.Command {
 	return &cli.Command{
 		Name:  "node",
@@ -70,18 +70,15 @@ func nodeCommand(env Env) *cli.Command {
 			{
 				Name:      "remove",
 				Usage:     "stop a node's cluster services, remove its node components from its host, and take it out of the cluster, whose nodes then refuse its identity",
-				ArgsUsage: "<node>",
+				ArgsUsage: "<node>...",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{
 						Name:  "unreachable",
-						Usage: "remove a node that can't be reached, without reaching it: the preflight skips it alone, and its host is left as it is",
+						Usage: "remove nodes that can't be reached, one or several, without reaching them: the preflight skips them alone, and their hosts are left as they are",
 					},
 					forceFlag,
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if err := wantArgs(cmd, 1); err != nil {
-						return err
-					}
 					return withHint(nodeRemove(ctx, env, cmd))
 				},
 			},
@@ -120,7 +117,7 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	// finished, its node is recorded all the same.
 	ctx, stop := interrupt.Context(ctx, env.Exit)
 	defer stop()
-	cl, err := preflight(ctx, env, cmd, d, "", nil)
+	cl, err := preflight(ctx, env, cmd, d, nil, nil)
 	if err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("node add interrupted: %w", err)
@@ -151,7 +148,7 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 		return err
 	}
 	return addEach(ctx, env, rerunNodeAdd(cmd), hosts, func(h *newHost, later bool) error {
-		return addNode(ctx, env, cl, d, rel, ca, cluster.Fingerprints(removed), h, later)
+		return addNode(ctx, env, cl, d, rel, ca, removed, h, later)
 	})
 }
 
@@ -179,15 +176,26 @@ func addEach(ctx context.Context, env Env, again string, hosts []*newHost, add f
 }
 
 // rerunNodeAdd is the start of the command line that runs node add as
-// cmd ran it, but for other targets: in its cluster directory, from its
-// release source, with its SSH key, which opens the secret store, and
-// --force if it had it, each quoted for a shell.
+// cmd ran it, but for other targets.
 func rerunNodeAdd(cmd *cli.Command) string {
+	return rerunNode(cmd, "add")
+}
+
+// removeUnreachable is the command line that removes names with
+// --unreachable, run as cmd ran.
+func removeUnreachable(cmd *cli.Command, names ...string) string {
+	return rerunNode(cmd, slices.Concat([]string{"remove"}, names, []string{"--unreachable"})...)
+}
+
+// rerunNode is the command line that runs mooctl node with words as cmd
+// ran: in its cluster directory, from its release source, with its SSH
+// key and --force if it had them, each quoted for a shell.
+func rerunNode(cmd *cli.Command, words ...string) string {
 	args := mooctlIn(cmd)
 	if key := cmd.String("ssh-key"); key != "" {
 		args = append(args, "--ssh-key", key)
 	}
-	args = append(args, "node", "add")
+	args = append(append(args, "node"), words...)
 	if cmd.Bool("force") {
 		args = append(args, "--force")
 	}
@@ -269,12 +277,11 @@ const recheckTimeout = time.Minute
 // addNode installs the release on h, records it in the cluster directory
 // at the next generation, and has every node record that generation.
 // A host that comes later, after another, it checks again first.
-func addNode(ctx context.Context, env Env, cl *orchestrate.Cluster, d *cluster.Dir, rel *release.Release, ca *identity.CA, removed []string, h *newHost, later bool) error {
+func addNode(ctx context.Context, env Env, cl *orchestrate.Cluster, d *cluster.Dir, rel *release.Release, ca *identity.CA, removed []cluster.RemovedIdentity, h *newHost, later bool) error {
 	n, name := h.n, h.n.Name
 	adding := fmt.Sprintf("adding %s as %s", h.target, name)
 	if later {
-		// The host must answer within recheckTimeout, but the check has no
-		// bound of its own.
+		// The host must answer within recheckTimeout before the check runs.
 		answerCtx, cancel := context.WithTimeout(ctx, recheckTimeout)
 		_, err := h.c.Run(answerCtx, "true", nil)
 		timedOut := err != nil && errors.Is(answerCtx.Err(), context.DeadlineExceeded)
@@ -318,7 +325,7 @@ func addNode(ctx context.Context, env Env, cl *orchestrate.Cluster, d *cluster.D
 		return cl.Record(ctx, generation)
 	})
 	if err != nil {
-		return &addedError{fmt.Errorf("added %s, but cluster status shows these nodes behind until an operation that changes the cluster directory records its generation: %w", name, err)}
+		return &addedError{fmt.Errorf("added %s, but cluster status shows these nodes behind until the next operation has them record its generation: %w", name, err)}
 	}
 	if interrupted {
 		return &addedError{fmt.Errorf("node add interrupted once %s was added as %s, which the nodes recorded", h.target, name)}
@@ -678,21 +685,48 @@ func reachHost(ctx context.Context, env Env, target string, private netip.Addr, 
 	return &reachedHost{c: c, settings: settings, key: key, host: host, private: private}, nil
 }
 
-// nodeRemove is mooctl node remove.
 func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {
-	name := cmd.Args().First()
+	names := cmd.Args().Slice()
 	unreachable := cmd.Bool("unreachable")
+	if len(names) == 0 {
+		return fmt.Errorf("%s takes the nodes to remove; see --help", cmd.FullName())
+	}
+	if len(names) > 1 && !unreachable {
+		return fmt.Errorf("%s reaches one host at a time: give it one node, or several with --unreachable", cmd.FullName())
+	}
+	for i, name := range names {
+		if slices.Contains(names[:i], name) {
+			return fmt.Errorf("%s is given twice", name)
+		}
+	}
 	d, err := openCluster(cmd)
 	if err != nil {
 		return err
 	}
-	n, err := d.Node(name)
+	listed, err := d.RemovedIdentities()
 	if err != nil {
 		return err
 	}
-	skip := ""
+	for _, name := range names {
+		_, err := d.Node(name)
+		if errors.Is(err, fs.ErrNotExist) && namesRemoved(listed, name) {
+			return fmt.Errorf("%s is removed already: leave it out", name)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	all, err := d.Nodes()
+	if err != nil {
+		return err
+	}
+	who, is, was := strings.Join(names, ", "), "is", "was"
+	if len(names) > 1 {
+		is, was = "are", "were"
+	}
+	var skip []string
 	if unreachable {
-		skip = name
+		skip = names
 	}
 	// From here on, a signal ends the preflight or the reach of the
 	// node's host, and node remove gives the lock back, rather than
@@ -704,8 +738,19 @@ func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil && ctx.Err() != nil {
 		return fmt.Errorf("node remove interrupted: %w", err)
 	}
-	if perr := (*orchestrate.PreflightError)(nil); !unreachable && errors.As(err, &perr) && perr.Unreachable(name) {
-		return fmt.Errorf("%w\nIf %s can't be reached, remove it without reaching it with mooctl node remove %s --unreachable.", err, name, name)
+	if perr := (*orchestrate.PreflightError)(nil); errors.As(err, &perr) && (unreachable || perr.Unreachable(names[0])) {
+		gone := slices.Clone(names)
+		for _, n := range all {
+			if perr.Unreachable(n.Name) && !slices.Contains(gone, n.Name) {
+				gone = append(gone, n.Name)
+			}
+		}
+		if len(gone) > len(names) {
+			return fmt.Errorf("%w\nIf %s can't be reached, remove them without reaching them with %s.", err, strings.Join(gone, ", "), removeUnreachable(cmd, gone...))
+		}
+		if !unreachable {
+			return fmt.Errorf("%w\nIf %s can't be reached, remove it without reaching it with %s.", err, who, removeUnreachable(cmd, names...))
+		}
 	}
 	if err != nil {
 		return err
@@ -714,36 +759,42 @@ func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {
 	// The rest runs only while the operation holds the lock.
 	ctx = cl.Context()
 	if !unreachable {
-		if err := uninstall(ctx, env, cl, n); err != nil {
+		n, err := d.Node(names[0])
+		if err != nil {
 			return err
 		}
-	} else if err := stoppedBefore(ctx, "removing "+name); err != nil {
+		if err := uninstall(ctx, env, cmd, cl, n); err != nil {
+			return err
+		}
+	} else if err := stoppedBefore(ctx, "removing "+who); err != nil {
 		return err
 	}
 	generation := cl.Next(d.Cluster.Generation)
-	if err := d.RemoveNode(name, generation); err != nil {
+	if err := d.RemoveNodes(names, generation); err != nil {
 		if unreachable {
-			return fmt.Errorf("recording that %s is removed: %w", name, err)
+			return fmt.Errorf("recording that %s %s removed: %w", who, is, err)
 		}
-		return fmt.Errorf("%s's host is cleaned, but recording that it is removed failed, so remove it with mooctl node remove %s --unreachable: %w", name, name, err)
+		return fmt.Errorf("%s's host is cleaned, but recording that it is removed failed, so remove it with %s: %w", who, removeUnreachable(cmd, names...), err)
 	}
-	fmt.Fprintf(env.Stdout, "Removed node %s, at generation %d of the cluster directory\n", name, generation)
-	if unreachable {
-		fmt.Fprintf(env.Stdout, "%s's host was left as it is. If it comes back, the cluster's nodes refuse it as a peer, but it still runs Moostack's components: to clean it, %s.\n", name, bootstrap.CleanByHand)
+	for _, name := range names {
+		fmt.Fprintf(env.Stdout, "Removed node %s, at generation %d of the cluster directory\n", name, generation)
+		if unreachable {
+			fmt.Fprintf(env.Stdout, "%s's host was left as it is. If it comes back, the cluster's nodes refuse it as a peer, but it still runs Moostack's components: to clean it, %s.\n", name, bootstrap.CleanByHand)
+		}
 	}
 	remindToCommit(env)
 	removed, err := d.RemovedIdentities()
 	if err != nil {
 		return err
 	}
-	interrupted, err := tellNodes(ctx, env, cl, name+" is removed", func(ctx context.Context) error {
-		return errors.Join(cl.RemoveIdentities(ctx, cluster.Fingerprints(removed)), cl.Record(ctx, generation))
+	interrupted, err := tellNodes(ctx, env, cl, who+" "+is+" removed", func(ctx context.Context) error {
+		return errors.Join(cl.RemoveIdentities(ctx, removed), cl.Record(ctx, generation))
 	})
 	if err != nil {
-		return fmt.Errorf("removed %s, but the next operation has to finish telling these nodes, until which they may still accept its identity: %w", name, err)
+		return fmt.Errorf("removed %s, but the next operation has to finish telling these nodes: %w", who, err)
 	}
 	if interrupted {
-		return fmt.Errorf("node remove interrupted once %s was removed, which the nodes were told", name)
+		return fmt.Errorf("node remove interrupted once %s %s removed, which the nodes were told", who, was)
 	}
 	return nil
 }
@@ -780,13 +831,13 @@ func tellNodes(ctx context.Context, env Env, cl *orchestrate.Cluster, change str
 
 // uninstall stops n's cluster services and removes its node components
 // from its host, over SSH, once it has left n out of the operation cl.
-func uninstall(ctx context.Context, env Env, cl *orchestrate.Cluster, n cluster.Node) error {
+func uninstall(ctx context.Context, env Env, cmd *cli.Command, cl *orchestrate.Cluster, n cluster.Node) error {
 	c, err := sshclient.Dial(ctx, sshclient.Node{Target: n.User + "@" + n.Address, HostKeys: []ssh.PublicKey{n.HostKey}}, sshOptions(env))
 	if err != nil && ctx.Err() != nil {
 		return stopped(ctx, "reaching "+n.Name+"'s host to clean it, which stays in the cluster directory", err)
 	}
 	if err != nil {
-		return fmt.Errorf("%s stays in the cluster directory, since its host can't be reached to clean it: %w\nIf it can't be reached, remove it without reaching it with mooctl node remove %s --unreachable.", n.Name, err, n.Name)
+		return fmt.Errorf("%s stays in the cluster directory, since its host can't be reached to clean it: %w\nIf it can't be reached, remove it without reaching it with %s.", n.Name, err, removeUnreachable(cmd, n.Name))
 	}
 	defer c.Close()
 	if err := cl.CheckLock(); err != nil {
@@ -795,7 +846,7 @@ func uninstall(ctx context.Context, env Env, cl *orchestrate.Cluster, n cluster.
 	fmt.Fprintf(env.Stdout, "Stopping the cluster services of %s and removing its node components\n", n.Name)
 	cl.Remove(n.Name)
 	if err := bootstrap.Uninstall(ctx, c); err != nil {
-		return fmt.Errorf("removing %s's node components: %w\n%s stays in the cluster directory. To finish, %s on its host, then remove it with mooctl node remove %s --unreachable.", n.Name, err, n.Name, bootstrap.CleanByHand, n.Name)
+		return fmt.Errorf("removing %s's node components: %w\n%s stays in the cluster directory. To finish, %s on its host, then remove it with %s.", n.Name, err, n.Name, bootstrap.CleanByHand, removeUnreachable(cmd, n.Name))
 	}
 	return nil
 }
@@ -824,7 +875,9 @@ func (n unreachedNode) ReleaseLock(context.Context, string) error { return n.err
 
 func (n unreachedNode) BreakLock(context.Context) (*nodeclient.Lock, error) { return nil, n.err }
 
-func (n unreachedNode) RemoveIdentities(context.Context, []string, string) error { return n.err }
+func (n unreachedNode) RemoveIdentities(context.Context, []*nodev1.RemovedIdentity, string) error {
+	return n.err
+}
 
 func (n unreachedNode) UpdateAgent(context.Context, string, []byte, time.Duration) error {
 	return n.err

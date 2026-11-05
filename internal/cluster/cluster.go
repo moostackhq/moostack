@@ -3,7 +3,6 @@
 package cluster
 
 import (
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -16,6 +15,8 @@ import (
 	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
 
+	"github.com/moostackhq/moostack/internal/hostlayout"
+	"github.com/moostackhq/moostack/internal/identity"
 	"github.com/moostackhq/moostack/internal/release"
 	"github.com/moostackhq/moostack/internal/strictyaml"
 )
@@ -111,18 +112,8 @@ func (n Node) check() error {
 // checkIdentity checks n's identity, which an install issues after
 // CheckNewNode.
 func (n Node) checkIdentity() error {
-	if err := checkFingerprint(n.Identity); err != nil {
+	if err := identity.CheckFingerprint(n.Identity); err != nil {
 		return fmt.Errorf("identity: %w", err)
-	}
-	return nil
-}
-
-// checkFingerprint checks that fp is a node identity's fingerprint: the
-// SHA-256 of its certificate, hex, after "sha256:".
-func checkFingerprint(fp string) error {
-	sum, ok := strings.CutPrefix(fp, "sha256:")
-	if _, err := hex.DecodeString(sum); !ok || err != nil || len(sum) != 64 || strings.ToLower(sum) != sum {
-		return fmt.Errorf("%q isn't sha256: and 64 lowercase hex digits", fp)
 	}
 	return nil
 }
@@ -387,12 +378,7 @@ func (d *Dir) Node(name string) (Node, error) {
 
 // RemovedIdentity is a removed node's identity, as the cluster directory
 // lists it.
-type RemovedIdentity struct {
-	// Node is the name the node had.
-	Node string `yaml:"node"`
-	// Identity is the fingerprint of its identity.
-	Identity string `yaml:"identity"`
-}
+type RemovedIdentity = hostlayout.RemovedIdentity
 
 // RemovedIdentities are the identities of the nodes removed from the
 // cluster, in the order they were removed.
@@ -409,35 +395,44 @@ func (d *Dir) RemovedIdentities() ([]RemovedIdentity, error) {
 	if err := strictyaml.Unmarshal(data, &removed); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	nodeOf := map[string]string{}
 	for _, r := range removed {
-		if err := checkFingerprint(r.Identity); err != nil {
-			return nil, fmt.Errorf("%s: %s: %w", path, r.Node, err)
+		if err := r.Check(); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
 		}
+		if err := CheckName(r.Node); err != nil {
+			return nil, fmt.Errorf("%s: the node of the identity %s: %w", path, r.Identity, err)
+		}
+		if node, ok := nodeOf[r.Identity]; ok && node != r.Node {
+			return nil, fmt.Errorf("%s: the identity %s is listed under the nodes %s and %s: edit the file to leave the one it had", path, r.Identity, node, r.Node)
+		}
+		nodeOf[r.Identity] = r.Node
 	}
 	return removed, nil
 }
 
-// Fingerprints are the fingerprints of removed, in order.
-func Fingerprints(removed []RemovedIdentity) []string {
-	fps := make([]string, len(removed))
-	for i, r := range removed {
-		fps[i] = r.Identity
-	}
-	return fps
-}
-
-// RemoveNode lists the identity of the node called name as removed,
-// removes its node file, and writes the cluster file at generation. If
-// the directory has no such node, the error is fs.ErrNotExist. If it
-// fails, it leaves the directory as it was.
-func (d *Dir) RemoveNode(name string, generation int64) error {
-	n, err := d.Node(name)
-	if err != nil {
-		return err
-	}
+// RemoveNodes lists the identities of the nodes called names as removed,
+// removes their node files, and writes the cluster file at generation. If
+// the directory has no node of a name, the error is fs.ErrNotExist. If it
+// fails, it leaves the directory as it was, but for a node file it can't
+// put back, whose identity it leaves listed.
+func (d *Dir) RemoveNodes(names []string, generation int64) error {
 	removed, err := d.RemovedIdentities()
 	if err != nil {
 		return err
+	}
+	nodesBefore := map[string][]byte{}
+	for _, name := range names {
+		n, err := d.Node(name)
+		if err != nil {
+			return err
+		}
+		if nodesBefore[name], err = os.ReadFile(d.nodePath(name)); err != nil {
+			return err
+		}
+		if entry := (RemovedIdentity{Node: n.Name, Identity: n.Identity}); !slices.Contains(removed, entry) {
+			removed = append(removed, entry)
+		}
 	}
 	listPath := filepath.Join(d.path, RemovedFileName)
 	listBefore, err := os.ReadFile(listPath)
@@ -445,36 +440,48 @@ func (d *Dir) RemoveNode(name string, generation int64) error {
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	nodeBefore, err := os.ReadFile(d.nodePath(name))
+	data, err := yaml.Marshal(removed)
 	if err != nil {
 		return err
 	}
-	data, err := yaml.Marshal(append(removed, RemovedIdentity{Node: n.Name, Identity: n.Identity}))
-	if err != nil {
-		return err
-	}
-	// The identity is listed first, so that a node file is never gone
-	// while its identity isn't listed.
+	// A node file is never gone while its identity isn't listed.
 	if err := writeFile(listPath, data, os.Rename); err != nil {
 		return err
 	}
-	putListBack := func() {
-		if listExisted {
-			writeFile(listPath, listBefore, os.Rename)
-		} else {
-			os.Remove(listPath)
+	putBack := func(gone []string) error {
+		return restoreNodes(gone, func(name string) error { return createFile(d.nodePath(name), nodesBefore[name]) }, func() {
+			if listExisted {
+				writeFile(listPath, listBefore, os.Rename)
+			} else {
+				os.Remove(listPath)
+			}
+		})
+	}
+	for i, name := range names {
+		if err := os.Remove(d.nodePath(name)); err != nil {
+			return errors.Join(err, putBack(names[:i]))
 		}
 	}
-	if err := os.Remove(d.nodePath(name)); err != nil {
-		putListBack()
-		return err
-	}
 	if err := d.setGeneration(generation); err != nil {
-		createFile(d.nodePath(name), nodeBefore)
-		putListBack()
-		return err
+		return errors.Join(err, putBack(names))
 	}
 	return nil
+}
+
+// restoreNodes puts back the node files of gone with create, and then the
+// list of removed identities with putList. If a node file can't be put
+// back, it keeps the list, which still names that node, and fails.
+func restoreNodes(gone []string, create func(name string) error, putList func()) error {
+	var errs []error
+	for _, name := range gone {
+		if err := create(name); err != nil {
+			errs = append(errs, fmt.Errorf("putting back %s's node file, so its identity stays listed as removed: %w", name, err))
+		}
+	}
+	if len(errs) == 0 {
+		putList()
+	}
+	return errors.Join(errs...)
 }
 
 // setGeneration writes the cluster file at generation.

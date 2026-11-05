@@ -32,9 +32,7 @@ import (
 
 // Relay is the command that connects to a unix socket on a node through
 // sudo, for sshclient.Options.Relay. The relay is that of the program
-// that serves the socket, so that a broken agent doesn't keep mooctl from
-// the updater. It panics for a socket no program serves, which mooctl
-// never dials.
+// that serves the socket. It panics for a socket no program serves.
 func Relay(socket string) string {
 	program, ok := hostlayout.Server(socket)
 	if !ok {
@@ -236,10 +234,7 @@ func (s Status) Services() []*nodev1.Component {
 
 // Printable is s, a text that a node reported, quoted if it holds a rune
 // that isn't printable, such as a line break or an escape, or isn't
-// valid UTF-8, whose stray bytes some terminals take as controls, so that
-// whatever repeats it to the operator shows it as one piece of text,
-// which can't add lines of its own or move the terminal's cursor. A text
-// that is printable is as it was.
+// valid UTF-8. A text that is printable is as it was.
 func Printable(s string) string {
 	if !utf8.ValidString(s) || strings.ContainsFunc(s, func(r rune) bool { return !strconv.IsPrint(r) }) {
 		return strconv.Quote(s)
@@ -264,10 +259,10 @@ func (n *Node) RecordGeneration(ctx context.Context, generation int64, nodes []*
 	return err
 }
 
-// RemoveIdentities has the agent add identities, by their fingerprints,
-// to those the node holds as removed and refuses as peers, for the
-// operation whose lease holds the node's operation lock.
-func (n *Node) RemoveIdentities(ctx context.Context, identities []string, lease string) error {
+// RemoveIdentities has the agent add identities to those the node holds
+// as removed and refuses as peers, for the operation whose lease holds
+// the node's operation lock.
+func (n *Node) RemoveIdentities(ctx context.Context, identities []*nodev1.RemovedIdentity, lease string) error {
 	_, err := n.Agent.RemoveIdentities(ctx, &nodev1.RemoveIdentitiesRequest{Identities: identities, Lease: lease})
 	return err
 }

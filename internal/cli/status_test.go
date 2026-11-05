@@ -273,7 +273,7 @@ func TestClusterStatusSaysWhenANodeIsBehindTheClusterDirectory(t *testing.T) {
 	source := statusCluster(t, o, "node1", "node2")
 	o.nodes = map[string]*fakeNode{"node1": healthyNode(1), "node2": healthyNode(0)}
 	r := o.mustRun("--release-source", source, "cluster", "status")
-	wantContains(t, "cluster status", r.stdout, "\nnode2: it has applied generation 0, earlier than this cluster directory's 1, until an operation that changes the cluster directory records its generation\n")
+	wantContains(t, "cluster status", r.stdout, "\nnode2: it has applied generation 0, earlier than this cluster directory's 1, until the next operation has it record that generation\n")
 	if strings.Contains(r.stdout, "node1: ") {
 		t.Errorf("cluster status gives a problem for node1, which is at the directory's generation:\n%s", r.stdout)
 	}

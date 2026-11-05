@@ -74,7 +74,7 @@ func runSourceUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	nodes, err := d.Nodes()
+	nodes, err := nodesToUpdate(d)
 	if err != nil {
 		return err
 	}
@@ -102,7 +102,7 @@ func runSourceUpdate(ctx context.Context, env Env, cmd *cli.Command) error {
 			return err
 		}
 	}
-	c, err := preflight(ctx, env, cmd, d, "", nil)
+	c, err := preflight(ctx, env, cmd, d, nil, nil)
 	if err != nil {
 		return err
 	}

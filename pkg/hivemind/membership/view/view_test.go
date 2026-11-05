@@ -456,7 +456,7 @@ func TestForgetOldestOfOneLeavesNoneDue(t *testing.T) {
 // A dropped member, alive or not, is out of the view at once, and its held
 // grave ignores every entry of it, newer ones and tombstones included,
 // until it goes; its entry is drawn for no healing probe.
-func TestADroppedMemberStaysOutUntilItsGraveGoes(t *testing.T) {
+func TestADroppedMemberStaysOutUntilItsHoldIsLifted(t *testing.T) {
 	for _, st := range []member.State{member.Alive, member.Suspect, member.Dead} {
 		v := New(member.Member{ID: "self"})
 		v.Apply(t0, up("x", 4, member.Alive))
@@ -486,11 +486,12 @@ func TestADroppedMemberStaysOutUntilItsGraveGoes(t *testing.T) {
 			t.Fatalf("%v: %v", st, err)
 		}
 		v.Forget(t0.Add(time.Hour), time.Minute, time.Hour)
-		if _, ok := v.Buried("x"); ok {
-			t.Fatalf("%v: the grave outlived its time", st)
+		if _, ok := v.Buried("x"); !ok {
+			t.Fatalf("%v: the held grave went at its time", st)
 		}
+		v.Lift("x")
 		if got := v.Apply(t0.Add(time.Hour), up("x", 4, member.Alive)); got != Changed {
-			t.Fatalf("%v: after the grave went: %v", st, got)
+			t.Fatalf("%v: after the hold was lifted: %v", st, got)
 		}
 	}
 }
@@ -561,6 +562,24 @@ func TestHeldGravesOutlastTheCap(t *testing.T) {
 
 // Lift ends a held grave: the member's entries are taken again. A grave
 // that isn't held, and a member with no grave, are left as they are.
+func TestAHeldGraveOutlastsItsTimeoutUntilLifted(t *testing.T) {
+	v := New(member.Member{ID: "self"})
+	v.Drop(t0, "x", time.Hour)
+	later := t0.Add(1000 * time.Hour)
+	v.Expire(later, time.Hour)
+	alive := up("x", 9, member.Alive)
+	if v.Admits(alive.Member) {
+		t.Error("a held grave's member was admitted past the timeout")
+	}
+	if err := v.Check(); err != nil {
+		t.Error(err)
+	}
+	v.Lift("x")
+	if !v.Admits(alive.Member) {
+		t.Error("a member whose hold was lifted isn't admitted")
+	}
+}
+
 func TestLiftEndsAHold(t *testing.T) {
 	v := New(member.Member{ID: "self"})
 	v.Apply(t0, up("x", 1, member.Alive))

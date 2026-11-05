@@ -343,6 +343,13 @@ func TestPlacePicksTheNodeThatRunsTheAppElseTheOneWithTheFewestApps(t *testing.T
 	}
 }
 
+func TestPlaceOnNoNodesSaysToAddOne(t *testing.T) {
+	_, err := orchestrate.Place("app", nil)
+	if err == nil || err.Error() != "the cluster has no nodes: add one with mooctl node add" {
+		t.Errorf("Place on no nodes: %v", err)
+	}
+}
+
 func TestPlaceRefusesAnAppOnMoreThanOneNodeNamingThem(t *testing.T) {
 	_, err := orchestrate.Place("web", map[string][]*nodev1.ContainerStatus{
 		"node3": containersOf("app-web"), "node1": containersOf("app-web"), "node2": nil,

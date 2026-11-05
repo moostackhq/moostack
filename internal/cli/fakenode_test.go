@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 	"github.com/moostackhq/moostack/internal/appfile"
 	"github.com/moostackhq/moostack/internal/buildid"
 	"github.com/moostackhq/moostack/internal/cluster"
+	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/ociimage"
 	"github.com/moostackhq/moostack/internal/orchestrate"
@@ -61,6 +63,10 @@ type fakeNode struct {
 	acquired int
 	// removed are the identities the node holds as removed.
 	removed []string
+	// refuseRecording has the node fail to record a generation.
+	refuseRecording bool
+	// removedNames are the nodes of removed.
+	removedNames []string
 	// refuseNewRemovals makes the node fail to take identities it doesn't
 	// hold as removed yet, as when it can't keep them.
 	refuseNewRemovals bool
@@ -109,6 +115,14 @@ func identityOf(name string) string {
 	return fmt.Sprintf("sha256:%064x", sha256.Sum256([]byte(name)))
 }
 
+// removedNodes are the names of the nodes whose identities the node holds
+// as removed.
+func (n *fakeNode) removedNodes() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.removedNames)
+}
+
 // removedIdentities are the identities the node holds as removed.
 func (n *fakeNode) removedIdentities() []string {
 	n.mu.Lock()
@@ -123,7 +137,7 @@ func (n *fakeNode) dialed() int {
 	return n.dials
 }
 
-func (n *fakeNode) RemoveIdentities(ctx context.Context, identities []string, lease string) error {
+func (n *fakeNode) RemoveIdentities(ctx context.Context, identities []*nodev1.RemovedIdentity, lease string) error {
 	push := int(n.pushes.Add(1))
 	if n.removing != nil {
 		n.removing(push)
@@ -140,13 +154,17 @@ func (n *fakeNode) RemoveIdentities(ctx context.Context, identities []string, le
 		return fmt.Errorf("the operation's lease doesn't hold the node's operation lock")
 	}
 	for _, id := range identities {
-		if slices.Contains(n.removed, id) {
+		if err := (hostlayout.RemovedIdentity{Node: id.Node, Identity: id.Identity}).Check(); err != nil {
+			return err
+		}
+		if slices.Contains(n.removed, id.Identity) {
 			continue
 		}
 		if n.refuseNewRemovals {
 			return fmt.Errorf("keeping the removed identities: the disk is full")
 		}
-		n.removed = append(n.removed, id)
+		n.removed = append(n.removed, id.Identity)
+		n.removedNames = append(n.removedNames, id.Node)
 	}
 	return nil
 }
@@ -283,7 +301,19 @@ func (n *fakeNode) RecordGeneration(ctx context.Context, g int64, nodes []*nodev
 	if n.lock == nil || n.lock.Lease != lease {
 		return fmt.Errorf("the operation's lease doesn't hold the node's operation lock")
 	}
+	if n.refuseRecording {
+		return fmt.Errorf("recording the generation: the disk is full")
+	}
+	if g < n.status.Generation {
+		return fmt.Errorf("the node has applied generation %d, later than %d", n.status.Generation, g)
+	}
+	for _, listed := range nodes {
+		if _, err := netip.ParseAddr(listed.PrivateAddress); err != nil {
+			return fmt.Errorf("a node %q at the private address %q", listed.Name, listed.PrivateAddress)
+		}
+	}
 	n.recorded = append(n.recorded, g)
+	n.status.Generation = g
 	n.recordedNodes = nodes
 	return nil
 }

@@ -16,8 +16,7 @@ import (
 	"github.com/moostackhq/moostack/internal/strictyaml"
 )
 
-// The directories Moostack keeps on a host. Nothing else of Moostack's is
-// on the host, apart from its systemd units.
+// The directories Moostack keeps on a host.
 const (
 	Root      = "/opt/moostack"
 	ConfigDir = "/etc/moostack"
@@ -63,8 +62,9 @@ const (
 	// LockFile keeps the node's operation lock across restarts of the
 	// agent.
 	LockFile = StateDir + "/lock"
-	// RemovedIdentitiesFile keeps the fingerprints of the node identities
-	// removed from the cluster, which the agent refuses as peers, as
+	// RemovedIdentitiesFile keeps the identities of the nodes removed from
+	// the cluster, each with its node's name, which the agent refuses as
+	// peers, as
 	// MarshalRemovedIdentities writes them.
 	RemovedIdentitiesFile = StateDir + "/removed-identities"
 	// PeerPort is the port the agent listens for peers on, at the node's
@@ -75,8 +75,7 @@ const (
 	ContainersFile = StateDir + "/containers"
 	// ContainersDir holds a directory for each container that serves an
 	// API, named for it, which the agent mounts in the container, where
-	// the container serves its API. It is root's alone, so that no other
-	// user of the host reaches a container's API around the agent.
+	// the container serves its API. It is root's alone.
 	ContainersDir = RunDir + "/containers"
 	// ContainerLogDir holds each container's output, as <name>.log.
 	ContainerLogDir = StateDir + "/logs"
@@ -195,21 +194,49 @@ disabled_plugins = [
   socket_dir = "` + RunDir + `/containerd/s"
 `
 
-// MarshalRemovedIdentities is the fingerprints of removed identities as
-// RemovedIdentitiesFile holds them: a JSON list.
-func MarshalRemovedIdentities(fingerprints []string) []byte {
-	data, err := json.Marshal(fingerprints)
+// RemovedIdentity is a removed node's identity.
+type RemovedIdentity struct {
+	// Node is the name the node had.
+	Node string `json:"node" yaml:"node"`
+	// Identity is the fingerprint of its identity.
+	Identity string `json:"identity" yaml:"identity"`
+}
+
+// Check checks that r names a node and that its identity is a
+// fingerprint.
+func (r RemovedIdentity) Check() error {
+	if r.Node == "" {
+		return fmt.Errorf("the removed identity %q names no node", r.Identity)
+	}
+	if err := identity.CheckFingerprint(r.Identity); err != nil {
+		return fmt.Errorf("the removed identity of %q: %w", r.Node, err)
+	}
+	return nil
+}
+
+// MarshalRemovedIdentities is removed as RemovedIdentitiesFile holds
+// them: a JSON list.
+func MarshalRemovedIdentities(removed []RemovedIdentity) []byte {
+	data, err := json.Marshal(removed)
 	if err != nil {
 		panic(err)
 	}
 	return append(data, '\n')
 }
 
-// ParseRemovedIdentities reads what MarshalRemovedIdentities wrote.
-func ParseRemovedIdentities(data []byte) ([]string, error) {
-	var fingerprints []string
-	err := json.Unmarshal(data, &fingerprints)
-	return fingerprints, err
+// ParseRemovedIdentities reads what MarshalRemovedIdentities wrote. It
+// fails on an entry Check fails.
+func ParseRemovedIdentities(data []byte) ([]RemovedIdentity, error) {
+	var removed []RemovedIdentity
+	if err := json.Unmarshal(data, &removed); err != nil {
+		return nil, err
+	}
+	for _, r := range removed {
+		if err := r.Check(); err != nil {
+			return nil, err
+		}
+	}
+	return removed, nil
 }
 
 // The modes a node is operated in.

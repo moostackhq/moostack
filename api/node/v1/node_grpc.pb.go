@@ -50,8 +50,12 @@ type AgentClient interface {
 	// Status reports the node's mode and the state of its node components.
 	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
 	// RecordGeneration records the generation of the cluster directory that
-	// the node has applied, with the directory's nodes. It refuses a
-	// generation lower than the one recorded, with FAILED_PRECONDITION,
+	// the node has applied, with the directory's nodes, which membership
+	// joins, and forgets every node of a removed identity that the
+	// directory doesn't list. RemoveIdentities forgets the same by the
+	// generation last recorded, if the node can read one, and so does the
+	// agent as it starts. It refuses a generation lower than the one
+	// recorded, with FAILED_PRECONDITION,
 	// unless the node can't tell the one recorded, and refuses it with
 	// FAILED_PRECONDITION unless the request's lease holds the operation
 	// lock.
@@ -118,12 +122,14 @@ type AgentClient interface {
 	// FAILED_PRECONDITION, changing nothing, unless the request's lease
 	// holds the operation lock.
 	Remove(ctx context.Context, in *RemoveRequest, opts ...grpc.CallOption) (*RemoveResponse, error)
-	// RemoveIdentities adds node identities, by their fingerprints, to
-	// those the node holds as removed from the cluster, and refuses peers
-	// that prove one from then on, cutting off their open connections. The
-	// node keeps the identities it held already, so the list only grows.
-	// It refuses the request with FAILED_PRECONDITION unless the request's
-	// lease holds the operation lock.
+	// RemoveIdentities adds node identities to those the node holds as
+	// removed from the cluster, and refuses peers that prove one from then
+	// on, on the peer listener and in membership, cutting off their open
+	// connections. Membership forgets each removed node, as
+	// RecordGeneration says. The node keeps the identities it held already,
+	// so the list only grows. It refuses a removed identity with no node or
+	// that isn't a fingerprint with INVALID_ARGUMENT, and the request with
+	// FAILED_PRECONDITION unless its lease holds the operation lock.
 	RemoveIdentities(ctx context.Context, in *RemoveIdentitiesRequest, opts ...grpc.CallOption) (*RemoveIdentitiesResponse, error)
 	// UpdateUpdater replaces the updater with the binary that the requests
 	// carry, as the updater's UpdateAgent replaces the agent, and with the
@@ -325,8 +331,12 @@ type AgentServer interface {
 	// Status reports the node's mode and the state of its node components.
 	Status(context.Context, *StatusRequest) (*StatusResponse, error)
 	// RecordGeneration records the generation of the cluster directory that
-	// the node has applied, with the directory's nodes. It refuses a
-	// generation lower than the one recorded, with FAILED_PRECONDITION,
+	// the node has applied, with the directory's nodes, which membership
+	// joins, and forgets every node of a removed identity that the
+	// directory doesn't list. RemoveIdentities forgets the same by the
+	// generation last recorded, if the node can read one, and so does the
+	// agent as it starts. It refuses a generation lower than the one
+	// recorded, with FAILED_PRECONDITION,
 	// unless the node can't tell the one recorded, and refuses it with
 	// FAILED_PRECONDITION unless the request's lease holds the operation
 	// lock.
@@ -393,12 +403,14 @@ type AgentServer interface {
 	// FAILED_PRECONDITION, changing nothing, unless the request's lease
 	// holds the operation lock.
 	Remove(context.Context, *RemoveRequest) (*RemoveResponse, error)
-	// RemoveIdentities adds node identities, by their fingerprints, to
-	// those the node holds as removed from the cluster, and refuses peers
-	// that prove one from then on, cutting off their open connections. The
-	// node keeps the identities it held already, so the list only grows.
-	// It refuses the request with FAILED_PRECONDITION unless the request's
-	// lease holds the operation lock.
+	// RemoveIdentities adds node identities to those the node holds as
+	// removed from the cluster, and refuses peers that prove one from then
+	// on, on the peer listener and in membership, cutting off their open
+	// connections. Membership forgets each removed node, as
+	// RecordGeneration says. The node keeps the identities it held already,
+	// so the list only grows. It refuses a removed identity with no node or
+	// that isn't a fingerprint with INVALID_ARGUMENT, and the request with
+	// FAILED_PRECONDITION unless its lease holds the operation lock.
 	RemoveIdentities(context.Context, *RemoveIdentitiesRequest) (*RemoveIdentitiesResponse, error)
 	// UpdateUpdater replaces the updater with the binary that the requests
 	// carry, as the updater's UpdateAgent replaces the agent, and with the
@@ -802,8 +814,8 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Updater is the node API that the updater serves, on its own socket, so
-// that it answers whatever state the agent is in. On a node in control
+// Updater is the node API that the updater serves, on its own socket,
+// whatever state the agent is in. On a node in control
 // plane mode, the updater's local socket serves only Status, and refuses
 // its other methods with FAILED_PRECONDITION.
 type UpdaterClient interface {
@@ -863,8 +875,8 @@ type Updater_UpdateAgentClient = grpc.ClientStreamingClient[UpdateAgentRequest, 
 // All implementations must embed UnimplementedUpdaterServer
 // for forward compatibility.
 //
-// Updater is the node API that the updater serves, on its own socket, so
-// that it answers whatever state the agent is in. On a node in control
+// Updater is the node API that the updater serves, on its own socket,
+// whatever state the agent is in. On a node in control
 // plane mode, the updater's local socket serves only Status, and refuses
 // its other methods with FAILED_PRECONDITION.
 type UpdaterServer interface {

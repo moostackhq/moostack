@@ -2096,8 +2096,9 @@ func TestAJoinSkipsSeedsWithNoIDAndItself(t *testing.T) {
 // Forget takes a member out of the view at once, whatever its state, and
 // reports it. From then on the node neither probes it nor gossips it, and
 // ignores every entry of it, at any incarnation, from the member itself or
-// gossiped by another, until GraveTimeout; then it takes it back.
-func TestForgetRemovesAMemberAndKeepsItOutUntilGraveTimeout(t *testing.T) {
+// gossiped by another, past GraveTimeout, until a Join names it; then it
+// takes it back.
+func TestForgetRemovesAMemberAndKeepsItOutUntilAJoinNamesIt(t *testing.T) {
 	for _, st := range []member.State{member.Alive, member.Suspect, member.Dead, member.Left} {
 		n := soloWith(func(c *node.Config) { c.GraveTimeout = time.Hour }, "b", "c", "x")
 		if st != member.Alive {
@@ -2150,19 +2151,23 @@ func TestForgetRemovesAMemberAndKeepsItOutUntilGraveTimeout(t *testing.T) {
 			alive.Incarnation++
 			at = at.Add(time.Second)
 		}
-		at = t0.Add(time.Hour)
+		at = t0.Add(100 * time.Hour)
 		n.Step(at, node.Tick{})
+		if r := hear(n, at, alive, msg.Ping{Target: "n"}); len(r.Changes) != 0 {
+			t.Fatalf("%v: x taken back after GraveTimeout: %v", st, r.Changes)
+		}
+		n.Step(at, node.Join{Seeds: []node.Seed{{ID: "x", Addr: "x"}}})
 		if r := hear(n, at, alive, msg.Ping{Target: "n"}); len(r.Changes) != 1 {
-			t.Fatalf("%v: x not taken back after GraveTimeout: %v", st, r.Changes)
+			t.Fatalf("%v: x not taken back after a Join named it: %v", st, r.Changes)
 		}
 	}
 }
 
 // The first entry of a buried member to arrive at GraveTimeout takes it
 // back, with no tick before it, and one a nanosecond before is ignored:
-// from itself, from another's gossip, and in a sync, for a grave Forget
-// holds and for the grave of a member forgotten at DeadTimeout, whose entry
-// is no newer than its tombstone.
+// from itself, from another's gossip, and in a sync, for the grave of a
+// member forgotten at DeadTimeout, whose entry is no newer than its
+// tombstone.
 func TestABuriedMemberIsTakenBackByTheFirstEntryAtGraveTimeout(t *testing.T) {
 	const g = 100 * time.Millisecond
 	for _, grave := range []struct {
@@ -2170,7 +2175,6 @@ func TestABuriedMemberIsTakenBackByTheFirstEntryAtGraveTimeout(t *testing.T) {
 		dig  func(n *node.Node) time.Time
 		x    member.Member
 	}{
-		{"held", func(n *node.Node) time.Time { n.Step(t0, node.Forget{ID: "x"}); return t0 }, member.Member{ID: "x", Addr: "x", Incarnation: 1}},
 		{"of the dead", func(n *node.Node) time.Time {
 			dead := peer("x")
 			dead.State = member.Dead
@@ -2207,23 +2211,21 @@ func TestABuriedMemberIsTakenBackByTheFirstEntryAtGraveTimeout(t *testing.T) {
 	}
 }
 
-// A Forget at GraveTimeout holds the member afresh, for GraveTimeout from
-// then.
-func TestAForgetAtGraveTimeoutHoldsAfresh(t *testing.T) {
+// A second Forget keeps the hold, which a Join naming the member lifts
+// once.
+func TestASecondForgetKeepsTheHold(t *testing.T) {
 	const g = 100 * time.Millisecond
 	n := soloWith(func(c *node.Config) { c.GraveTimeout = g }, "b", "c", "x")
 	n.Step(t0, node.Forget{ID: "x"})
 	n.Step(t0.Add(g), node.Forget{ID: "x"})
 	alive := peer("x")
 	alive.Incarnation = 5
-	if r := hear(n, t0.Add(2*g-time.Nanosecond), alive, msg.Ping{Target: "n"}); len(r.Changes) != 0 {
-		t.Fatalf("x taken back before the second hold ran out: %v", r.Changes)
+	if r := hear(n, t0.Add(10*g), alive, msg.Ping{Target: "n"}); len(r.Changes) != 0 {
+		t.Fatalf("x taken back with its hold on: %v", r.Changes)
 	}
-	if _, ok := n.Member("x"); ok {
-		t.Fatal("x in the view before the second hold ran out")
-	}
-	if hear(n, t0.Add(2*g), alive, msg.Ping{Target: "n"}); func() bool { _, ok := n.Member("x"); return !ok }() {
-		t.Fatal("x not taken back at the second hold's end")
+	n.Step(t0.Add(10*g), node.Join{Seeds: []node.Seed{{ID: "x", Addr: "x"}}})
+	if r := hear(n, t0.Add(10*g), alive, msg.Ping{Target: "n"}); len(r.Changes) != 1 {
+		t.Fatalf("x not taken back after the Join: %v", r.Changes)
 	}
 }
 
@@ -2411,9 +2413,9 @@ func TestAForgottenMemberStaysOutWhileOthersGossipIt(t *testing.T) {
 			t.Fatalf("the others lost n04 at %v", tn.now.Sub(forgot))
 		}
 	}
-	tn.after(10 * time.Second)
-	if m, ok := tn.state("n00", "n04"); !ok || m.State != member.Alive {
-		t.Fatalf("n04 not back at n00 after GraveTimeout: %+v", m)
+	tn.after(2 * time.Minute)
+	if m, ok := tn.state("n00", "n04"); ok {
+		t.Fatalf("n04 back at n00 after GraveTimeout: %+v", m)
 	}
 }
 
@@ -2515,20 +2517,6 @@ func TestHeldMembersAgainstAModel(t *testing.T) {
 		now := t0
 		for step := range 150 {
 			now = now.Add(time.Duration(r.IntN(4000)) * time.Millisecond)
-			if h := ids[r.IntN(len(ids))]; r.IntN(3) == 0 {
-				if at, ok := held[h]; ok {
-					end := at.Add(graveTimeout - time.Duration(r.IntN(2)))
-					if !end.Before(now) {
-						now = end
-					}
-				}
-			}
-			for h, at := range held {
-				if !now.Before(at.Add(graveTimeout)) {
-					delete(held, h)
-					free[h] = true
-				}
-			}
 			id := ids[r.IntN(len(ids))]
 			var what string
 			var res node.Result

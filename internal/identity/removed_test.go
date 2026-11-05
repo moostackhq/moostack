@@ -161,3 +161,26 @@ func TestAPeerRemovedAfterAHandshakeIsRefusedOnResumingIt(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckFingerprint(t *testing.T) {
+	hex := strings.Repeat("0a", 32)
+	if err := identity.CheckFingerprint("sha256:" + hex); err != nil {
+		t.Errorf("a good fingerprint: %v", err)
+	}
+	for name, fp := range map[string]string{
+		"empty":          "",
+		"no digits":      "sha256:",
+		"no prefix":      hex,
+		"another prefix": "sha512:" + hex,
+		"62 digits":      "sha256:" + hex[2:],
+		"63 digits":      "sha256:" + hex[1:],
+		"65 digits":      "sha256:" + hex + "0",
+		"66 digits":      "sha256:" + hex + "00",
+		"uppercase":      "sha256:" + strings.ToUpper(hex),
+		"not hex":        "sha256:" + strings.Repeat("g", 64),
+	} {
+		if err := identity.CheckFingerprint(fp); err == nil {
+			t.Errorf("%s: passed", name)
+		}
+	}
+}

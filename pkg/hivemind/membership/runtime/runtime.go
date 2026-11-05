@@ -337,7 +337,7 @@ func (r *Runtime) Join(seeds ...node.Seed) error {
 
 // Forget removes the member id from the view at once, reports it to
 // OnForget if it was in the view, and ignores every entry of it, at any
-// incarnation and from anyone, until GraveTimeout or until Join names it
+// incarnation and from anyone, until Join names it
 // as a seed (node.Forget). A member the node doesn't know yet is held out
 // too. Forgetting the node itself, or the empty ID, is refused.
 func (r *Runtime) Forget(id member.ID) error {

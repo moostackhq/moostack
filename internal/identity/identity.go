@@ -392,3 +392,13 @@ func mustKeyPEM(key ed25519.PrivateKey) []byte {
 func newSerial() (*big.Int, error) {
 	return rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 }
+
+// CheckFingerprint checks that fp has a fingerprint's form: "sha256:" and
+// 64 lowercase hex digits.
+func CheckFingerprint(fp string) error {
+	sum, ok := strings.CutPrefix(fp, "sha256:")
+	if _, err := hex.DecodeString(sum); !ok || err != nil || len(sum) != 64 || strings.ToLower(sum) != sum {
+		return fmt.Errorf("%q isn't sha256: and 64 lowercase hex digits", fp)
+	}
+	return nil
+}

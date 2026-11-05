@@ -150,3 +150,49 @@ func TestANodeDoesntTakeARemovedNodeItDials(t *testing.T) {
 		}
 	}
 }
+
+// CutOff ends the connections of one identity and no other.
+func TestCutOffClosesTheConnectionsOfAnIdentity(t *testing.T) {
+	ca := newCA(t)
+	a, b, c := load(t, newIdentity(t, ca, "a", t.TempDir())), load(t, newIdentity(t, ca, "b", t.TempDir())), load(t, newIdentity(t, ca, "c", t.TempDir()))
+	addr := func(i byte) netip.AddrPort { return netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, i}), 17445) }
+	ma, err := Start(t.Context(), Config{Identity: a, Address: addr(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ma.Stop)
+	var others []*Membership
+	for i, id := range []*identity.Identity{b, c} {
+		m, err := Start(t.Context(), Config{Identity: id, Address: addr(byte(i + 2))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(m.Stop)
+		others = append(others, m)
+		if err := m.SetSeeds([]Seed{{NodeID: "a", Address: addr(1).String()}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mb, mc := others[0], others[1]
+	waitFor(t, "a holding b and c alive", func() bool {
+		s := states(ma)
+		return s["b"] == Alive && s["c"] == Alive
+	})
+	waitFor(t, "b and c holding each other alive", func() bool { return states(mb)["c"] == Alive && states(mc)["b"] == Alive })
+	// Both cut c off, as one alone answers c's indirect probes.
+	for _, m := range []*Membership{ma, mb} {
+		if err := m.CutOff(c.Fingerprint()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, "c no longer holding a and b alive", func() bool {
+		s := states(mc)
+		return s["a"] != Alive && s["b"] != Alive
+	})
+	if s := states(mb)["a"]; s != Alive {
+		t.Errorf("b holds a %s, after each cut off another identity", s)
+	}
+	if s := states(ma)["b"]; s != Alive {
+		t.Errorf("a holds b %s, after each cut off another identity", s)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -92,5 +93,85 @@ func TestReadNodeConfigNamesTheFileItCantRead(t *testing.T) {
 	}
 	if _, err := hostlayout.ReadNodeConfig(path); err == nil || !strings.Contains(err.Error(), path) {
 		t.Errorf("reading a node file that isn't one: %v, want an error naming it", err)
+	}
+}
+
+func TestTheRemovedIdentitiesFileKeepsEachNodesName(t *testing.T) {
+	first, second := "sha256:"+strings.Repeat("a", 64), "sha256:"+strings.Repeat("b", 64)
+	removed := []hostlayout.RemovedIdentity{{Node: "node2", Identity: first}, {Node: "node3", Identity: second}}
+	data := hostlayout.MarshalRemovedIdentities(removed)
+	if want := `[{"node":"node2","identity":"` + first + `"},{"node":"node3","identity":"` + second + `"}]` + "\n"; string(data) != want {
+		t.Errorf("the file is %q, want %q", data, want)
+	}
+	got, err := hostlayout.ParseRemovedIdentities(data)
+	if err != nil || !slices.Equal(got, removed) {
+		t.Errorf("reading it back: %v, %v, want %v", got, err, removed)
+	}
+}
+
+func TestNoRemovedIdentitiesReadBackAsNone(t *testing.T) {
+	got, err := hostlayout.ParseRemovedIdentities(hostlayout.MarshalRemovedIdentities(nil))
+	if err != nil || len(got) != 0 {
+		t.Errorf("reading no identities back: %v, %v", got, err)
+	}
+}
+
+func TestARemovedIdentitiesFileItCantUseIsRefused(t *testing.T) {
+	for name, content := range map[string]string{
+		"fingerprints alone": `["sha256:aa"]`,
+		"no node":            `[{"identity":"sha256:` + strings.Repeat("a", 64) + `"}]`,
+		"an empty node":      `[{"node":"","identity":"sha256:` + strings.Repeat("a", 64) + `"}]`,
+		"a null entry":       `[null]`,
+		"no fingerprint":     `[{"node":"node2","identity":"sha256:aa"}]`,
+		"no identity":        `[{"node":"node2"}]`,
+		"an empty identity":  `[{"node":"node2","identity":""}]`,
+		"garbage":            `garbage`,
+	} {
+		if got, err := hostlayout.ParseRemovedIdentities([]byte(content)); err == nil {
+			t.Errorf("%s: read as %v, want an error", name, got)
+		}
+	}
+}
+
+func FuzzRemovedIdentitiesReadBack(f *testing.F) {
+	f.Add([]byte(`[{"node":"a","identity":"sha256:` + strings.Repeat("0", 64) + `"}]`))
+	f.Add([]byte(`null`))
+	f.Add([]byte(`[null]`))
+	f.Add([]byte(`["sha256:aa"]`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		removed, err := hostlayout.ParseRemovedIdentities(data)
+		if err != nil {
+			return
+		}
+		for _, r := range removed {
+			if err := r.Check(); err != nil {
+				t.Fatalf("read %+v: %v", r, err)
+			}
+		}
+		again, err := hostlayout.ParseRemovedIdentities(hostlayout.MarshalRemovedIdentities(removed))
+		if err != nil || !slices.Equal(again, removed) {
+			t.Fatalf("read %v back as %v, %v", removed, again, err)
+		}
+	})
+}
+
+func TestARemovedIdentityMustNameANodeAndAFingerprint(t *testing.T) {
+	good := "sha256:" + strings.Repeat("0", 64)
+	if err := (hostlayout.RemovedIdentity{Node: "a", Identity: good}).Check(); err != nil {
+		t.Errorf("a good entry: %v", err)
+	}
+	for name, r := range map[string]hostlayout.RemovedIdentity{
+		"no node":        {Identity: good},
+		"no identity":    {Node: "a"},
+		"no prefix":      {Node: "a", Identity: strings.Repeat("0", 64)},
+		"too short":      {Node: "a", Identity: "sha256:" + strings.Repeat("0", 63)},
+		"too long":       {Node: "a", Identity: "sha256:" + strings.Repeat("0", 65)},
+		"uppercase":      {Node: "a", Identity: "sha256:" + strings.Repeat("A", 64)},
+		"not hex":        {Node: "a", Identity: "sha256:" + strings.Repeat("g", 64)},
+		"another prefix": {Node: "a", Identity: "sha512:" + strings.Repeat("0", 64)},
+	} {
+		if err := r.Check(); err == nil {
+			t.Errorf("%s: passed", name)
+		}
 	}
 }

@@ -25,8 +25,8 @@
 //     it relays of other members, in gossip and syncs, is another matter,
 //     below.
 //   - A member forgotten (runtime.Forget) is out of its view until
-//     GraveTimeout or until runtime.Join names it as a seed: every entry
-//     of it, at any incarnation and from anyone, is ignored until then.
+//     runtime.Join names it as a seed: every entry of it, at any
+//     incarnation and from anyone, is ignored until then.
 //   - Its own entry is its own to the end: an entry saying it is suspect,
 //     dead or left, at its incarnation or above, or alive at its
 //     incarnation but different, makes it raise its incarnation and gossip

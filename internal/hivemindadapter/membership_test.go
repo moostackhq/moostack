@@ -161,6 +161,9 @@ func TestCallsAfterStopAreRefused(t *testing.T) {
 	if err := m.Forget("b"); !errors.Is(err, ErrStopped) {
 		t.Errorf("Forget after Stop: %v, want ErrStopped", err)
 	}
+	if err := m.CutOff("sha256:aa"); !errors.Is(err, ErrStopped) {
+		t.Errorf("CutOff after Stop: %v, want ErrStopped", err)
+	}
 }
 
 // A forgotten node is out of the view at once, and stays out while
@@ -325,7 +328,7 @@ func TestCallsAgainstAModel(t *testing.T) {
 			for range 40 {
 				id := fmt.Sprint("node-", 1+r.IntN(2))
 				var err error
-				op := r.IntN(12)
+				op := r.IntN(13)
 				refused := stopped && op != 0
 				switch op {
 				case 0:
@@ -335,6 +338,8 @@ func TestCallsAgainstAModel(t *testing.T) {
 					if err = m.Forget(id); err == nil {
 						forgotten[id] = true
 					}
+				case 6:
+					err = m.CutOff("sha256:aa")
 				default:
 					if err = m.SetSeeds([]Seed{{NodeID: id, Address: address[id]}}); err == nil {
 						delete(forgotten, id)
@@ -423,6 +428,9 @@ func TestCallsAfterTheContextEndsAreRefused(t *testing.T) {
 	waitFor(t, "the context to end it", func() bool { return errors.Is(m.SetSeeds(nil), ErrStopped) })
 	if err := m.Forget("b"); !errors.Is(err, ErrStopped) {
 		t.Errorf("Forget after the context ended: %v, want ErrStopped", err)
+	}
+	if err := m.CutOff("sha256:aa"); !errors.Is(err, ErrStopped) {
+		t.Errorf("CutOff after the context ended: %v, want ErrStopped", err)
 	}
 }
 

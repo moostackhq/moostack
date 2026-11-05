@@ -76,7 +76,7 @@ func removeApp(ctx context.Context, env Env, cmd *cli.Command) error {
 	// the removal gives the lock back, rather than ending mooctl.
 	ctx, stop := interrupt.Context(ctx, env.Exit)
 	defer stop()
-	c, err := preflight(ctx, env, cmd, d, "", nil)
+	c, err := preflight(ctx, env, cmd, d, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -164,7 +164,7 @@ func deploy(ctx context.Context, env Env, cmd *cli.Command) error {
 	// the deploy gives the lock back, rather than ending mooctl.
 	ctx, stop := interrupt.Context(ctx, exit)
 	defer stop()
-	c, err := preflight(ctx, env, cmd, d, "", nil)
+	c, err := preflight(ctx, env, cmd, d, nil, nil)
 	if err != nil {
 		return err
 	}

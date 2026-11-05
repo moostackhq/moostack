@@ -52,6 +52,29 @@ func TestClusterUpdateOnAnUpToDateClusterChangesNothing(t *testing.T) {
 	}
 }
 
+// A directory with no nodes has nothing to update: cluster update says so
+// before it opens a release or builds from a checkout.
+func TestClusterUpdateOfNoNodesSaysToAddOne(t *testing.T) {
+	for name, args := range map[string]func(t *testing.T) []string{
+		"the pinned release": func(*testing.T) []string {
+			return []string{"--release-source", "https://host.invalid/r", "cluster", "update"}
+		},
+		"a checkout": func(t *testing.T) []string { return []string{"cluster", "update", "--source", devCheckout(t), "agent"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			o := newOperator(t, "op")
+			statusCluster(t, o)
+			r := o.run(args(t)...)
+			if r.err == nil || r.err.Error() != "the cluster has no nodes: add one with mooctl node add" {
+				t.Errorf("cluster update failed with %v, want it to say the cluster has no nodes", r.err)
+			}
+			if r.stdout != "" || r.stderr != "" {
+				t.Errorf("cluster update printed\n%s%s\nwant nothing beside its error", r.stdout, r.stderr)
+			}
+		})
+	}
+}
+
 func TestARerunOfClusterUpdateGoesOnFromTheStepThatFailed(t *testing.T) {
 	o := newOperator(t, "op")
 	source := updateCluster(t, o)

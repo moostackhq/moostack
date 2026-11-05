@@ -217,7 +217,7 @@ const healthTimeout = time.Minute
 // lists as removed from before its agent starts. It runs the services
 // for the lease that lock takes the node's operation lock for. Install
 // returns the fingerprint of the node's identity.
-func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig, ca *identity.CA, removed []string, lock TakeLock) (string, error) {
+func Install(ctx context.Context, c *sshclient.Client, h Host, rel *release.Release, node hostlayout.NodeConfig, ca *identity.CA, removed []hostlayout.RemovedIdentity, lock TakeLock) (string, error) {
 	if err := rel.CheckClusterServices(); err != nil {
 		return "", err
 	}
@@ -325,7 +325,7 @@ type TakeLock func(ctx context.Context, node orchestrate.Node) (lease string, re
 // start the release's cluster services, nil if it doesn't start them.
 type installPlan struct {
 	identify func() (identified, error)
-	removed  []string
+	removed  []hostlayout.RemovedIdentity
 	lock     TakeLock
 }
 
@@ -503,8 +503,7 @@ const uninstallTimeout = 2 * time.Minute
 // Uninstall stops and removes the node components, the cluster
 // services' containers, and everything an install created. A unit that
 // systemd doesn't know is fine, but a unit that doesn't stop fails it
-// before anything is removed, since its program would keep running from
-// the files, and so do containers that don't end. It goes ahead after ctx
+// before anything is removed, and so do containers that don't end. It goes ahead after ctx
 // ends, within its own timeout.
 func Uninstall(ctx context.Context, c *sshclient.Client) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), uninstallTimeout)

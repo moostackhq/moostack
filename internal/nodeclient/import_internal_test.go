@@ -21,9 +21,10 @@ import (
 // recordingAgent records the requests of the calls it answers.
 type recordingAgent struct {
 	nodev1.UnimplementedAgentServer
-	mu      sync.Mutex
-	imports []*nodev1.ImportImageRequest
-	removes []*nodev1.RemoveRequest
+	mu       sync.Mutex
+	imports  []*nodev1.ImportImageRequest
+	removes  []*nodev1.RemoveRequest
+	removals []*nodev1.RemoveIdentitiesRequest
 	// ended says an import's stream ended as one that sent it all does,
 	// and ends is told how each import's stream ended.
 	ended bool
@@ -197,6 +198,27 @@ func (r *gatedReader) Read(p []byte) (int, error) {
 	clear(p[:n])
 	r.read++
 	return n, nil
+}
+
+func (a *recordingAgent) RemoveIdentities(_ context.Context, req *nodev1.RemoveIdentitiesRequest) (*nodev1.RemoveIdentitiesResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.removals = append(a.removals, req)
+	return &nodev1.RemoveIdentitiesResponse{}, nil
+}
+
+func TestRemoveIdentitiesSendsEachNodesNameWithItsFingerprint(t *testing.T) {
+	a := &recordingAgent{}
+	n := &Node{Agent: serveRecording(t, a)}
+	if err := n.RemoveIdentities(t.Context(), []*nodev1.RemovedIdentity{{Node: "node3", Identity: "sha256:aa"}}, "the-lease"); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.removals) != 1 || a.removals[0].Lease != "the-lease" || len(a.removals[0].Identities) != 1 ||
+		a.removals[0].Identities[0].Node != "node3" || a.removals[0].Identities[0].Identity != "sha256:aa" {
+		t.Errorf("the agent got %v", a.removals)
+	}
 }
 
 // An import streams the archive as it reads it, a chunk at a time,

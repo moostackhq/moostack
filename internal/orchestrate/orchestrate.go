@@ -1,7 +1,8 @@
 // Package orchestrate is what an operation does across the whole
 // cluster through the node API: the preflight, which reaches every node,
-// takes the operation lock and pushes the removed identities before
-// anything changes, the rolling update, and recording the generation
+// takes the operation lock, brings up a node behind the cluster directory
+// and pushes the removed identities before anything changes, the rolling
+// update, and recording the generation
 // every node has applied.
 package orchestrate
 
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
+	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/nodeclient"
 )
 
@@ -41,10 +43,10 @@ type Node interface {
 	// BreakLock releases the node's operation lock, whichever lease holds
 	// it, and returns the lock it broke, nil if none.
 	BreakLock(ctx context.Context) (*nodeclient.Lock, error)
-	// RemoveIdentities adds identities, by their fingerprints, to those
-	// the node holds as removed and refuses as peers, for the operation
-	// whose lease holds the node's operation lock.
-	RemoveIdentities(ctx context.Context, identities []string, lease string) error
+	// RemoveIdentities adds identities to those the node holds as removed
+	// and refuses as peers, for the operation whose lease holds the node's
+	// operation lock.
+	RemoveIdentities(ctx context.Context, identities []*nodev1.RemovedIdentity, lease string) error
 	// UpdateAgent has the node's updater replace its agent with binary,
 	// the agent at version, which must become healthy within
 	// healthTimeout, or the updater rolls it back.
@@ -92,11 +94,13 @@ const DefaultServiceTimeout = time.Minute
 
 // Nodes are the nodes an operation runs on, and how to reach them.
 type Nodes struct {
-	// Names are the names of the nodes in the cluster directory, and
-	// PrivateAddresses the address other nodes reach each one at, by
-	// name, which Record records.
+	// Names are the names of the nodes to operate on, and PrivateAddresses
+	// the address other nodes reach each one at, by name, which Record
+	// records.
 	Names            []string
 	PrivateAddresses map[string]netip.Addr
+	// Partial says Names leaves out a node of the cluster directory.
+	Partial bool
 	// Dial connects to a node by its name.
 	Dial Dial
 	// ReachTimeout bounds connecting to one node and asking for its
@@ -113,10 +117,9 @@ type Nodes struct {
 	// LeaseTTL is how long a node holds the operation lock after the
 	// operation last renewed it. Zero means DefaultLeaseTTL.
 	LeaseTTL time.Duration
-	// Removed are the fingerprints of the identities the cluster
-	// directory lists as removed, which the preflight pushes to every
-	// node.
-	Removed []string
+	// Removed are the identities the cluster directory lists as removed,
+	// which the preflight pushes to every node.
+	Removed []hostlayout.RemovedIdentity
 	// Check, if set, is what else the preflight checks of each node, such
 	// as the release it runs, given the status of each node it reached
 	// too: a node it fails can't be operated, even with force.
@@ -212,7 +215,13 @@ type Cluster struct {
 	// the directory's. The operation can't reach them, so they keep the
 	// generation they have applied.
 	Unlisted []string
-	// Latest is the latest generation any node has applied.
+	// CaughtUp are the nodes behind the cluster directory that the
+	// preflight had record its generation, and Behind one error for each
+	// that didn't, which names it.
+	CaughtUp []string
+	Behind   []error
+	// Latest is the latest generation any node had applied when the
+	// preflight checked.
 	Latest         int64
 	recordTimeout  time.Duration
 	reachTimeout   time.Duration
@@ -269,7 +278,7 @@ type EarlierGenerationError struct {
 }
 
 func (e *EarlierGenerationError) Error() string {
-	return fmt.Sprintf("it has applied generation %d, earlier than this cluster directory's %d, until an operation that changes the cluster directory records its generation", e.Applied, e.Generation)
+	return fmt.Sprintf("it has applied generation %d, earlier than this cluster directory's %d, until the next operation has it record that generation", e.Applied, e.Generation)
 }
 
 // UnknownGenerationError says a node can't tell the generation it has
@@ -295,9 +304,11 @@ func (e *UnknownGenerationError) Error() string {
 // naming each node whose lock another operation holds, after handing
 // back the lock on the others. Holding the lock, it checks the
 // generations again, fails if a lease may already have run out, and
-// then, renewing the lease, has every node hold the identities
+// then, renewing the lease, has a node behind generation record it,
+// unless force or nodes.Partial, has every node hold the identities
 // nodes.Removed lists as removed, and fails if the operation can't be
-// sure it still holds the lock once they have.
+// sure it still holds the lock once they have. A node that refuses to
+// record fails nothing: Behind says so.
 func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, holder Holder) (*Cluster, error) {
 	c := &Cluster{
 		recordTimeout:  cmp.Or(nodes.RecordTimeout, DefaultTimeout),
@@ -334,7 +345,7 @@ func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, h
 	if problems := c.check(reached, generation, force); len(problems) > 0 {
 		return fail(&PreflightError{Problems: problems})
 	}
-	// A node that only an older generation lists, the directory removed.
+	// The unlisted nodes are of a generation no older than the directory's.
 	if force && c.Latest >= generation {
 		c.Unlisted = unlisted(reached, nodes.Names, c.Latest)
 	}
@@ -349,19 +360,58 @@ func Preflight(ctx context.Context, nodes Nodes, generation int64, force bool, h
 		defer close(c.kept)
 		c.keepLease(c.stop)
 	}()
-	// Every operation pushes the removed identities, so that a node that
-	// missed a removal gets them before anything changes. The lease is
-	// renewed meanwhile, and checked again once the push is done.
+	if !force && !nodes.Partial {
+		c.catchUp(reached, nodes, generation)
+	}
+	// A node that missed a removal gets the removed identities before
+	// anything changes. The lease is renewed meanwhile, and checked again
+	// once the push is done.
 	problems := c.push(c.ctx, c.conns, nodes.Removed)
+	var kept []string
+	if len(c.CaughtUp) > 0 {
+		kept = append(kept, strings.Join(c.CaughtUp, ", ")+" recorded the cluster directory's generation")
+	}
 	if err := c.CheckLock(); err != nil {
 		c.Close()
+		if len(kept) > 0 {
+			return nil, fmt.Errorf("%w, though %s", err, kept[0])
+		}
 		return nil, err
 	}
 	if len(problems) > 0 {
+		if len(nodes.Removed) > 0 && len(problems) < len(c.conns) {
+			kept = append(kept, "the nodes that took the removed identities keep them")
+		}
 		c.Close()
-		return nil, &PreflightError{Problems: problems}
+		return nil, &PreflightError{Problems: problems, Kept: kept}
 	}
 	return c, nil
+}
+
+// catchUp has each of reached that applied a generation before generation
+// record it, of the cluster directory's nodes, all at once, each within
+// the record timeout. It sets c.CaughtUp to those that did and c.Behind
+// to one error per node that didn't, which names it.
+func (c *Cluster) catchUp(reached []Reached, nodes Nodes, generation int64) {
+	var behind []*namedConn
+	for _, r := range reached {
+		if applied, ok := r.KnownGeneration(); ok && applied < generation {
+			if i := slices.IndexFunc(c.conns, func(n *namedConn) bool { return n.name == r.Name }); i >= 0 {
+				behind = append(behind, c.conns[i])
+			}
+		}
+	}
+	listed := make([]*nodev1.GenerationNode, len(nodes.Names))
+	for i, name := range nodes.Names {
+		listed[i] = &nodev1.GenerationNode{Name: name, PrivateAddress: nodes.PrivateAddresses[name].String()}
+	}
+	for i, err := range c.record(c.ctx, behind, generation, listed) {
+		if err != nil {
+			c.Behind = append(c.Behind, err)
+		} else {
+			c.CaughtUp = append(c.CaughtUp, behind[i].name)
+		}
+	}
 }
 
 // check checks that each reached node can be operated from a cluster
@@ -428,8 +478,7 @@ func (c *Cluster) Context() context.Context { return c.ctx }
 // preflight was given: it ends, with a cause that wraps ErrLockLost, when
 // the operation can no longer be sure it holds the operation lock, or
 // when the cluster is closed, but a signal that ends the caller's work
-// doesn't end it. Telling the nodes of a change already made runs in it,
-// so that they are told once the change is made.
+// doesn't end it. Telling the nodes of a change already made runs in it.
 func (c *Cluster) Held() context.Context { return c.held }
 
 // CheckLock fails, and ends the operation's context, if the operation
@@ -510,6 +559,9 @@ type PreflightError struct {
 	// Problems are one error per node, which names it, a *NodeError
 	// where the node failed a check or refused the lock.
 	Problems []error
+	// Kept says what the nodes keep of a preflight that failed, none if
+	// it changed nothing.
+	Kept []string
 }
 
 func (e *PreflightError) Error() string {
@@ -517,7 +569,11 @@ func (e *PreflightError) Error() string {
 	for i, p := range e.Problems {
 		lines[i] = "  " + p.Error()
 	}
-	return "the preflight failed, so nothing changed:\n" + strings.Join(lines, "\n")
+	said := "the preflight failed, so nothing changed"
+	if len(e.Kept) > 0 {
+		said = "the preflight failed, so the operation changed nothing, but " + strings.Join(e.Kept, ", and ")
+	}
+	return said + ":\n" + strings.Join(lines, "\n")
 }
 
 func (e *PreflightError) Unwrap() []error { return e.Problems }
@@ -548,8 +604,7 @@ func (e *PreflightError) Forceable() bool {
 
 // Next is the generation an operation that writes the cluster directory,
 // now at generation, gives it: one later than both that and every
-// generation a node has applied, so that it is the latest even when an
-// older generation is forced.
+// generation a node has applied, even when an older generation is forced.
 func (c *Cluster) Next(generation int64) int64 { return max(generation, c.Latest) + 1 }
 
 // Add adds the connection to a new node called name, whose private
@@ -572,7 +627,8 @@ func (c *Cluster) Add(name string, privateAddress netip.Addr, conn Node) {
 
 // Remove leaves the node called name out of the rest of the operation:
 // it releases the lock on it and closes the connection, so that the node
-// can go away without the operation losing its lease.
+// can go away without the operation losing its lease. The operation's
+// last node keeps the lock, until it goes away or the lease runs out.
 func (c *Cluster) Remove(name string) {
 	c.mu.Lock()
 	i := slices.IndexFunc(c.conns, func(n *namedConn) bool { return n.name == name })
@@ -582,17 +638,20 @@ func (c *Cluster) Remove(name string) {
 	}
 	n := c.conns[i]
 	c.conns = slices.Delete(c.conns, i, i+1)
+	last := len(c.conns) == 0
 	c.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), min(c.reachTimeout, releaseTimeout))
-	defer cancel()
-	n.conn.ReleaseLock(ctx, c.lease.Lease)
+	if !last {
+		ctx, cancel := context.WithTimeout(context.Background(), min(c.reachTimeout, releaseTimeout))
+		defer cancel()
+		n.conn.ReleaseLock(ctx, c.lease.Lease)
+	}
 	n.conn.Close()
 }
 
 // RemoveIdentities has every node the cluster has a connection to hold
-// identities, by their fingerprints, as removed, all at once, each within
-// the record timeout. It fails naming every node that didn't.
-func (c *Cluster) RemoveIdentities(ctx context.Context, identities []string) error {
+// identities as removed, all at once, each within the record timeout. It
+// fails naming every node that didn't.
+func (c *Cluster) RemoveIdentities(ctx context.Context, identities []hostlayout.RemovedIdentity) error {
 	c.mu.Lock()
 	conns := slices.Clone(c.conns)
 	c.mu.Unlock()
@@ -602,7 +661,11 @@ func (c *Cluster) RemoveIdentities(ctx context.Context, identities []string) err
 // push has each of conns hold identities as removed, all at once, each
 // within the record timeout. It returns one error per node that didn't,
 // which names it.
-func (c *Cluster) push(ctx context.Context, conns []*namedConn, identities []string) []error {
+func (c *Cluster) push(ctx context.Context, conns []*namedConn, identities []hostlayout.RemovedIdentity) []error {
+	removed := make([]*nodev1.RemovedIdentity, len(identities))
+	for i, r := range identities {
+		removed[i] = &nodev1.RemovedIdentity{Node: r.Node, Identity: r.Identity}
+	}
 	errs := make([]error, len(conns))
 	var wg sync.WaitGroup
 	for i, n := range conns {
@@ -611,7 +674,7 @@ func (c *Cluster) push(ctx context.Context, conns []*namedConn, identities []str
 			if err == nil {
 				ctx, cancel := context.WithTimeout(ctx, c.recordTimeout)
 				defer cancel()
-				err = n.conn.RemoveIdentities(ctx, identities, c.lease.Lease)
+				err = n.conn.RemoveIdentities(ctx, removed, c.lease.Lease)
 			}
 			if err != nil {
 				errs[i] = fmt.Errorf("%s didn't take the removed identities: %w", n.name, err)
@@ -634,6 +697,14 @@ func (c *Cluster) Record(ctx context.Context, generation int64) error {
 	for i, n := range conns {
 		nodes[i] = &nodev1.GenerationNode{Name: n.name, PrivateAddress: n.privateAddress.String()}
 	}
+	return errors.Join(c.record(ctx, conns, generation, nodes)...)
+}
+
+// record has each of conns record generation, of a cluster directory of
+// nodes, sorted by name, all at once, each within the record timeout. It
+// returns an error for each of conns, in order: nil if it did, and one
+// naming it if it didn't.
+func (c *Cluster) record(ctx context.Context, conns []*namedConn, generation int64, nodes []*nodev1.GenerationNode) []error {
 	slices.SortFunc(nodes, func(a, b *nodev1.GenerationNode) int { return strings.Compare(a.Name, b.Name) })
 	errs := make([]error, len(conns))
 	var wg sync.WaitGroup
@@ -651,7 +722,7 @@ func (c *Cluster) Record(ctx context.Context, generation int64) error {
 		})
 	}
 	wg.Wait()
-	return errors.Join(slices.DeleteFunc(errs, func(err error) bool { return err == nil })...)
+	return errs
 }
 
 // Close releases the operation lock, ends the operation's context, and

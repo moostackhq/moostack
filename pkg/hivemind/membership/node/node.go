@@ -7,7 +7,7 @@
 //
 // How the components fit together, per input:
 //
-//	any input  → view, first after the pause check: graves at GraveTimeout go
+//	any input  → view, first after the pause check: graves not held go at GraveTimeout
 //	packet in  → view (sender's entry, gossip) → probe (ack, nack, ping-req)
 //	tick       → probe: next probe, indirect probe, failed probe
 //	failed     → health (score) and view (suspect) → suspicion (timer)

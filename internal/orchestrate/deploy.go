@@ -43,18 +43,19 @@ type Placement struct {
 	RunsThere bool
 }
 
+// ErrNoNodes is why an operation that needs a node has none to work on.
+var ErrNoNodes = errors.New("the cluster has no nodes: add one with mooctl node add")
+
 // Place picks the node for the app called app, from the containers each
 // node runs, by the node's name: the node whose containers have the
 // app's, or else the node with the fewest containers of apps, the first
-// by name of those with as few. It fails with a *DuplicateAppError if
-// more than one node runs the app.
+// by name of those with as few. It fails with ErrNoNodes on no nodes, and
+// with a *DuplicateAppError if more than one node runs the app.
 //
-// Temporary: placement is this naive, and the nodes are the only record
-// of where an app runs, until a cluster data store, service discovery
-// and telemetry let placement be real.
+// The nodes are the only record of where an app runs.
 func Place(app string, containers map[string][]*nodev1.ContainerStatus) (Placement, error) {
 	if len(containers) == 0 {
-		return Placement{}, errors.New("the cluster has no nodes")
+		return Placement{}, ErrNoNodes
 	}
 	name := appfile.ContainerName(app)
 	var running []string

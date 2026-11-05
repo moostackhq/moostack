@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/quick"
 	"time"
 
 	"github.com/urfave/cli/v3"
@@ -390,7 +391,7 @@ func (n *lockNode) RenewLock(ctx context.Context, lease string, _ time.Duration)
 
 func (n *lockNode) ReleaseLock(context.Context, string) error { return nil }
 
-func (n *lockNode) RemoveIdentities(ctx context.Context, _ []string, _ string) error {
+func (n *lockNode) RemoveIdentities(ctx context.Context, _ []*nodev1.RemovedIdentity, _ string) error {
 	return ctx.Err()
 }
 
@@ -499,6 +500,44 @@ func TestTellNodesTellsThemWhateverEndsTheOperationButTheLostLock(t *testing.T) 
 		}
 		if strings.Contains(stderr.String(), interrupted) {
 			t.Errorf("an operation that lost its lock said it was interrupted:\n%s", stderr.String())
+		}
+	})
+}
+
+// A shell reads back what shellQuote quotes as it was.
+func TestShellQuoteReadsBackAsItWas(t *testing.T) {
+	for _, shell := range []string{"sh", "zsh"} {
+		if _, err := exec.LookPath(shell); err != nil {
+			continue
+		}
+		readsBack := func(arg string) bool {
+			arg = strings.ReplaceAll(strings.ToValidUTF8(arg, "?"), "\x00", "")
+			if arg == "" {
+				return true
+			}
+			out, err := exec.Command(shell, "-c", "printf '%s' "+shellQuote(arg)).Output()
+			return err == nil && string(out) == arg
+		}
+		if err := quick.Check(readsBack, nil); err != nil {
+			t.Errorf("%s: %v", shell, err)
+		}
+	}
+}
+
+func FuzzShellQuote(f *testing.F) {
+	for _, seed := range []string{"plain", "with space", "it's", "$HOME", "`id`", "a\nb", "-C", "*"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, arg string) {
+		if arg == "" || strings.ContainsRune(arg, 0) {
+			t.Skip()
+		}
+		out, err := exec.Command("sh", "-c", "printf '%s' "+shellQuote(arg)).Output()
+		if err != nil {
+			t.Fatalf("sh reading %q: %v", shellQuote(arg), err)
+		}
+		if string(out) != arg {
+			t.Fatalf("sh reads %q as %q", arg, out)
 		}
 	})
 }

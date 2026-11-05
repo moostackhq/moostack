@@ -78,6 +78,34 @@ func TestRemovingAnIdentityCutsOffItsOpenConnections(t *testing.T) {
 	}
 }
 
+// A node added again under its name has a new identity, which the
+// removal of the old one leaves alone.
+func TestANewIdentityUnderARemovedNameStaysConnected(t *testing.T) {
+	n := nodetest.Start(t)
+	n.EventuallyHealthy(t)
+	removed := nodetest.PeerIdentity(t, n.CA, "node-2")
+	renewed := nodetest.PeerIdentity(t, n.CA, "node-2")
+	conn, watch := watchHealth(t, n, renewed)
+
+	removeIdentities(t, n, removed)
+	if err := checkConn(t, conn); err != nil {
+		t.Errorf("the new identity's connection was cut off: %v", err)
+	}
+	ended := make(chan error, 1)
+	go func() {
+		_, err := watch.Recv()
+		ended <- err
+	}()
+	select {
+	case err := <-ended:
+		t.Errorf("the new identity's health watch ended: %v", err)
+	case <-time.After(time.Second):
+	}
+	if err := checkPeer(t, n, renewed.ClientTLS(n.NodeName, nil)); err != nil {
+		t.Errorf("the new identity was refused: %v", err)
+	}
+}
+
 func TestTheAgentRemovesIdentitiesOnlyForTheLeaseThatHoldsTheLock(t *testing.T) {
 	n := nodetest.Start(t)
 	n.EventuallyHealthy(t)
@@ -85,7 +113,7 @@ func TestTheAgentRemovesIdentitiesOnlyForTheLeaseThatHoldsTheLock(t *testing.T) 
 	acquire(t, n, "a", time.Minute)
 	for _, lease := range []string{"", "b"} {
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		_, err := n.Agent.RemoveIdentities(ctx, &nodev1.RemoveIdentitiesRequest{Identities: []string{removed.Fingerprint()}, Lease: lease})
+		_, err := n.Agent.RemoveIdentities(ctx, &nodev1.RemoveIdentitiesRequest{Identities: removedOf(removed), Lease: lease})
 		cancel()
 		if status.Code(err) != codes.FailedPrecondition {
 			t.Errorf("removing an identity with lease %q while a holds the lock: %v, want FailedPrecondition", lease, err)
@@ -113,6 +141,9 @@ func TestTheRemovedIdentitiesOnlyGrowAndOutliveARestart(t *testing.T) {
 		if err := checkPeer(t, n, id.ClientTLS(n.NodeName, nil)); err == nil {
 			t.Errorf("after a restart, %s, whose identity is removed, was accepted", id.Node)
 		}
+		if err := checkMembership(t, n, id.ClientTLS(n.NodeName, nil)); err == nil {
+			t.Errorf("after a restart, membership took %s, whose identity is removed", id.Node)
+		}
 	}
 	if err := checkPeer(t, n, nodetest.PeerIdentity(t, n.CA, "node-4").ClientTLS(n.NodeName, nil)); err != nil {
 		t.Errorf("after a restart, a peer whose identity isn't removed was refused: %v", err)
@@ -136,7 +167,7 @@ func TestPushingRemovedIdentitiesTheNodeHoldsChangesNothing(t *testing.T) {
 	acquire(t, n, "remove", time.Minute)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	_, err := n.Agent.RemoveIdentities(ctx, &nodev1.RemoveIdentitiesRequest{Identities: []string{nodetest.PeerIdentity(t, n.CA, "node-3").Fingerprint()}, Lease: "remove"})
+	_, err := n.Agent.RemoveIdentities(ctx, &nodev1.RemoveIdentitiesRequest{Identities: removedOf(nodetest.PeerIdentity(t, n.CA, "node-3")), Lease: "remove"})
 	if err == nil {
 		t.Error("a push that adds an identity succeeded with a directory in the list's place")
 	}
@@ -164,16 +195,21 @@ func TestTheAgentWontServeWithARemovedIdentitiesListItCantRead(t *testing.T) {
 func removeIdentities(t *testing.T, n *nodetest.Node, ids ...*identity.Identity) {
 	t.Helper()
 	acquire(t, n, "remove", time.Minute)
-	var fps []string
-	for _, id := range ids {
-		fps = append(fps, id.Fingerprint())
-	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	if _, err := n.Agent.RemoveIdentities(ctx, &nodev1.RemoveIdentitiesRequest{Identities: fps, Lease: "remove"}); err != nil {
-		t.Fatalf("removing %v: %v", fps, err)
+	if _, err := n.Agent.RemoveIdentities(ctx, &nodev1.RemoveIdentitiesRequest{Identities: removedOf(ids...), Lease: "remove"}); err != nil {
+		t.Fatalf("removing %v: %v", removedOf(ids...), err)
 	}
 	releaseLock(t, n, "remove")
+}
+
+// removedOf is ids as a removal names them.
+func removedOf(ids ...*identity.Identity) []*nodev1.RemovedIdentity {
+	var removed []*nodev1.RemovedIdentity
+	for _, id := range ids {
+		removed = append(removed, &nodev1.RemovedIdentity{Node: id.Node, Identity: id.Fingerprint()})
+	}
+	return removed
 }
 
 // watchHealth connects to n's peer listener as id, and watches its

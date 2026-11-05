@@ -21,21 +21,22 @@ import (
 	"github.com/moostackhq/moostack/internal/identity"
 )
 
-// removedIdentities are the node identities, by fingerprint, that the
-// node holds as removed from the cluster, kept in a file, and the open
-// connections of the peers it accepted, so that removing an identity
-// cuts off the peer that proves it.
+// removedIdentities are the node identities that the node holds as
+// removed from the cluster, kept in a file, and the open connections of
+// the peers it accepted.
 type removedIdentities struct {
 	file string
-	mu   sync.Mutex
-	// list is the fingerprints, in the order they were added.
-	list  []string
+	// onAdd, if set, is called with the identities each add added, once
+	// their peers are cut off.
+	onAdd func([]hostlayout.RemovedIdentity)
+	mu    sync.Mutex
+	// list is the identities, in the order they were added.
+	list  []hostlayout.RemovedIdentity
 	conns map[*peerConn]bool
 }
 
 // loadRemoved is the removed identities kept in file, none if there is
-// no file. It fails if the file can't be read, so that the agent never
-// accepts a peer it may have been told to refuse.
+// no file. It fails if the file can't be read.
 func loadRemoved(file string) (*removedIdentities, error) {
 	r := &removedIdentities{file: file, conns: map[*peerConn]bool{}}
 	data, err := os.ReadFile(file)
@@ -55,21 +56,38 @@ func loadRemoved(file string) (*removedIdentities, error) {
 func (r *removedIdentities) has(fingerprint string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return slices.Contains(r.list, fingerprint)
+	return holds(r.list, fingerprint)
 }
 
-// add adds fingerprints to the removed identities, keeping those there,
-// and cuts off the peers that prove one. The file is written only if the
-// list grows, before the agent refuses them.
-func (r *removedIdentities) add(fingerprints []string) error {
+// holds says whether list has the identity of fingerprint.
+func holds(list []hostlayout.RemovedIdentity, fingerprint string) bool {
+	return slices.ContainsFunc(list, func(r hostlayout.RemovedIdentity) bool { return r.Identity == fingerprint })
+}
+
+// nodes are the names of the removed identities' nodes.
+func (r *removedIdentities) nodes() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	names := make([]string, len(r.list))
+	for i, id := range r.list {
+		names[i] = id.Node
+	}
+	return names
+}
+
+// add adds identities to the removed ones, keeping those there. If the
+// list grows, it writes the file, before the agent refuses them, cuts off
+// the peers that prove one, and calls onAdd.
+func (r *removedIdentities) add(identities []hostlayout.RemovedIdentity) error {
 	r.mu.Lock()
 	list := slices.Clone(r.list)
-	for _, fp := range fingerprints {
-		if !slices.Contains(list, fp) {
-			list = append(list, fp)
+	for _, id := range identities {
+		if !holds(list, id.Identity) {
+			list = append(list, id)
 		}
 	}
-	if len(list) == len(r.list) {
+	added := list[len(r.list):]
+	if len(added) == 0 {
 		r.mu.Unlock()
 		return nil
 	}
@@ -80,15 +98,17 @@ func (r *removedIdentities) add(fingerprints []string) error {
 	r.list = list
 	var cut []*peerConn
 	for c := range r.conns {
-		if slices.Contains(list, c.fingerprint) {
+		if holds(list, c.fingerprint) {
 			cut = append(cut, c)
 		}
 	}
 	r.mu.Unlock()
-	// A connection that registers after the unlock checks the new list,
-	// so none slips through.
+	// A connection that registers after the unlock checks the new list.
 	for _, c := range cut {
 		c.Close()
+	}
+	if r.onAdd != nil {
+		r.onAdd(added)
 	}
 	return nil
 }
@@ -98,7 +118,7 @@ func (r *removedIdentities) add(fingerprints []string) error {
 func (r *removedIdentities) track(conn net.Conn, fingerprint string) (net.Conn, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if slices.Contains(r.list, fingerprint) {
+	if holds(r.list, fingerprint) {
 		conn.Close()
 		return nil, fmt.Errorf("the identity %s is removed from the cluster", fingerprint)
 	}
@@ -160,9 +180,43 @@ func (c peerCredentials) Clone() credentials.TransportCredentials {
 	return peerCredentials{c.TransportCredentials.Clone(), c.removed}
 }
 
+// applyRemoval closes the membership connections of the peers that prove
+// added, and forgets the removed nodes as forgetRemoved does, by the
+// generation the node last recorded, if it can read it.
+func (s *agentServer) applyRemoval(added []hostlayout.RemovedIdentity) {
+	for _, id := range added {
+		_ = s.members.CutOff(id.Identity)
+	}
+	if applied, err := s.applied(); err == nil {
+		s.forgetRemoved(applied)
+	}
+}
+
+// forgetRemoved has membership forget every node of a removed identity
+// that a doesn't list. A node a lists stays until a recording leaves it
+// out, and a node that has recorded no generation forgets nothing.
+// Membership refuses the node's own name, and everything once it stopped.
+func (s *agentServer) forgetRemoved(a appliedGeneration) {
+	if a.Generation == 0 {
+		return
+	}
+	for _, name := range s.removed.nodes() {
+		if !slices.ContainsFunc(a.Nodes, func(n generationNode) bool { return n.Name == name }) {
+			_ = s.members.Forget(name)
+		}
+	}
+}
+
 func (s *agentServer) RemoveIdentities(_ context.Context, req *nodev1.RemoveIdentitiesRequest) (*nodev1.RemoveIdentitiesResponse, error) {
+	identities := make([]hostlayout.RemovedIdentity, len(req.Identities))
+	for i, id := range req.Identities {
+		identities[i] = hostlayout.RemovedIdentity{Node: id.Node, Identity: id.Identity}
+		if err := identities[i].Check(); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+	}
 	err := s.lock.fenced(req.Lease, func() error {
-		if err := s.removed.add(req.Identities); err != nil {
+		if err := s.removed.add(identities); err != nil {
 			return status.Error(codes.Internal, err.Error())
 		}
 		return nil

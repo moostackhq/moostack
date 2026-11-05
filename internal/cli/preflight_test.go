@@ -130,6 +130,33 @@ func TestForceNamesTheNodesTheLatestGenerationListsButTheDirectoryDoesnt(t *test
 	wantContains(t, "node add --force's warnings", r.stderr, "Generation 5 lists node4, node5, which this cluster directory doesn't, so mooctl can't reach them, and they keep the generation they have applied.")
 }
 
+// A name the directory lists as removed, which a later generation lists
+// again: a recording from this directory forgets that node.
+func TestForceSaysWhichUnlistedNodesARecordingForgets(t *testing.T) {
+	o := newOperator(t, "op")
+	source := preflightCluster(t, o)
+	o.writeRemoved(t, "node4")
+	later := healthyNode(5)
+	later.status.Nodes = []string{"node1", "node2", "node3", "node4", "node5"}
+	o.nodes["node2"] = later
+	r := nodeAddPassesPreflight(t, o, source, "--force")
+	wantContains(t, "node add --force's warnings", r.stderr, "A removed identity has the name node4, so a node that records a generation from this directory forgets the node of that name until a generation lists it.")
+	if strings.Contains(r.stderr, "the name node5") {
+		t.Errorf("node add --force says a recording forgets node5, whose name isn't removed:\n%s", r.stderr)
+	}
+}
+
+func TestNodeAddBringsUpANodeBehindBeforeItAdds(t *testing.T) {
+	o := newOperator(t, "op")
+	source := preflightCluster(t, o)
+	o.nodes["node2"] = healthyNode(0)
+	r := nodeAddPassesPreflight(t, o, source)
+	wantContains(t, "node add's stderr", r.stderr, "node2 was behind this cluster directory, and recorded its generation, 1.")
+	if g := o.nodes["node2"].generations(); len(g) == 0 || g[0] != 1 {
+		t.Errorf("node2 recorded the generations %v, want generation 1 first", g)
+	}
+}
+
 func TestThePreflightRefusesANodeThatCantTellItsGenerationUnlessForced(t *testing.T) {
 	o := newOperator(t, "op")
 	source := preflightCluster(t, o)

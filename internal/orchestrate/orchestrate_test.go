@@ -16,6 +16,7 @@ import (
 
 	nodev1 "github.com/moostackhq/moostack/api/node/v1"
 	"github.com/moostackhq/moostack/internal/appfile"
+	"github.com/moostackhq/moostack/internal/hostlayout"
 	"github.com/moostackhq/moostack/internal/nodeclient"
 	"github.com/moostackhq/moostack/internal/orchestrate"
 	"github.com/moostackhq/moostack/internal/release"
@@ -30,6 +31,11 @@ type node struct {
 	problem string
 	// recordErr, if set, is why recording a generation fails.
 	recordErr error
+	// stolenOnRecord, if set, is the lease that takes the lock as the node
+	// records, and recordDelay how long a recording takes, until its
+	// context ends.
+	stolenOnRecord string
+	recordDelay    time.Duration
 	// hangs says the node never answers once reached: a status call, a
 	// recording or a lock call waits until its context ends.
 	hangs bool
@@ -113,12 +119,14 @@ type node struct {
 	recordedNodes []*nodev1.GenerationNode
 	// removed are the identities the node holds as removed, and pushes
 	// counts the pushes of them.
-	removed []string
+	removed []hostlayout.RemovedIdentity
 	pushes  int
-	closed  bool
+	// recordedAtPush is how many recordings came before the last push.
+	recordedAtPush int
+	closed         bool
 }
 
-func (n *node) RemoveIdentities(ctx context.Context, identities []string, lease string) error {
+func (n *node) RemoveIdentities(ctx context.Context, identities []*nodev1.RemovedIdentity, lease string) error {
 	if n.hang(ctx) {
 		return ctx.Err()
 	}
@@ -131,9 +139,14 @@ func (n *node) RemoveIdentities(ctx context.Context, identities []string, lease 
 		return errors.New("the operation's lease doesn't hold the node's operation lock")
 	}
 	n.pushes++
+	n.recordedAtPush = len(n.recorded)
 	for _, id := range identities {
-		if !slices.Contains(n.removed, id) {
-			n.removed = append(n.removed, id)
+		r := hostlayout.RemovedIdentity{Node: id.Node, Identity: id.Identity}
+		if err := r.Check(); err != nil {
+			return err
+		}
+		if !slices.Contains(n.removed, r) {
+			n.removed = append(n.removed, r)
 		}
 	}
 	if n.stolenOnRemove != "" {
@@ -149,7 +162,7 @@ func (n *node) RemoveIdentities(ctx context.Context, identities []string, lease 
 }
 
 // removedIdentities are the identities the node holds as removed.
-func (n *node) removedIdentities() []string {
+func (n *node) removedIdentities() []hostlayout.RemovedIdentity {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return slices.Clone(n.removed)
@@ -186,8 +199,31 @@ func (n *node) RecordGeneration(ctx context.Context, g int64, nodes []*nodev1.Ge
 	if l := n.held(); l == nil || l.Lease != lease {
 		return errors.New("the operation's lease doesn't hold the node's operation lock")
 	}
+	if g < n.generation {
+		return fmt.Errorf("the node has applied generation %d, later than %d", n.generation, g)
+	}
+	for _, listed := range nodes {
+		if _, err := netip.ParseAddr(listed.PrivateAddress); err != nil {
+			return fmt.Errorf("a node %q at the private address %q", listed.Name, listed.PrivateAddress)
+		}
+	}
+	if n.stolenOnRecord != "" {
+		n.lock = &nodeclient.Lock{Lease: n.stolenOnRecord, Holder: "bob", Machine: "desktop"}
+		n.expires = time.Now().Add(time.Hour)
+	}
+	if n.recordDelay > 0 {
+		n.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			n.mu.Lock()
+			return ctx.Err()
+		case <-time.After(n.recordDelay):
+		}
+		n.mu.Lock()
+	}
 	n.recorded = append(n.recorded, g)
 	n.recordedNodes = nodes
+	n.generation = g
 	return nil
 }
 
