@@ -62,6 +62,9 @@ type Status struct {
 	// Dropped counts the messages dropped since Start, by reason, each
 	// above 0.
 	Dropped map[string]uint64
+	// Problem says why the node's link keeps it from opening connections,
+	// empty if nothing the node can see does.
+	Problem string
 }
 
 // Config is what membership runs with.
@@ -84,6 +87,8 @@ var ErrStopped = errors.New("membership: stopped")
 type Membership struct {
 	rt  *runtime.Runtime
 	ctx context.Context
+	// address is the node's private address, invalid if it has none.
+	address netip.Addr
 	// transportDrops are the transport's drop counts, by reason.
 	transportDrops func() map[string]uint64
 	cutOff         func(match func(*x509.Certificate) bool)
@@ -105,7 +110,7 @@ func Start(ctx context.Context, cfg Config) (*Membership, error) {
 	if err != nil {
 		return nil, err
 	}
-	m.cutOff = tr.CutOff
+	m.cutOff, m.address = tr.CutOff, cfg.Address.Addr()
 	return m, nil
 }
 
@@ -164,7 +169,8 @@ func (m *Membership) Members() []Member {
 	return out
 }
 
-// Status returns the members, the node's health and what it dropped.
+// Status returns the members, the node's health, what it dropped and the
+// problem of its link.
 func (m *Membership) Status() Status {
 	dropped := runtimeDrops(m.rt.Counts())
 	dropped["impersonated"] = m.impersonated.Load()
@@ -178,7 +184,7 @@ func (m *Membership) Status() Status {
 			delete(dropped, reason)
 		}
 	}
-	return Status{Members: m.Members(), HealthScore: m.rt.Health(), Dropped: dropped}
+	return Status{Members: m.Members(), HealthScore: m.rt.Health(), Dropped: dropped, Problem: m.problem()}
 }
 
 // SetSeeds joins the cluster through seeds, and keeps them to sync with

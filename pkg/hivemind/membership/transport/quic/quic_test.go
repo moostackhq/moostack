@@ -10,6 +10,7 @@ import (
 	"net"
 	goruntime "runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -295,7 +296,7 @@ func TestARestartedNodeIsReachedAgainAtOnceWithTheSameResetKey(t *testing.T) {
 		}
 		start := time.Now()
 		for {
-			a.SendPacket(dest(b2, "b"), []byte("after"))
+			a.SendPacket(dest(b2, "b"), bytes.Repeat([]byte("x"), 100))
 			if _, ok := next(b2, 100*time.Millisecond); ok {
 				break
 			}
@@ -1400,4 +1401,92 @@ func TestThePortContract(t *testing.T) {
 		c := newCluster(t)
 		return transporttest.Pair{A: listen(t, c.Node("a")), B: listen(t, c.Node("b"))}
 	})
+}
+
+// The first packet of a dial fits the smallest path QUIC runs over.
+func TestADialsFirstPacketIsAtMostQUICsSmallestPayload(t *testing.T) {
+	c := newCluster(t)
+	tr := listen(t, c.Node("a"))
+	silent, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+	tr.SendPacket(transport.Dest{Addr: silent.LocalAddr().String(), Peer: "b"}, []byte("x"))
+	if err := silent.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	b := make([]byte, 2048)
+	n, _, err := silent.ReadFrom(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n > 1200 {
+		t.Errorf("the first packet is %d bytes, want at most 1200", n)
+	}
+}
+
+// relay passes datagrams between a dialler and to, and keeps the largest
+// it saw.
+func relay(t *testing.T, to string) (addr string, largest func() int) {
+	t.Helper()
+	front, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { front.Close() })
+	back, err := net.Dial("udp", to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { back.Close() })
+	var most atomic.Int64
+	var dialler atomic.Pointer[net.Addr]
+	go func() {
+		b := make([]byte, 65536)
+		for {
+			n, from, err := front.ReadFrom(b)
+			if err != nil {
+				return
+			}
+			dialler.Store(&from)
+			most.Store(max(most.Load(), int64(n)))
+			back.Write(b[:n])
+		}
+	}()
+	go func() {
+		b := make([]byte, 65536)
+		for {
+			n, err := back.Read(b)
+			if err != nil {
+				return
+			}
+			most.Store(max(most.Load(), int64(n)))
+			if from := dialler.Load(); from != nil {
+				front.WriteTo(b[:n], *from)
+			}
+		}
+	}()
+	return front.LocalAddr().String(), func() int { return int(most.Load()) }
+}
+
+// However much a connection carries, no datagram outgrows the smallest
+// path QUIC runs over.
+func TestNoDatagramOutgrowsQUICsSmallestPayload(t *testing.T) {
+	c := newCluster(t)
+	a, b := listen(t, c.Node("a")), listen(t, c.Node("b"))
+	addr, largest := relay(t, b.Addr())
+	to := transport.Dest{Addr: addr, Peer: "b"}
+	sync := bytes.Repeat([]byte("x"), 256<<10)
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		a.SendStream(to, sync)
+		time.Sleep(50 * time.Millisecond)
+		for len(b.Receive()) > 0 {
+			<-b.Receive()
+		}
+	}
+	if got := largest(); got == 0 || got > 1200 {
+		t.Errorf("the largest datagram was %d bytes, want at most 1200", got)
+	}
 }

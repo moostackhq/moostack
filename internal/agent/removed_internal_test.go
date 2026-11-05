@@ -243,3 +243,9 @@ func BenchmarkARecordingForgetsTheRemovedNodes(b *testing.B) {
 		})
 	}
 }
+
+func TestMembershipOfHasTheProblem(t *testing.T) {
+	if got := membershipOf(hivemindadapter.Status{Problem: "the link is bad"}).Problem; got != "the link is bad" {
+		t.Errorf("the problem: %q", got)
+	}
+}

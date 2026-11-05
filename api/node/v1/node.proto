@@ -63,8 +63,8 @@ service Agent {
   // pulling nothing. A failed pull answers NOT_FOUND for an image the
   // registry doesn't have, PERMISSION_DENIED for one it denies access to,
   // RESOURCE_EXHAUSTED at the registry's first answer that the node is
-  // rate limited, with no retry, and UNAVAILABLE for a registry that
-  // can't be reached. The pull ends when its call ends.
+  // rate limited, and UNAVAILABLE for a registry that can't be reached.
+  // The pull ends when its call ends.
   rpc PullImage(PullImageRequest) returns (PullImageResponse);
   // Run runs a container from its image, which the node must have, and
   // keeps it running across restarts of the agent, of containerd and of
@@ -192,6 +192,9 @@ message Membership {
   // Dropped counts the messages the node dropped since it started, by
   // reason. A reason it dropped none for is left out.
   map<string, uint64> dropped = 3;
+  // Problem says why membership can't open connections from this node,
+  // empty if the node knows of no reason.
+  string problem = 4;
 }
 
 // Member is a node as another node's membership knows it.

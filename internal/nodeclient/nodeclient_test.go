@@ -95,7 +95,7 @@ func TestStatusQuotesWhatTheNodeReportsThatIsntPrintable(t *testing.T) {
 				Lock:              &nodev1.Lock{Lease: "l", Holder: bad, Machine: bad, Operation: bad},
 				Components:        []*nodev1.Component{{Name: "agent", Version: bad, Build: bad, Problem: bad}},
 				Containers:        []*nodev1.ContainerStatus{{Name: bad, Image: bad, Digest: bad, Problem: bad}},
-				Membership:        &nodev1.Membership{Members: []*nodev1.Member{{Node: bad, Address: bad}}, Dropped: map[string]uint64{bad: 1}},
+				Membership:        &nodev1.Membership{Members: []*nodev1.Member{{Node: bad, Address: bad}}, Dropped: map[string]uint64{bad: 1}, Problem: bad},
 			}},
 			Updater: updaterStatusOf{res: &nodev1.UpdaterStatusResponse{Updater: &nodev1.Component{Name: "updater", Version: bad}}},
 		}
@@ -108,7 +108,7 @@ func TestStatusQuotesWhatTheNodeReportsThatIsntPrintable(t *testing.T) {
 			"the updater's version": updater.Version,
 			"the container's name":  container.Name, "the container's image": container.Image,
 			"the container's digest": container.Digest, "the container's problem": container.Problem,
-			"the member's node": member.Node, "the member's address": member.Address,
+			"the member's node": member.Node, "the member's address": member.Address, "membership's problem": s.Membership.Problem,
 		} {
 			if got != quoted {
 				t.Errorf("%q as %s: Status says %q, want %q", bad, what, got, quoted)
@@ -156,8 +156,7 @@ func FuzzPrintable(f *testing.F) {
 // the release's image of that service, each named for its service, at
 // the version of that image, as healthy as the container's API, and
 // those so named whose image the node can't tell, at no version; no
-// other container is one: not one under the service's name alone, as
-// releases before the service- names ran it.
+// other container is one: not one under the service's name alone.
 func TestStatusTellsTheClusterServicesAmongTheContainers(t *testing.T) {
 	n := &nodeclient.Node{
 		Agent: statusOf{agent: &nodev1.StatusResponse{Containers: []*nodev1.ContainerStatus{

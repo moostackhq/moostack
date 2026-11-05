@@ -160,6 +160,82 @@ func TestClusterStatusJSONHasEachNodesMembership(t *testing.T) {
 	}
 }
 
+const linkTooSmall = "QUIC can't open connections: the link's MTU, 1200, is below the 1228 it needs"
+
+// smallLinkCluster is node1, with a link too small, and node2, each
+// holding only itself.
+func smallLinkCluster() map[string]*fakeNode {
+	return map[string]*fakeNode{
+		"node1": withMembership(&nodev1.Membership{Problem: linkTooSmall, Members: []*nodev1.Member{member("node1", 1, alive)}}),
+		"node2": withMembership(&nodev1.Membership{Members: []*nodev1.Member{member("node2", 2, alive)}}),
+	}
+}
+
+// Both commands say what a node reports of its link, and put the two
+// nodes it keeps apart down to that, not UDP.
+func TestClusterStatusAndMembersNameALinkInPlaceOfUDP(t *testing.T) {
+	want := "node1: " + linkTooSmall + "\n" +
+		"node1: node2 doesn't know it, though its agent answers mooctl, so they may not reach each other: " + linkTooSmall + "\n" +
+		"node2: node1 doesn't know it, though its agent answers mooctl, so they may not reach each other: " + linkTooSmall + "\n"
+	for _, command := range [][]string{{"cluster", "status"}, {"cluster", "members"}} {
+		o := newOperator(t, "op")
+		source := statusCluster(t, o, "node1", "node2")
+		o.nodes = smallLinkCluster()
+		r := o.mustRun(append([]string{"--release-source", source}, command...)...)
+		if !strings.HasSuffix(r.stdout, want) {
+			t.Errorf("%v printed\n%s\nwant it to end in\n%s", command, r.stdout, want)
+		}
+		if strings.Contains(r.stdout, "UDP") {
+			t.Errorf("%v blames UDP:\n%s", command, r.stdout)
+		}
+		r = o.mustRun(append([]string{"--release-source", source}, append(command, "--json")...)...)
+		if want := `"problem": "` + linkTooSmall + `"`; !strings.Contains(r.stdout, want) {
+			t.Errorf("%v --json printed\n%s\nwant %s", command, r.stdout, want)
+		}
+	}
+}
+
+// A node's problem stands between it and the others, and not between two
+// others, which still may not reach each other over UDP.
+func TestClusterMembersKeepsUDPForAPairWithNoProblem(t *testing.T) {
+	o := newOperator(t, "op")
+	source := statusCluster(t, o, "node1", "node2", "node3")
+	o.nodes = smallLinkCluster()
+	o.nodes["node3"] = withMembership(&nodev1.Membership{Members: []*nodev1.Member{member("node3", 3, alive)}})
+	r := o.mustRun("--release-source", source, "cluster", "members")
+	for _, want := range []string{
+		"node3: node2 doesn't know it, though its agent answers mooctl, so they may not reach each other over UDP on the peer port, 7443\n",
+		"node3: node1 doesn't know it, though its agent answers mooctl, so they may not reach each other: " + linkTooSmall + "\n",
+	} {
+		if !strings.Contains(r.stdout, want) {
+			t.Errorf("cluster members printed\n%s\nwant\n%s", r.stdout, want)
+		}
+	}
+}
+
+func TestClusterMembersJSONGivesTheProblemOfASuspicion(t *testing.T) {
+	o := newOperator(t, "op")
+	source := statusCluster(t, o, "node1", "node2")
+	o.nodes = smallLinkCluster()
+	r := o.mustRun("--release-source", source, "cluster", "members", "--json")
+	var view struct {
+		Nodes []struct {
+			Name        string `json:"name"`
+			SuspectedBy []struct {
+				Problem string `json:"problem"`
+			} `json:"suspected_by"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal([]byte(r.stdout), &view); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range view.Nodes {
+		if len(n.SuspectedBy) != 1 || n.SuspectedBy[0].Problem != linkTooSmall {
+			t.Errorf("%s has the suspicions %+v, want one with the problem", n.Name, n.SuspectedBy)
+		}
+	}
+}
+
 // A member state the node doesn't say is unknown.
 func TestClusterStatusShowsAMemberStateItDoesntKnowAsUnknown(t *testing.T) {
 	o := newOperator(t, "op")

@@ -211,6 +211,7 @@ func (n *Node) Status(ctx context.Context) Status {
 			dropped[Printable(reason)] += n
 		}
 		s.Membership.Dropped = dropped
+		s.Membership.Problem = Printable(s.Membership.Problem)
 	}
 	return s
 }

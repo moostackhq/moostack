@@ -26,8 +26,10 @@ import (
 type node struct {
 	// view, if set, says which members the node holds in which state, at
 	// each status call, or nil for a status that has no membership.
-	view       func() map[string]nodev1.MemberState
-	generation int64
+	view func() map[string]nodev1.MemberState
+	// membershipProblem is the problem its membership reports.
+	membershipProblem string
+	generation        int64
 	// nodes are the nodes of the cluster directory at generation.
 	nodes []string
 	// problem, if set, says why the node can't tell its generation.
@@ -84,7 +86,7 @@ type node struct {
 	components []*nodev1.Component
 	services   []*nodev1.Component
 	// oldNames are the cluster services the node runs under their names
-	// alone, as releases before the service- names ran them, until removed.
+	// alone, until removed.
 	oldNames []*nodev1.Component
 	// others are containers that no service runs as, which the node
 	// reports as they are.
@@ -193,7 +195,7 @@ func (n *node) Status(ctx context.Context) nodeclient.Status {
 	s := nodeclient.Status{Mode: nodev1.Mode_MODE_DIRECT, Generation: generation, Nodes: n.nodes, GenerationUnknown: n.problem, Lock: n.heldLock(), Components: n.components, Containers: n.containers()}
 	if n.view != nil {
 		if view := n.view(); view != nil {
-			s.Membership = &nodev1.Membership{}
+			s.Membership = &nodev1.Membership{Problem: n.membershipProblem}
 			for member, state := range view {
 				s.Membership.Members = append(s.Membership.Members, &nodev1.Member{Node: member, State: state})
 			}
@@ -652,9 +654,7 @@ func (n *node) isClosed() bool {
 // fakes is a cluster of fake nodes, by name.
 type fakes map[string]*node
 
-// names are the names of the cluster's nodes, last by name first, so
-// that an operation that goes through the nodes in order of their names
-// sorts them itself.
+// names are the names of the cluster's nodes, last by name first.
 func (f fakes) names() []string {
 	var names []string
 	for name := range f {
@@ -1038,9 +1038,7 @@ func TestPreflightRefusesNodesItsCheckFailsBeforeTakingTheLock(t *testing.T) {
 	}
 }
 
-// Another operation may have changed what a node runs between the check
-// and the lock, so the check runs again on what the nodes say once the
-// lock is held.
+// The check runs again on what the nodes say once the lock is held.
 func TestPreflightChecksTheNodesAgainWhileHoldingTheLock(t *testing.T) {
 	f := fakes{"node1": {generation: 1}, "node2": {generation: 1}}
 	nodes := inOrder(f, "node1", "node2")

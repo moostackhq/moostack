@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -77,6 +78,86 @@ func TestWaitAliveFailsNamingTheNodesAndThePort(t *testing.T) {
 				t.Errorf("WaitAlive: %v, want %q", err, want)
 			}
 		})
+	}
+}
+
+// A problem takes UDP's place when it stands between the new node and
+// every other that answered, and otherwise sits beside it.
+func TestWaitAliveNamesTheProblemsNodesReport(t *testing.T) {
+	udp := "node3 and node1, node2 can't reach each other over UDP on the peer port, 7443"
+	for name, c := range map[string]struct {
+		node1, node2, added string
+		want                string
+	}{
+		"the new node's": {added: "bad", want: "node3 and node1, node2 can't reach each other:\nnode3: bad"},
+		"every other's":  {node1: "bad", node2: "worse", want: "node3 and node1, node2 can't reach each other:\nnode1: bad\nnode2: worse"},
+		"both ends'":     {node2: "bad", added: "worse", want: "node3 and node1, node2 can't reach each other:\nnode2: bad\nnode3: worse"},
+		"another's only": {node1: "bad", want: udp + "\nnode1: bad"},
+		"nobody's":       {want: udp},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := fakes{
+				"node1": {generation: 1, view: holds("node1"), membershipProblem: c.node1},
+				"node2": {generation: 1, view: holds("node2"), membershipProblem: c.node2},
+			}
+			cl := withNode3(t, f, &node{view: holds("node3"), membershipProblem: c.added})
+			err := cl.WaitAlive(t.Context(), "node3", 50*time.Millisecond, false)
+			if err == nil || err.Error() != c.want {
+				t.Errorf("WaitAlive: %v, want %q", err, c.want)
+			}
+		})
+	}
+}
+
+// A node that doesn't report isn't counted among those with a problem.
+func TestWaitAliveBlamesUDPBesideAProblemAndASilentNode(t *testing.T) {
+	f := fakes{
+		"node1": {generation: 1, view: holds("node1"), membershipProblem: "bad"},
+		"node2": {generation: 1, view: holds("node2")},
+		"node4": {generation: 1, view: holds("node4")},
+	}
+	cl := withNode3(t, f, &node{view: holds("node3")})
+	f["node4"].stopAnswering()
+	err := cl.WaitAlive(t.Context(), "node3", 50*time.Millisecond, false)
+	want := "node3 and node1, node2 can't reach each other over UDP on the peer port, 7443\nnode1: bad\nNo membership reported by:\nnode4: it didn't answer"
+	if err == nil || err.Error() != want {
+		t.Errorf("WaitAlive: %v, want %q", err, want)
+	}
+}
+
+// The new node's problem counts though no other node reported.
+func TestWaitAliveNamesTheNewNodesProblemWithNoOtherAnswering(t *testing.T) {
+	f := fakes{"node1": {generation: 1, view: holds("node1")}}
+	cl := withNode3(t, f, &node{view: holds("node3"), membershipProblem: "bad"})
+	f["node1"].stopAnswering()
+	err := cl.WaitAlive(t.Context(), "node3", 50*time.Millisecond, false)
+	if err == nil || !strings.Contains(err.Error(), "node3: bad") {
+		t.Errorf("WaitAlive: %v, want the new node's problem", err)
+	}
+}
+
+// A problem gone by the last answer isn't named.
+func TestWaitAliveDoesntNameAProblemThatCleared(t *testing.T) {
+	added := &node{view: holds("node3")}
+	f := fakes{"node1": {generation: 1, view: holds("node1")}}
+	cl := withNode3(t, f, added)
+	var reads atomic.Int32
+	added.view = func() map[string]nodev1.MemberState {
+		if reads.Add(1) == 1 {
+			added.mu.Lock()
+			added.membershipProblem = "bad"
+			added.mu.Unlock()
+		} else {
+			added.mu.Lock()
+			added.membershipProblem = ""
+			added.mu.Unlock()
+		}
+		return holds("node3")()
+	}
+	err := cl.WaitAlive(t.Context(), "node3", 500*time.Millisecond, false)
+	want := "node3 and node1 can't reach each other over UDP on the peer port, 7443"
+	if err == nil || err.Error() != want {
+		t.Errorf("WaitAlive: %v, want %q", err, want)
 	}
 }
 

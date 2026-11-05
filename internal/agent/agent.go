@@ -164,6 +164,9 @@ func Serve(ctx context.Context, cfg Config) error {
 		return err
 	}
 	defer members.Stop()
+	if problem := members.Status().Problem; problem != "" {
+		log.Printf("membership: %s", problem)
+	}
 	l, err := rootsocket.Listen(cfg.Socket)
 	if err != nil {
 		return err
@@ -331,7 +334,7 @@ var memberStates = map[hivemindadapter.State]nodev1.MemberState{
 
 // membershipOf is s as the node API reports it.
 func membershipOf(s hivemindadapter.Status) *nodev1.Membership {
-	m := &nodev1.Membership{HealthScore: uint32(s.HealthScore), Dropped: s.Dropped}
+	m := &nodev1.Membership{HealthScore: uint32(s.HealthScore), Dropped: s.Dropped, Problem: s.Problem}
 	for _, e := range s.Members {
 		m.Members = append(m.Members, &nodev1.Member{Node: e.NodeID, Address: e.Address, State: memberStates[e.State]})
 	}

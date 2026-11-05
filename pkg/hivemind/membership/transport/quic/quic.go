@@ -234,9 +234,12 @@ func Listen(cfg Config) (*Transport, error) {
 		cfg:    cfg,
 		server: server,
 		qconf: &quicgo.Config{
-			EnableDatagrams:      true,
-			HandshakeIdleTimeout: time.Second,
-			MaxIdleTimeout:       cfg.IdleTimeout,
+			EnableDatagrams: true,
+			// Packets stay at QUIC's smallest size.
+			InitialPacketSize:       1200,
+			DisablePathMTUDiscovery: true,
+			HandshakeIdleTimeout:    time.Second,
+			MaxIdleTimeout:          cfg.IdleTimeout,
 			// A peer may have at most maxStreams unidirectional streams
 			// open on one connection, and no bidirectional stream.
 			MaxIncomingUniStreams: maxStreams,

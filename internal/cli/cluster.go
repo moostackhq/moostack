@@ -421,7 +421,7 @@ func printStatus(env Env, view statusView) error {
 		if n.GenerationProblem != "" {
 			t.problem(n.Name + ": " + nodeclient.Printable(n.GenerationProblem))
 		}
-		for _, p := range suspicionProblems(n) {
+		for _, p := range membershipProblems(n) {
 			t.problem(p)
 		}
 	}
@@ -467,15 +467,23 @@ func (t *statusTree) component(node string, depth int, c componentStatusView) {
 	}
 }
 
-// suspicionProblems say which other nodes don't hold n alive.
-func suspicionProblems(n nodeStatusView) []string {
+// membershipProblems say what n reports of its link, and which other
+// nodes don't hold it alive, and why they may not.
+func membershipProblems(n nodeStatusView) []string {
 	var problems []string
+	if n.Membership != nil && n.Membership.Problem != "" {
+		problems = append(problems, n.Name+": "+n.Membership.Problem)
+	}
 	for _, by := range n.SuspectedBy {
 		held := "holds it " + by.State
 		if by.State == memberAbsent {
 			held = "doesn't know it"
 		}
-		problems = append(problems, fmt.Sprintf("%s: %s %s, though its agent answers mooctl, so they may not reach each other over UDP on the peer port, %d", n.Name, by.Node, held, hostlayout.PeerPort))
+		cause := fmt.Sprintf(" over UDP on the peer port, %d", hostlayout.PeerPort)
+		if by.Problem != "" {
+			cause = ": " + by.Problem
+		}
+		problems = append(problems, fmt.Sprintf("%s: %s %s, though its agent answers mooctl, so they may not reach each other%s", n.Name, by.Node, held, cause))
 	}
 	return problems
 }
@@ -576,7 +584,7 @@ func printMembers(env Env, view membersView) error {
 		for _, e := range n.Membership.Members {
 			fmt.Fprintf(&b, "  %s  %s  %s\n", padRight(e.Node, nameWidth), padRight(e.State, stateWidth), e.Address)
 		}
-		problems = append(problems, suspicionProblems(n)...)
+		problems = append(problems, membershipProblems(n)...)
 	}
 	if len(problems) > 0 {
 		fmt.Fprintf(&b, "\n%s\n", strings.Join(problems, "\n"))
@@ -1028,6 +1036,8 @@ type membershipView struct {
 	Members     []memberView      `json:"members"`
 	HealthScore uint32            `json:"health_score"`
 	Dropped     map[string]uint64 `json:"dropped,omitempty"`
+	// Problem says why the node's membership can't open connections.
+	Problem string `json:"problem,omitempty"`
 }
 
 // memberView is a node as a node's membership holds it.
@@ -1044,6 +1054,8 @@ type memberView struct {
 type suspicionView struct {
 	Node  string `json:"node"`
 	State string `json:"state"`
+	// Problem is what either of the two nodes reports of its link.
+	Problem string `json:"problem,omitempty"`
 }
 
 // memberAbsent is the state of a suspicionView whose node doesn't list
@@ -1063,7 +1075,7 @@ func membershipOf(m *nodev1.Membership) *membershipView {
 	if m == nil {
 		return nil
 	}
-	v := &membershipView{Members: []memberView{}, HealthScore: m.HealthScore, Dropped: m.Dropped}
+	v := &membershipView{Members: []memberView{}, HealthScore: m.HealthScore, Dropped: m.Dropped, Problem: m.Problem}
 	for _, e := range m.Members {
 		v.Members = append(v.Members, memberView{Node: e.Node, Address: e.Address, State: cmp.Or(memberStates[e.State], "unknown")})
 	}
@@ -1092,11 +1104,12 @@ func markSuspicions(nodes []nodeStatusView) {
 			if other.Name == n.Name || other.Membership == nil {
 				continue
 			}
+			problem := cmp.Or(n.Membership.Problem, other.Membership.Problem)
 			switch state, known := views[other.Name][n.Name]; {
 			case !known:
-				n.SuspectedBy = append(n.SuspectedBy, suspicionView{Node: other.Name, State: memberAbsent})
+				n.SuspectedBy = append(n.SuspectedBy, suspicionView{Node: other.Name, State: memberAbsent, Problem: problem})
 			case state != "alive":
-				n.SuspectedBy = append(n.SuspectedBy, suspicionView{Node: other.Name, State: state})
+				n.SuspectedBy = append(n.SuspectedBy, suspicionView{Node: other.Name, State: state, Problem: problem})
 			}
 		}
 	}

@@ -407,7 +407,10 @@ type Membership struct {
 	HealthScore uint32 `protobuf:"varint,2,opt,name=health_score,json=healthScore,proto3" json:"health_score,omitempty"`
 	// Dropped counts the messages the node dropped since it started, by
 	// reason. A reason it dropped none for is left out.
-	Dropped       map[string]uint64 `protobuf:"bytes,3,rep,name=dropped,proto3" json:"dropped,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	Dropped map[string]uint64 `protobuf:"bytes,3,rep,name=dropped,proto3" json:"dropped,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	// Problem says why membership can't open connections from this node,
+	// empty if the node knows of no reason.
+	Problem       string `protobuf:"bytes,4,opt,name=problem,proto3" json:"problem,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -461,6 +464,13 @@ func (x *Membership) GetDropped() map[string]uint64 {
 		return x.Dropped
 	}
 	return nil
+}
+
+func (x *Membership) GetProblem() string {
+	if x != nil {
+		return x.Problem
+	}
+	return ""
 }
 
 // Member is a node as another node's membership knows it.
@@ -2730,12 +2740,13 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"containers\x12<\n" +
 	"\n" +
 	"membership\x18\b \x01(\v2\x1c.moostack.node.v1.MembershipR\n" +
-	"membership\"\xe4\x01\n" +
+	"membership\"\xfe\x01\n" +
 	"\n" +
 	"Membership\x122\n" +
 	"\amembers\x18\x01 \x03(\v2\x18.moostack.node.v1.MemberR\amembers\x12!\n" +
 	"\fhealth_score\x18\x02 \x01(\rR\vhealthScore\x12C\n" +
-	"\adropped\x18\x03 \x03(\v2).moostack.node.v1.Membership.DroppedEntryR\adropped\x1a:\n" +
+	"\adropped\x18\x03 \x03(\v2).moostack.node.v1.Membership.DroppedEntryR\adropped\x12\x18\n" +
+	"\aproblem\x18\x04 \x01(\tR\aproblem\x1a:\n" +
 	"\fDroppedEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"k\n" +

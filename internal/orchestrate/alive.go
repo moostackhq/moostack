@@ -32,8 +32,8 @@ func (c *Cluster) Empty() bool {
 // own. If heldOut, the others may hold name out until they record it, and
 // only name's view counts. If name, or every other node, never reported its
 // membership, it fails saying so; otherwise it fails saying the nodes that
-// did and name can't reach each other. It fails with ctx's cause if ctx
-// ends.
+// did and name can't reach each other, over UDP or through the problems
+// they report. It fails with ctx's cause if ctx ends.
 func (c *Cluster) WaitAlive(ctx context.Context, name string, wait time.Duration, heldOut bool) error {
 	c.mu.Lock()
 	conns := slices.Clone(c.conns)
@@ -50,6 +50,7 @@ func (c *Cluster) WaitAlive(ctx context.Context, name string, wait time.Duration
 		go reportViews(waiting, i, n, reports)
 	}
 	views := make([]map[string]nodev1.MemberState, len(conns))
+	problems := make([]string, len(conns))
 	silent := make([]error, len(conns))
 	for i := range silent {
 		silent[i] = errors.New("it didn't answer")
@@ -58,7 +59,7 @@ func (c *Cluster) WaitAlive(ctx context.Context, name string, wait time.Duration
 		select {
 		case r := <-reports:
 			if r.err == nil {
-				silent[r.i], views[r.i] = nil, r.view
+				silent[r.i], views[r.i], problems[r.i] = nil, r.view, r.problem
 				if bothAlive(conns, views, heldOut) {
 					return nil
 				}
@@ -69,17 +70,18 @@ func (c *Cluster) WaitAlive(ctx context.Context, name string, wait time.Duration
 			if err := context.Cause(ctx); err != nil {
 				return err
 			}
-			return notAlive(conns, silent, wait)
+			return notAlive(conns, silent, problems, wait)
 		}
 	}
 }
 
 // viewReport is what the node at index i of a wait said of its view: the
-// view, or why it gave none.
+// view and the problem it reports, or why it gave none.
 type viewReport struct {
-	i    int
-	view map[string]nodev1.MemberState
-	err  error
+	i       int
+	view    map[string]nodev1.MemberState
+	problem string
+	err     error
 }
 
 // reportViews sends what n says of its view to reports, every alivePoll
@@ -113,7 +115,7 @@ func readView(ctx context.Context, n *namedConn) viewReport {
 	for _, member := range s.Membership.Members {
 		view[member.Node] = member.State
 	}
-	return viewReport{view: view}
+	return viewReport{view: view, problem: s.Membership.Problem}
 }
 
 // bothAlive says whether conns[0] and one of the others hold each other
@@ -130,27 +132,43 @@ func bothAlive(conns []*namedConn, views []map[string]nodev1.MemberState, heldOu
 
 // notAlive is why conns[0] and conns[1:] didn't hold each other alive
 // within wait, from silent, which says why each node never reported its
-// membership, nil if it did.
-func notAlive(conns []*namedConn, silent []error, wait time.Duration) error {
+// membership, nil if it did, and problems, the problem each reported. The
+// problems take UDP's place if conns[0] or every other that reported has
+// one, and sit below it if not.
+func notAlive(conns []*namedConn, silent []error, problems []string, wait time.Duration) error {
 	if silent[0] != nil {
 		return fmt.Errorf("%s didn't report its membership within %s: %w", conns[0].name, wait, silent[0])
 	}
-	var answered, reasons []string
+	var answered, reasons, reported []string
+	everyOtherReports := true
 	for i, n := range conns[1:] {
 		if silent[i+1] == nil {
 			answered = append(answered, n.name)
+			everyOtherReports = everyOtherReports && problems[i+1] != ""
 		} else {
 			reasons = append(reasons, fmt.Sprintf("%s: %v", n.name, silent[i+1]))
 		}
 	}
+	for i, n := range conns {
+		if problems[i] != "" {
+			reported = append(reported, fmt.Sprintf("%s: %s", n.name, problems[i]))
+		}
+	}
 	slices.Sort(answered)
 	slices.Sort(reasons)
+	slices.Sort(reported)
 	if len(answered) == 0 {
-		return fmt.Errorf("no other node reported its membership within %s:\n%s", wait, strings.Join(reasons, "\n"))
+		return fmt.Errorf("no other node reported its membership within %s:\n%s", wait, strings.Join(append(reasons, reported...), "\n"))
 	}
-	err := fmt.Errorf("%s and %s can't reach each other over UDP on the peer port, %d", conns[0].name, strings.Join(answered, ", "), hostlayout.PeerPort)
+	message := fmt.Sprintf("%s and %s can't reach each other", conns[0].name, strings.Join(answered, ", "))
+	if problems[0] == "" && !everyOtherReports {
+		message += fmt.Sprintf(" over UDP on the peer port, %d", hostlayout.PeerPort)
+	} else {
+		message += ":"
+	}
+	lines := append([]string{message}, reported...)
 	if len(reasons) > 0 {
-		return fmt.Errorf("%w\nNo membership reported by:\n%s", err, strings.Join(reasons, "\n"))
+		lines = append(append(lines, "No membership reported by:"), reasons...)
 	}
-	return err
+	return errors.New(strings.Join(lines, "\n"))
 }

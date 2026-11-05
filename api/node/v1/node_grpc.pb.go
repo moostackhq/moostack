@@ -96,8 +96,8 @@ type AgentClient interface {
 	// pulling nothing. A failed pull answers NOT_FOUND for an image the
 	// registry doesn't have, PERMISSION_DENIED for one it denies access to,
 	// RESOURCE_EXHAUSTED at the registry's first answer that the node is
-	// rate limited, with no retry, and UNAVAILABLE for a registry that
-	// can't be reached. The pull ends when its call ends.
+	// rate limited, and UNAVAILABLE for a registry that can't be reached.
+	// The pull ends when its call ends.
 	PullImage(ctx context.Context, in *PullImageRequest, opts ...grpc.CallOption) (*PullImageResponse, error)
 	// Run runs a container from its image, which the node must have, and
 	// keeps it running across restarts of the agent, of containerd and of
@@ -377,8 +377,8 @@ type AgentServer interface {
 	// pulling nothing. A failed pull answers NOT_FOUND for an image the
 	// registry doesn't have, PERMISSION_DENIED for one it denies access to,
 	// RESOURCE_EXHAUSTED at the registry's first answer that the node is
-	// rate limited, with no retry, and UNAVAILABLE for a registry that
-	// can't be reached. The pull ends when its call ends.
+	// rate limited, and UNAVAILABLE for a registry that can't be reached.
+	// The pull ends when its call ends.
 	PullImage(context.Context, *PullImageRequest) (*PullImageResponse, error)
 	// Run runs a container from its image, which the node must have, and
 	// keeps it running across restarts of the agent, of containerd and of
