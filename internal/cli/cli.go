@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/urfave/cli/v3"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/moostackhq/moostack/internal/clusterdir"
 	"github.com/moostackhq/moostack/internal/gitrepo"
@@ -42,6 +43,11 @@ type Env struct {
 	// Root is the directory of cluster directories; clusterdir.Root if
 	// empty.
 	Root string
+	// Connect connects to a node by its SSH target, trusting only
+	// hostKey, or, if hostKey is nil, the key the node offers, which it
+	// returns. Nil means over SSH, with the operator's SSH config and
+	// ssh-agent.
+	Connect func(ctx context.Context, target string, hostKey ssh.PublicKey) (remote, ssh.PublicKey, error)
 }
 
 // OSEnv is the Env of the running process.
@@ -278,4 +284,9 @@ func openTerminal(env Env) (terminal.Terminal, func()) {
 // the secret store with, on the terminal t.
 func keyOptions(env Env, cmd *cli.Command, t terminal.Terminal) secretstore.KeyOptions {
 	return secretstore.KeyOptions{Home: env.Home, SSHKey: cmd.String("ssh-key"), Terminal: t, Out: env.Stderr}
+}
+
+// say prints a line of progress.
+func say(env Env, format string, args ...any) {
+	fmt.Fprintf(env.Stderr, format+"\n", args...)
 }

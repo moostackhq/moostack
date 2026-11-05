@@ -31,6 +31,16 @@ func clusterCommand(env Env) *cli.Command {
 				Action: func(ctx context.Context, cmd *cli.Command) error { return clusterInit(ctx, env, cmd) },
 			},
 			{
+				Name:      "node-add",
+				Usage:     "install k3s on a host: the first becomes the control plane, the others join it",
+				ArgsUsage: "<ssh target>",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "name", Usage: "the node's name; the first free of node1, node2 and so on without it"},
+					&cli.StringFlag{Name: "private-address", Usage: "the host's address on the private network its nodes share, if mooctl can't tell"},
+				},
+				Action: func(ctx context.Context, cmd *cli.Command) error { return nodeAdd(ctx, env, cmd) },
+			},
+			{
 				Name:      "remote",
 				Usage:     "set the git remote that the cluster directory is pushed to after each operation, and push it",
 				ArgsUsage: "<url>",
