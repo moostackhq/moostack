@@ -334,7 +334,7 @@ var memberStates = map[hivemindadapter.State]nodev1.MemberState{
 
 // membershipOf is s as the node API reports it.
 func membershipOf(s hivemindadapter.Status) *nodev1.Membership {
-	m := &nodev1.Membership{HealthScore: uint32(s.HealthScore), Dropped: s.Dropped, Problem: s.Problem}
+	m := &nodev1.Membership{HealthScore: uint32(s.HealthScore), Dropped: s.Dropped, Transport: s.Transport, Problem: s.Problem}
 	for _, e := range s.Members {
 		m.Members = append(m.Members, &nodev1.Member{Node: e.NodeID, Address: e.Address, State: memberStates[e.State]})
 	}
@@ -407,8 +407,8 @@ func generationNodes(nodes []*nodev1.GenerationNode) ([]generationNode, error) {
 	return out, nil
 }
 
-// seed has membership join the cluster through nodes, each at its
-// private address and the peer port. Membership skips this node.
+// seed gives membership nodes as its seeds, each at its private address
+// and the peer port. Membership skips this node.
 func (s *agentServer) seed(nodes []generationNode) {
 	var seeds []hivemindadapter.Seed
 	for _, n := range nodes {

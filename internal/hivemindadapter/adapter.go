@@ -62,6 +62,9 @@ type Status struct {
 	// Dropped counts the messages dropped since Start, by reason, each
 	// above 0.
 	Dropped map[string]uint64
+	// Transport counts what the transport did since Start: dials,
+	// accepts, syncs_in and syncs_out, and conns, the connections open now.
+	Transport map[string]uint64
 	// Problem says why the node's link keeps it from opening connections,
 	// empty if nothing the node can see does.
 	Problem string
@@ -89,8 +92,9 @@ type Membership struct {
 	ctx context.Context
 	// address is the node's private address, invalid if it has none.
 	address netip.Addr
-	// transportDrops are the transport's drop counts, by reason.
-	transportDrops func() map[string]uint64
+	// transportStats is what the transport counted, nil for a transport
+	// that counts nothing.
+	transportStats func() quic.Stats
 	cutOff         func(match func(*x509.Certificate) bool)
 	impersonated   atomic.Uint64
 	// mu guards stopped, and is held through a SetSeeds, a Forget or a
@@ -106,7 +110,7 @@ func Start(ctx context.Context, cfg Config) (*Membership, error) {
 	if err != nil {
 		return nil, fmt.Errorf("membership: listening on UDP %s: %w", cfg.Address, err)
 	}
-	m, err := start(ctx, cfg.Identity.Node, tr, func() map[string]uint64 { return quicDrops(tr.Stats().Dropped) })
+	m, err := start(ctx, cfg.Identity.Node, tr, tr.Stats)
 	if err != nil {
 		return nil, err
 	}
@@ -139,10 +143,10 @@ func peerID(cert *x509.Certificate) (string, error) {
 	return cert.Subject.CommonName, nil
 }
 
-// start runs membership for nodeID over tr, whose drop counts
-// transportDrops returns, nil for none.
-func start(ctx context.Context, nodeID string, tr transport.Transport, transportDrops func() map[string]uint64) (*Membership, error) {
-	m := &Membership{ctx: ctx, transportDrops: transportDrops, cutOff: cutNothing}
+// start runs membership for nodeID over tr, whose counts transportStats
+// returns, nil for none.
+func start(ctx context.Context, nodeID string, tr transport.Transport, transportStats func() quic.Stats) (*Membership, error) {
+	m := &Membership{ctx: ctx, transportStats: transportStats, cutOff: cutNothing}
 	rt, err := runtime.Start(ctx, node.Defaults(member.ID(nodeID), ""), tr, runtime.Options{
 		OnEvent: func(e node.Event) {
 			if e.Kind == node.Impersonated {
@@ -174,8 +178,11 @@ func (m *Membership) Members() []Member {
 func (m *Membership) Status() Status {
 	dropped := runtimeDrops(m.rt.Counts())
 	dropped["impersonated"] = m.impersonated.Load()
-	if m.transportDrops != nil {
-		for reason, n := range m.transportDrops() {
+	var counts map[string]uint64
+	if m.transportStats != nil {
+		stats := m.transportStats()
+		counts = quicCounts(stats)
+		for reason, n := range quicDrops(stats.Dropped) {
 			dropped[reason] += n
 		}
 	}
@@ -184,11 +191,12 @@ func (m *Membership) Status() Status {
 			delete(dropped, reason)
 		}
 	}
-	return Status{Members: m.Members(), HealthScore: m.rt.Health(), Dropped: dropped, Problem: m.problem()}
+	return Status{Members: m.Members(), HealthScore: m.rt.Health(), Dropped: dropped, Transport: counts, Problem: m.problem()}
 }
 
-// SetSeeds joins the cluster through seeds, and keeps them to sync with
-// now and then. A seed that was forgotten is taken back.
+// SetSeeds keeps seeds to sync with now and then, and syncs with a few of
+// them if this is the first time it gets any, or the node has no other
+// live member. A seed that was forgotten is taken back.
 func (m *Membership) SetSeeds(seeds []Seed) error {
 	s := make([]node.Seed, len(seeds))
 	for i, seed := range seeds {
@@ -256,6 +264,17 @@ func stoppedIfClosed(err error) error {
 func convert(e member.Member) Member {
 	s := map[member.State]State{member.Alive: Alive, member.Suspect: Suspect, member.Dead: Dead, member.Left: Left}[e.State]
 	return Member{NodeID: strings.ToValidUTF8(string(e.ID), "\uFFFD"), Address: strings.ToValidUTF8(e.Addr, "\uFFFD"), State: s}
+}
+
+// quicCounts are the transport's counts, by name.
+func quicCounts(s quic.Stats) map[string]uint64 {
+	return map[string]uint64{
+		"dials":     s.Dials,
+		"accepts":   s.Accepts,
+		"syncs_in":  s.StreamsIn,
+		"syncs_out": s.StreamsOut,
+		"conns":     uint64(s.Conns),
+	}
 }
 
 // runtimeDrops are the runtime's drop counts, by reason.

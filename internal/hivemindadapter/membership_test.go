@@ -197,8 +197,8 @@ func TestForgetKeepsANodeOutUntilSetSeedsNamesIt(t *testing.T) {
 func TestStatusCountsTheDropsByReason(t *testing.T) {
 	t.Parallel()
 	net := memnet.New(1, time.Millisecond)
-	a, err := start(t.Context(), "a", net.ListenAs("10.0.0.1:7443", "a"), func() map[string]uint64 {
-		return map[string]uint64{"queue_full": 2, "unsent": 0}
+	a, err := start(t.Context(), "a", net.ListenAs("10.0.0.1:7443", "a"), func() quic.Stats {
+		return quic.Stats{Dropped: quic.Drops{QueueFull: 2}}
 	})
 	if err != nil {
 		t.Fatal(err)

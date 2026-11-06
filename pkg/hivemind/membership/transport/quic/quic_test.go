@@ -1430,6 +1430,12 @@ func TestADialsFirstPacketIsAtMostQUICsSmallestPayload(t *testing.T) {
 // it saw.
 func relay(t *testing.T, to string) (addr string, largest func() int) {
 	t.Helper()
+	return slowRelay(t, to, 0)
+}
+
+// slowRelay is a relay that holds each datagram for delay.
+func slowRelay(t *testing.T, to string, delay time.Duration) (addr string, largest func() int) {
+	t.Helper()
 	front, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1451,7 +1457,8 @@ func relay(t *testing.T, to string) (addr string, largest func() int) {
 			}
 			dialler.Store(&from)
 			most.Store(max(most.Load(), int64(n)))
-			back.Write(b[:n])
+			data := bytes.Clone(b[:n])
+			time.AfterFunc(delay, func() { back.Write(data) })
 		}
 	}()
 	go func() {
@@ -1463,11 +1470,44 @@ func relay(t *testing.T, to string) (addr string, largest func() int) {
 			}
 			most.Store(max(most.Load(), int64(n)))
 			if from := dialler.Load(); from != nil {
-				front.WriteTo(b[:n], *from)
+				data := bytes.Clone(b[:n])
+				time.AfterFunc(delay, func() { front.WriteTo(data, *from) })
 			}
 		}
 	}()
 	return front.LocalAddr().String(), func() int { return int(most.Load()) }
+}
+
+// A peer silent for three seconds of a handshake is still reached.
+func TestAHandshakeOutlastsASlowPeer(t *testing.T) {
+	c := newCluster(t)
+	a, b := listen(t, c.Node("a")), listen(t, c.Node("b"))
+	addr, _ := slowRelay(t, b.Addr(), 1500*time.Millisecond)
+	a.SendPacket(transport.Dest{Addr: addr, Peer: "b"}, []byte("ping"))
+	if m, ok := next(b, 15*time.Second); !ok || string(m.Data) != "ping" {
+		t.Fatalf("got %+v, %v; want the ping; a's stats %+v", m, ok, a.Stats())
+	}
+}
+
+// A peer that never answers fails the dial in the handshake's limit.
+func TestAHandshakeWithASilentPeerGivesUp(t *testing.T) {
+	silent, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+	a := listen(t, newCluster(t).Node("a"))
+	began := time.Now()
+	a.SendPacket(transport.Dest{Addr: silent.LocalAddr().String(), Peer: "b"}, []byte("ping"))
+	for a.Stats().DialFails == 0 {
+		if time.Since(began) > 8*time.Second {
+			t.Fatalf("no failed dial after %v", time.Since(began))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if d := time.Since(began); d < 4*time.Second {
+		t.Fatalf("the dial failed after %v, want about 5 s", d)
+	}
 }
 
 // However much a connection carries, no datagram outgrows the smallest

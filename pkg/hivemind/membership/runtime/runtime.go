@@ -322,9 +322,11 @@ func (r *Runtime) do(in node.Input) error {
 	return nil
 }
 
-// Join contacts the seeds, each named by its member ID beside its address,
-// keeps them for the periodic seed syncs, and lifts the hold Forget put on
-// each seed: entries of it are taken again. A node that left joins again.
+// Join keeps the seeds, each named by its member ID beside its address,
+// for the periodic seed syncs, lifts the hold Forget put on each seed:
+// entries of it are taken again, and contacts a few of the seeds if they
+// are the node's first, it has no other live member, or it had left. A
+// node that left joins again.
 // A seed with no ID or no address is refused, and the call does nothing.
 func (r *Runtime) Join(seeds ...node.Seed) error {
 	for _, s := range seeds {

@@ -72,6 +72,8 @@ type Node struct {
 	pacer  *gossip.Pacer
 	pause  *pause.Detector
 	left   bool
+	// seeded says the node has been given seeds.
+	seeded bool
 	// incompatible are the members already reported as reading no version
 	// the node writes.
 	incompatible map[string]bool
@@ -275,9 +277,11 @@ func (n *Node) syncMsg(reply bool) msg.Sync {
 	return msg.Sync{From: n.view.Self(), View: n.view.All(), Reply: reply}
 }
 
-// join contacts the seeds. A node that left joins again, at a new
-// incarnation.
+// join keeps the seeds, and syncs with a few of them the first time it
+// is given any, and if the node has no other live member or had left. A
+// node that left joins again, at a new incarnation.
 func (n *Node) join(now time.Time, in Join, r *Result) {
+	reach := n.left || !n.seeded || n.alone()
 	if n.left {
 		n.left = false
 		self := n.view.Self()
@@ -292,8 +296,22 @@ func (n *Node) join(now time.Time, in Join, r *Result) {
 			seeds = append(seeds, member.Member{ID: s.ID, Addr: s.Addr})
 		}
 	}
-	for _, s := range n.syncs.Join(now, n.view.Self(), seeds) {
+	kept := n.syncs.Keep(n.view.Self(), seeds)
+	for _, s := range kept {
 		n.view.Lift(s.ID)
+	}
+	n.seeded = n.seeded || len(kept) > 0
+	if reach {
+		n.reach(now, r)
+	}
+}
+
+// alone says the node has no other live member.
+func (n *Node) alone() bool { return n.view.Live() <= 1 }
+
+// reach syncs with a few seeds, and starts trying the others.
+func (n *Node) reach(now time.Time, r *Result) {
+	for _, s := range n.syncs.Reach(now) {
 		n.sync(s.Addr, s.ID, true, r)
 	}
 }
@@ -539,8 +557,11 @@ func (n *Node) tick(now time.Time, r *Result) {
 	if !n.left && n.pacer.Tick(now) && n.gossip.Len() > 0 {
 		n.gossipRound(r)
 	}
+	if !n.left && n.alone() && !n.syncs.Joining() {
+		n.reach(now, r)
+	}
 	if !n.left && !n.syncs.Due().IsZero() && !now.Before(n.syncs.Due()) {
-		for _, m := range n.syncs.Tick(now, n.view.Live() > 1, n.randomLive(nil)) {
+		for _, m := range n.syncs.Tick(now, !n.alone(), n.randomLive(nil)) {
 			n.sync(m.Addr, m.ID, true, r)
 		}
 	}

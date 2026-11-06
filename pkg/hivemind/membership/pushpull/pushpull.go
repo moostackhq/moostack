@@ -1,6 +1,7 @@
 // Package pushpull schedules the whole-view syncs, in which two members
-// swap every entry they have. A node joins by syncing with its seeds, and
-// retries until it hears of another member.
+// swap every entry they have. A node joins by syncing with a few of its
+// seeds, and retries with the next few until it holds another live member.
+// Seeds are otherwise kept for the periodic seed syncs.
 package pushpull
 
 import (
@@ -28,8 +29,9 @@ type Scheduler struct {
 	cfg     Config
 	rng     *rand.Rand
 	seeds   []member.Member
-	next    time.Time // the next periodic sync
-	retryAt time.Time // the next join attempt; zero when not joining
+	untried []member.Member // the seeds a join hasn't tried in this pass
+	next    time.Time       // the next periodic sync
+	retryAt time.Time       // the next join attempt; zero when not joining
 	backoff time.Duration
 	count   int
 	catchUp int // syncs soon still allowed after a join
@@ -38,6 +40,9 @@ type Scheduler struct {
 // maxCatchUp is how many syncs past the first a joined node brings
 // forward, one for each sync that taught it of members it didn't know.
 const maxCatchUp = 3
+
+// joinSeeds is how many seeds a join attempt syncs with.
+const joinSeeds = 3
 
 // maxBackoff is how many times RetryEvery join attempts back off to while
 // the seeds don't answer.
@@ -53,20 +58,42 @@ func New(cfg Config, rng *rand.Rand, now time.Time) *Scheduler {
 	return &Scheduler{cfg: cfg, rng: rng, next: now.Add(first)}
 }
 
-// Join keeps the seeds, each a member's ID and address, other than those
-// with self's ID or address, and returns the seeds to sync with now. No
-// further sync is brought forward for an earlier join. With none, a join
-// still trying earlier seeds ends.
-func (s *Scheduler) Join(now time.Time, self member.Member, seeds []member.Member) []member.Member {
+// Keep keeps the seeds, each a member's ID and address, other than those
+// with self's ID or address, and returns them. With none, a join still
+// trying earlier seeds ends.
+func (s *Scheduler) Keep(self member.Member, seeds []member.Member) []member.Member {
 	s.seeds = slices.DeleteFunc(slices.Clone(seeds), func(m member.Member) bool { return m.ID == self.ID || m.Addr == self.Addr })
-	s.catchUp = 0
+	s.untried = nil
 	if len(s.seeds) == 0 {
+		s.catchUp = 0
 		s.endJoin()
+	}
+	return slices.Clone(s.seeds)
+}
+
+// Reach starts trying the seeds kept, and returns the few to sync with now.
+// No further sync is brought forward for an earlier join.
+func (s *Scheduler) Reach(now time.Time) []member.Member {
+	if len(s.seeds) == 0 {
 		return nil
 	}
+	s.catchUp = 0
 	s.backoff = s.cfg.RetryEvery
 	s.retryAt = now.Add(s.jitter(s.backoff))
-	return slices.Clone(s.seeds)
+	return s.few()
+}
+
+// few is the next joinSeeds of the seeds, in an order drawn at random for
+// each pass through them, or as many as the pass has left.
+func (s *Scheduler) few() []member.Member {
+	if len(s.untried) == 0 {
+		s.untried = slices.Clone(s.seeds)
+		s.rng.Shuffle(len(s.untried), func(i, j int) { s.untried[i], s.untried[j] = s.untried[j], s.untried[i] })
+	}
+	n := min(joinSeeds, len(s.untried))
+	out := s.untried[:n:n]
+	s.untried = s.untried[n:]
+	return out
 }
 
 // endJoin stops trying the seeds.
@@ -82,8 +109,9 @@ func (s *Scheduler) jitter(d time.Duration) time.Duration {
 
 // Tick returns the members to sync with at now. others says whether the
 // node knows another live member, and pick draws one at random. Without
-// any, a joining node tries its seeds again. Once it knows one, its join
-// is done, and it catches up: its next sync comes within RetryEvery or so
+// any, a joining node tries the next few of its seeds, and backs off once a
+// pass through them has found nobody. Once it knows one, its join is done,
+// and it catches up: its next sync comes within RetryEvery or so
 // instead of Every, and so does the one after each sync that taught it of
 // members it didn't know (see Learned), maxCatchUp times at most.
 func (s *Scheduler) Tick(now time.Time, others bool, pick func() (member.Member, bool)) []member.Member {
@@ -94,9 +122,11 @@ func (s *Scheduler) Tick(now time.Time, others bool, pick func() (member.Member,
 			s.catchUp = maxCatchUp
 			s.soon(now)
 		} else if !now.Before(s.retryAt) {
-			s.backoff = min(2*s.backoff, maxBackoff*s.cfg.RetryEvery)
+			if len(s.untried) == 0 {
+				s.backoff = min(2*s.backoff, maxBackoff*s.cfg.RetryEvery)
+			}
 			s.retryAt = now.Add(s.jitter(s.backoff))
-			out = append(out, s.seeds...)
+			out = append(out, s.few()...)
 		}
 	}
 	if s.cfg.Every <= 0 || now.Before(s.next) {
@@ -114,7 +144,7 @@ func (s *Scheduler) Tick(now time.Time, others bool, pick func() (member.Member,
 }
 
 // soon brings the next sync forward to within RetryEvery or so. With
-// periodic syncs off, next is never read.
+// periodic syncs off, it has no effect.
 func (s *Scheduler) soon(now time.Time) {
 	if at := now.Add(s.jitter(s.cfg.RetryEvery)); at.Before(s.next) {
 		s.next = at
@@ -132,7 +162,7 @@ func (s *Scheduler) Learned(now time.Time) {
 
 // Due returns when Tick next has something to do.
 // With periodic syncs off (Every 0) and no join in progress, that is the
-// zero time: nothing to do.
+// zero time.
 func (s *Scheduler) Due() time.Time {
 	next := s.next
 	if s.cfg.Every <= 0 {
@@ -166,6 +196,7 @@ func (s *Scheduler) Seed(id member.ID, addr string) (member.Member, bool) {
 // still trying them ends; the syncs soon after one still come.
 func (s *Scheduler) Forget(id member.ID) {
 	s.seeds = slices.DeleteFunc(s.seeds, func(m member.Member) bool { return m.ID == id })
+	s.untried = slices.DeleteFunc(s.untried, func(m member.Member) bool { return m.ID == id })
 	if len(s.seeds) == 0 {
 		s.endJoin()
 	}

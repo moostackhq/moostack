@@ -1,6 +1,7 @@
 package pushpull
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"slices"
 	"testing"
@@ -32,6 +33,11 @@ func addrs(ms []member.Member) []string {
 	return out
 }
 
+func join(s *Scheduler, now time.Time, seeds []member.Member) []member.Member {
+	s.Keep(me, seeds)
+	return s.Reach(now)
+}
+
 // me is the scheduler's own member.
 var me = member.Member{ID: "me", Addr: "me"}
 
@@ -41,16 +47,49 @@ func one(m member.Member) func() (member.Member, bool) {
 	return func() (member.Member, bool) { return m, true }
 }
 
+// A join attempt takes a few seeds at random, each once.
+func TestAJoinAttemptTakesAFewSeeds(t *testing.T) {
+	s := sched()
+	seeds := named("a", "b", "c", "d", "e", "f", "g", "h")
+	seen := map[string]bool{}
+	for range 50 {
+		got := addrs(join(s, t0, seeds))
+		if len(got) != joinSeeds {
+			t.Fatalf("Reach = %v", got)
+		}
+		slices.Sort(got)
+		if len(slices.Compact(got)) != joinSeeds {
+			t.Fatalf("a seed twice in %v", got)
+		}
+		for _, a := range got {
+			seen[a] = true
+		}
+	}
+	if len(seen) != len(seeds) {
+		t.Fatalf("drew only %v", seen)
+	}
+}
+
+// Keeping seeds starts no join and brings no sync forward.
+func TestKeepingSeedsStartsNoJoin(t *testing.T) {
+	s := sched()
+	due := s.Due()
+	s.Keep(me, named("a", "b"))
+	if s.Joining() || !s.Due().Equal(due) {
+		t.Fatalf("joining %v, due moved from %v to %v", s.Joining(), due, s.Due())
+	}
+}
+
 // A join with no seeds ends one still trying earlier seeds: nothing is
 // left to retry, and the scheduler wakes for nothing.
 func TestJoiningNoSeedsEndsTheJoin(t *testing.T) {
 	s := New(Config{RetryEvery: 2 * time.Second}, rand.New(rand.NewPCG(1, 1)), t0)
-	s.Join(t0, me, named("a"))
+	join(s, t0, named("a"))
 	if !s.Joining() {
 		t.Fatal("not joining")
 	}
-	if got := addrs(s.Join(t0.Add(time.Second), me, named("me"))); len(got) != 0 {
-		t.Fatalf("Join = %v", got)
+	if got := addrs(join(s, t0.Add(time.Second), named("me"))); len(got) != 0 {
+		t.Fatalf("Reach = %v", got)
 	}
 	if s.Joining() || !s.Due().IsZero() {
 		t.Fatalf("still joining, due %v, with no seeds", s.Due())
@@ -63,8 +102,8 @@ func TestJoiningNoSeedsEndsTheJoin(t *testing.T) {
 func TestJoinRetriesUntilAMemberIsKnown(t *testing.T) {
 	// Periodic syncs off: Due is the next try.
 	s := New(Config{RetryEvery: 2 * time.Second}, rand.New(rand.NewPCG(1, 1)), t0)
-	if got := addrs(s.Join(t0, me, named("me", "a", "b"))); !slices.Equal(got, []string{"a", "b"}) {
-		t.Fatalf("Join = %v", got)
+	if got := addrs(join(s, t0, named("me", "a", "b"))); !slices.Equal(got, []string{"a", "b"}) {
+		t.Fatalf("Reach = %v", got)
 	}
 	// Retries back off from RetryEvery, each give or take half, up to
 	// maxBackoff times it.
@@ -78,7 +117,9 @@ func TestJoinRetriesUntilAMemberIsKnown(t *testing.T) {
 			t.Fatalf("retried early: %v", got)
 		}
 		now = due
-		if got := addrs(s.Tick(now, false, none)); !slices.Equal(got, []string{"a", "b"}) {
+		got := addrs(s.Tick(now, false, none))
+		slices.Sort(got)
+		if !slices.Equal(got, []string{"a", "b"}) {
 			t.Fatalf("retry %d = %v", i, got)
 		}
 		back = min(2*back, maxBackoff*2*time.Second)
@@ -97,7 +138,7 @@ func TestJoinRetriesAreSpread(t *testing.T) {
 	seen := map[time.Time]bool{}
 	for seed := range uint64(20) {
 		s := New(Config{Every: 30 * time.Second, RetryEvery: 2 * time.Second}, rand.New(rand.NewPCG(seed, 0)), t0)
-		s.Join(t0, me, named("seed"))
+		join(s, t0, named("seed"))
 		seen[s.Due()] = true
 	}
 	if len(seen) < 15 {
@@ -114,7 +155,7 @@ func TestSyncsOff(t *testing.T) {
 	if got := addrs(s.Tick(t0.Add(time.Hour), true, one(member.Member{ID: "x", Addr: "x"}))); len(got) != 0 {
 		t.Fatalf("synced with syncs off: %v", got)
 	}
-	s.Join(t0, me, named("seed"))
+	join(s, t0, named("seed"))
 	if s.Due().IsZero() {
 		t.Fatal("a join has nothing due")
 	}
@@ -122,7 +163,7 @@ func TestSyncsOff(t *testing.T) {
 
 func TestPeriodicSyncsGoToSeedsEverySoOften(t *testing.T) {
 	s := sched()
-	s.Join(t0, me, named("seed"))
+	join(s, t0, named("seed"))
 	live := one(member.Member{ID: "x", Addr: "x"})
 	var got []string
 	now := s.next.Add(-30 * time.Second)
@@ -153,7 +194,7 @@ func TestFirstSyncsAreSpread(t *testing.T) {
 
 func TestShift(t *testing.T) {
 	s := sched()
-	s.Join(t0, me, named("seed"))
+	join(s, t0, named("seed"))
 	before := s.Due()
 	s.Shift(5 * time.Second)
 	if !s.Due().Equal(before.Add(5 * time.Second)) {
@@ -173,7 +214,7 @@ func TestPeriodicSyncsWithoutSeedSyncs(t *testing.T) {
 		"only self seeds": {4, []string{"me"}},
 	} {
 		s := New(Config{Every: 30 * time.Second, SeedEvery: tc.seedEvery, RetryEvery: 2 * time.Second}, rand.New(rand.NewPCG(1, 1)), t0)
-		s.Join(t0, me, named(tc.seeds...))
+		join(s, t0, named(tc.seeds...))
 		live := one(member.Member{ID: "x", Addr: "x"})
 		now := s.next
 		for i := range 8 {
@@ -185,12 +226,12 @@ func TestPeriodicSyncsWithoutSeedSyncs(t *testing.T) {
 	}
 }
 
-// With RetryEvery 0, a join tries its seeds again at every tick until it
-// hears of a member.
+// With RetryEvery 0, a join tries the next of its seeds at every tick until
+// it holds a live member.
 func TestJoinWithoutRetryInterval(t *testing.T) {
 	s := New(Config{}, rand.New(rand.NewPCG(1, 1)), t0)
-	if got := addrs(s.Join(t0, me, named("seed"))); !slices.Equal(got, []string{"seed"}) {
-		t.Fatalf("Join = %v", got)
+	if got := addrs(join(s, t0, named("seed"))); !slices.Equal(got, []string{"seed"}) {
+		t.Fatalf("Reach = %v", got)
 	}
 	if got := addrs(s.Tick(t0, false, none)); !slices.Equal(got, []string{"seed"}) || !s.Joining() {
 		t.Fatalf("Tick = %v, joining %v", got, s.Joining())
@@ -204,7 +245,7 @@ func TestJoinWithoutRetryInterval(t *testing.T) {
 func TestCatchUpAfterAJoin(t *testing.T) {
 	s := sched()
 	a := one(member.Member{ID: "a", Addr: "a"})
-	s.Join(t0, me, named("seed"))
+	join(s, t0, named("seed"))
 	joined := t0.Add(10 * time.Millisecond)
 	s.Tick(joined, true, a)
 	soon := func(from time.Time) {
@@ -249,7 +290,7 @@ func TestCatchUpAfterAJoin(t *testing.T) {
 // last one ends the join.
 func TestAForgottenSeedIsNoSeed(t *testing.T) {
 	s := sched()
-	s.Join(t0, me, named("a", "b"))
+	join(s, t0, named("a", "b"))
 	s.Forget("a")
 	if _, ok := s.Seed("", "a"); ok {
 		t.Fatal("a is still a seed")
@@ -269,7 +310,7 @@ func TestAForgottenSeedIsNoSeed(t *testing.T) {
 // A seed is found by its address, with its ID.
 func TestASeedIsFoundByItsAddress(t *testing.T) {
 	s := sched()
-	s.Join(t0, me, []member.Member{{ID: "s1", Addr: "x:1"}})
+	join(s, t0, []member.Member{{ID: "s1", Addr: "x:1"}})
 	if m, ok := s.Seed("", "x:1"); !ok || m.ID != "s1" {
 		t.Fatalf("Seed(x:1) = %v, %v", m, ok)
 	}
@@ -282,9 +323,9 @@ func TestASeedIsFoundByItsAddress(t *testing.T) {
 // the node's own address, under any ID, is skipped.
 func TestSeedsAtOneAddress(t *testing.T) {
 	s := sched()
-	got := s.Join(t0, member.Member{ID: "me", Addr: "here"}, []member.Member{{ID: "old", Addr: "a"}, {ID: "new", Addr: "a"}, {ID: "other", Addr: "here"}})
+	got := s.Keep(member.Member{ID: "me", Addr: "here"}, []member.Member{{ID: "old", Addr: "a"}, {ID: "new", Addr: "a"}, {ID: "other", Addr: "here"}})
 	if len(got) != 2 {
-		t.Fatalf("Join = %v", got)
+		t.Fatalf("Reach = %v", got)
 	}
 	if m, ok := s.Seed("new", "a"); !ok || m.ID != "new" {
 		t.Fatalf("Seed(new, a) = %v, %v", m, ok)
@@ -305,7 +346,7 @@ func TestSeedsAtOneAddress(t *testing.T) {
 func TestForgettingTheSeedKeepsTheCatchUp(t *testing.T) {
 	s := sched()
 	a := one(member.Member{ID: "a", Addr: "a"})
-	s.Join(t0, me, named("seed"))
+	join(s, t0, named("seed"))
 	joined := t0.Add(10 * time.Millisecond)
 	s.Tick(joined, true, a)
 	now := s.Due()
@@ -320,14 +361,98 @@ func TestForgettingTheSeedKeepsTheCatchUp(t *testing.T) {
 func TestJoiningNoSeedsEndsTheCatchUp(t *testing.T) {
 	s := sched()
 	a := one(member.Member{ID: "a", Addr: "a"})
-	s.Join(t0, me, named("seed"))
+	join(s, t0, named("seed"))
 	joined := t0.Add(10 * time.Millisecond)
 	s.Tick(joined, true, a)
 	now := s.Due()
 	s.Tick(now, true, a)
-	s.Join(now, me, nil)
+	join(s, now, nil)
 	s.Learned(now)
 	if d := s.Due().Sub(now); d < 15*time.Second {
-		t.Fatalf("after a Join of no seeds, a sync that taught something brings the next %v on, want the period, 30s give or take half", d)
+		t.Fatalf("after a Reach of no seeds, a sync that taught something brings the next %v on, want the period, 30s give or take half", d)
+	}
+}
+
+func TestARetryTakesTheNextFewSeeds(t *testing.T) {
+	var seeds []member.Member
+	for i := range 20 {
+		seeds = append(seeds, member.Member{ID: member.ID(fmt.Sprint("s", i)), Addr: fmt.Sprint("s", i)})
+	}
+	s := New(Config{RetryEvery: time.Second}, rand.New(rand.NewPCG(1, 2)), t0)
+	tried := map[string]int{}
+	for _, m := range join(s, t0, seeds) {
+		tried[m.Addr]++
+	}
+	now := t0
+	for attempt := 1; len(tried) < len(seeds); attempt++ {
+		if attempt > 6 {
+			t.Fatalf("%d attempts tried %d of the seeds", attempt, len(tried))
+		}
+		now = s.Due()
+		got := s.Tick(now, false, none)
+		if len(got) == 0 || len(got) > joinSeeds {
+			t.Fatalf("attempt %d synced with %v", attempt, addrs(got))
+		}
+		if d := s.Due().Sub(now); d > 3*time.Second/2 {
+			t.Fatalf("attempt %d backed off %v in its first pass", attempt, d)
+		}
+		for _, m := range got {
+			tried[m.Addr]++
+		}
+	}
+	for addr, n := range tried {
+		if n != 1 {
+			t.Fatalf("%s was tried %d times in a pass", addr, n)
+		}
+	}
+	now = s.Due()
+	if got := s.Tick(now, false, none); len(got) != joinSeeds {
+		t.Fatalf("the next pass began with %v", addrs(got))
+	}
+	if d := s.Due().Sub(now); d <= 3*time.Second/2 {
+		t.Fatalf("the next attempt is %v away, want backed off after a pass found nobody", d)
+	}
+}
+
+func TestAForgottenSeedLeavesThePass(t *testing.T) {
+	seeds := []member.Member{{ID: "a", Addr: "a"}, {ID: "b", Addr: "b"}, {ID: "c", Addr: "c"}, {ID: "d", Addr: "d"}, {ID: "e", Addr: "e"}}
+	s := New(Config{RetryEvery: time.Second}, rand.New(rand.NewPCG(3, 4)), t0)
+	first := join(s, t0, seeds)
+	for _, m := range seeds {
+		if !slices.Contains(first, m) {
+			s.Forget(m.ID)
+			if got := s.Tick(s.Due(), false, none); slices.Contains(got, m) {
+				t.Fatalf("%s was forgotten and tried in %v", m.ID, addrs(got))
+			}
+			return
+		}
+	}
+}
+
+func TestKeepingSeedsLeavesACatchUp(t *testing.T) {
+	seeds := []member.Member{{ID: "a", Addr: "a"}}
+	s := New(Config{Every: time.Hour, RetryEvery: time.Second}, rand.New(rand.NewPCG(5, 6)), t0)
+	join(s, t0, seeds)
+	s.Tick(t0.Add(2*time.Second), true, none)
+	s.next = t0.Add(time.Hour)
+	s.Keep(me, seeds)
+	now := t0.Add(3 * time.Second)
+	s.Learned(now)
+	if d := s.Due().Sub(now); d > 3*time.Second/2 {
+		t.Fatalf("a sync that taught something after a Keep left the next %v away", d)
+	}
+}
+
+// A join attempt through 200 seeds, as a node's whole generation names them.
+func BenchmarkReach(b *testing.B) {
+	seeds := make([]member.Member, 200)
+	for i := range seeds {
+		seeds[i] = member.Member{ID: member.ID(fmt.Sprint("s", i)), Addr: fmt.Sprint("s", i)}
+	}
+	self := member.Member{ID: "self", Addr: "self"}
+	s := New(Config{Every: time.Second, RetryEvery: time.Second}, rand.New(rand.NewPCG(1, 1)), t0)
+	for b.Loop() {
+		s.Keep(self, seeds)
+		s.Reach(t0)
 	}
 }

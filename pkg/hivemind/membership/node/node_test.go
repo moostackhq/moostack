@@ -917,11 +917,12 @@ func TestASyncToAnIncompatibleSeedIsReported(t *testing.T) {
 	c := node.Defaults("a", "a")
 	n := node.New(c, wire.Sizer{}, t0)
 	newer := member.Member{ID: "s", Addr: "s", MinVersion: 2, Version: 2}
-	first := n.Step(t0, node.Receive{Addr: "s", Packet: msg.Packet{From: newer, Body: msg.Ack{}}})
-	r := n.Step(t0, node.Join{Seeds: []node.Seed{seed("s")}})
-	events := append(first.Events, r.Events...)
-	if len(r.Syncs) != 0 || !slices.ContainsFunc(events, func(e node.Event) bool { return e.Kind == node.Incompatible && e.Member == "s" }) {
-		t.Fatalf("syncs %v, events %v", r.Syncs, events)
+	if r := hear(n, t0, peer("b"), msg.Ack{}, msg.Update{Member: newer, By: "b"}); hasEvent(r, node.Incompatible) {
+		t.Fatalf("a member heard of raised %v", r.Events)
+	}
+	r := n.Step(t0, node.Join{Seeds: []node.Seed{{ID: "s", Addr: "s"}}})
+	if len(r.Syncs) != 0 || !slices.ContainsFunc(r.Events, func(e node.Event) bool { return e.Kind == node.Incompatible && e.Member == "s" }) {
+		t.Fatalf("syncs %v, events %v", r.Syncs, r.Events)
 	}
 }
 
@@ -2093,6 +2094,258 @@ func TestAJoinSkipsSeedsWithNoIDAndItself(t *testing.T) {
 	}
 }
 
+// A node with another live member keeps seeds and contacts none, whatever
+// it holds of them, and brings no sync forward; a kept seed gets its turn
+// in the periodic seed syncs.
+func TestANodeWithLiveMembersKeepsSeedsAndContactsNone(t *testing.T) {
+	n := soloWith(func(c *node.Config) { c.SyncEvery, c.SeedSyncEvery = 2, 1 }, "b", "c")
+	b := peer("b")
+	b.State, b.Incarnation = member.Dead, b.Incarnation+1
+	now := joined(n, seed("c"))
+	hear(n, now, peer("c"), msg.Ack{}, msg.Update{Member: b, By: "c"})
+	r := n.Step(now, node.Join{Seeds: []node.Seed{
+		{ID: "b", Addr: "b"},
+		{ID: "c", Addr: "c-moved"},
+		{ID: "new", Addr: "new-addr"},
+	}})
+	if len(r.Syncs) != 0 || n.Joining() {
+		t.Fatalf("join syncs %+v, joining %v", r.Syncs, n.Joining())
+	}
+	for range 2000 {
+		r := n.Step(now, node.Tick{})
+		if slices.ContainsFunc(r.Syncs, func(s node.Sync) bool { return s.Addr == "new-addr" }) {
+			return
+		}
+		now = r.Wake
+	}
+	t.Fatal("no seed sync reached the seed kept")
+}
+
+// A node alone syncs with a few seeds, not all, and each attempt takes the
+// next few.
+func TestANodeAloneJoinsThroughAFewSeeds(t *testing.T) {
+	n := solo(nil)
+	var seeds []node.Seed
+	for i := range 20 {
+		seeds = append(seeds, seed(fmt.Sprint("s", i)))
+	}
+	r := n.Step(t0, node.Join{Seeds: seeds})
+	if len(r.Syncs) != 3 || !n.Joining() {
+		t.Fatalf("join syncs %+v, joining %v", r.Syncs, n.Joining())
+	}
+	tried := map[string]bool{}
+	for _, s := range r.Syncs {
+		tried[s.Addr] = true
+	}
+	now := t0
+	for range 2000 {
+		r := n.Step(now, node.Tick{})
+		for _, s := range r.Syncs {
+			tried[s.Addr] = true
+		}
+		now = r.Wake
+	}
+	if len(tried) != len(seeds) {
+		t.Fatalf("attempts tried only %v", tried)
+	}
+}
+
+// joined gives n its first seeds, and steps it until its join is done,
+// returning when that was.
+func joined(n *node.Node, seeds ...node.Seed) time.Time {
+	r := n.Step(t0, node.Join{Seeds: seeds})
+	for n.Joining() {
+		r = n.Step(r.Wake, node.Tick{})
+	}
+	return r.Wake
+}
+
+// A node's first seeds are always reached, though it has heard a member.
+func TestAFirstJoinReachesSeedsWithAMemberHeard(t *testing.T) {
+	n := solo(nil)
+	hear(n, t0, peer("b"), msg.Ack{})
+	var seeds []node.Seed
+	for i := range 20 {
+		seeds = append(seeds, seed(fmt.Sprint("s", i)))
+	}
+	if r := n.Step(t0, node.Join{Seeds: seeds}); len(r.Syncs) != 3 {
+		t.Fatalf("first join syncs %+v", r.Syncs)
+	}
+	if r := n.Step(t0, node.Join{Seeds: seeds}); len(r.Syncs) != 0 {
+		t.Fatalf("second join with a member heard syncs %+v", r.Syncs)
+	}
+}
+
+// A first join with no seeds doesn't count as the first.
+func TestAJoinWithNoSeedsLeavesTheFirstToCome(t *testing.T) {
+	n := solo(nil)
+	n.Step(t0, node.Join{})
+	hear(n, t0, peer("b"), msg.Ack{})
+	if r := n.Step(t0, node.Join{Seeds: []node.Seed{seed("s")}}); len(r.Syncs) != 1 {
+		t.Fatalf("join syncs %+v", r.Syncs)
+	}
+}
+
+// A running node that loses its last other member tries its seeds at once
+// and goes on trying.
+func TestANodeLeftAloneReachesForItsSeeds(t *testing.T) {
+	n := soloWith(nil, "b")
+	now := joined(n, seed("b"), seed("s"))
+	gone := peer("b")
+	gone.State, gone.Incarnation = member.Left, gone.Incarnation+1
+	r := hear(n, now, peer("b"), msg.Ack{}, msg.Update{Member: gone, By: "b"})
+	if len(r.Syncs) == 0 || !n.Joining() {
+		t.Fatalf("left alone: syncs %+v, joining %v", r.Syncs, n.Joining())
+	}
+}
+
+// A node alone, in the middle of trying its seeds, reaches new seeds at
+// once.
+func TestANodeAloneGivenSeedsReachesThemAtOnce(t *testing.T) {
+	n := solo(nil)
+	n.Step(t0, node.Join{Seeds: []node.Seed{seed("a")}})
+	r := n.Step(t0.Add(time.Millisecond), node.Join{Seeds: []node.Seed{seed("a"), seed("b"), seed("c"), seed("d")}})
+	if len(r.Syncs) != 3 {
+		t.Fatalf("join syncs %+v, want 3", r.Syncs)
+	}
+}
+
+// A node that left reaches for no seeds, though it is alone.
+func TestANodeThatLeftReachesForNoSeeds(t *testing.T) {
+	n := soloWith(nil, "b")
+	now := joined(n, seed("b"), seed("c"))
+	for _, s := range n.Step(now, node.Leave{}).Syncs {
+		if s.Sync.Reply {
+			t.Fatalf("leaving, it reached for a seed: %+v", s)
+		}
+	}
+	if r := n.Step(now, node.Forget{ID: "b"}); len(r.Syncs) != 0 {
+		t.Fatalf("alone, syncs %+v", r.Syncs)
+	}
+	for i := range 20 {
+		if r := n.Step(now.Add(time.Duration(i)*time.Minute), node.Tick{}); len(r.Syncs) != 0 {
+			t.Fatalf("after %d minutes, syncs %+v", i, r.Syncs)
+		}
+	}
+}
+
+// A node that left joins again through a few seeds, though it still holds
+// live members.
+func TestANodeThatLeftJoinsAgainThroughAFewSeeds(t *testing.T) {
+	n := soloWith(nil, "b", "c")
+	now := joined(n, seed("b"))
+	n.Step(now, node.Leave{})
+	r := n.Step(now.Add(time.Second), node.Join{Seeds: []node.Seed{seed("b"), seed("c"), seed("d"), seed("e")}})
+	if len(r.Syncs) < 3 || len(r.Syncs) > 4 {
+		t.Fatalf("join syncs %+v, want 3, and a periodic one if it was due", r.Syncs)
+	}
+}
+
+// allSeeds names every node of tn but except, as a recording does.
+func allSeeds(tn *testnet, except string) []node.Seed {
+	var s []node.Seed
+	for _, a := range tn.addrs {
+		if a != except {
+			s = append(s, seed(a))
+		}
+	}
+	return s
+}
+
+// A seed a join didn't contact stays a seed: after a partition long enough
+// for each side to forget the other, only seed syncs bring them back
+// together.
+func TestAKeptSeedStillHealsAPartition(t *testing.T) {
+	tn := newNet(t, 6, func(_ int, c *node.Config) {
+		c.SyncEvery = 2
+		c.SeedSyncEvery = 1
+		c.DeadTimeout = 30 * time.Second
+		c.GraveTimeout = 30 * time.Second
+	})
+	tn.joinAll()
+	tn.after(20 * time.Second)
+	for _, a := range tn.addrs {
+		tn.step(a, node.Join{Seeds: allSeeds(tn, a)})
+	}
+	tn.after(20 * time.Second)
+	for _, a := range tn.addrs {
+		if r := tn.nodes[a].n.Step(tn.now, node.Join{Seeds: allSeeds(tn, a)}); len(r.Syncs) != 0 {
+			t.Fatalf("%s holds every seed alive and syncs %+v", a, r.Syncs)
+		}
+	}
+	tn.after(5 * time.Second)
+	// The node all joined through stays cut off.
+	first := tn.addrs[0]
+	side := func(a string) bool { return a < "n03" }
+	tn.cut = func(from, to string) bool { return from == first || to == first || side(from) != side(to) }
+	tn.after(3 * time.Minute)
+	rest := tn.addrs[1:]
+	for _, a := range rest {
+		want := 3
+		if side(a) {
+			want = 2
+		}
+		if got := len(tn.nodes[a].n.Members()); got != want {
+			t.Fatalf("%s holds %d members, want only its own side of %d", a, got, want)
+		}
+	}
+	tn.cut = func(from, to string) bool { return from == first || to == first }
+	tn.after(time.Minute)
+	for _, a := range rest {
+		if got := len(tn.nodes[a].n.Members()); got != len(rest) {
+			t.Fatalf("%s holds %d members a minute after the partition healed, want %d", a, got, len(rest))
+		}
+	}
+}
+
+// A node added to a cluster costs a few syncs whatever the cluster's size,
+// whichever of it and the others records the generation first: the new
+// node syncs with a few seeds, and the others hear of it by gossip.
+func TestANodeAddCostsAFewSyncsAtAnySize(t *testing.T) {
+	for _, c := range []struct {
+		n        int
+		newFirst bool
+	}{{25, false}, {50, false}, {100, false}, {25, true}, {50, true}, {100, true}} {
+		n := c.n
+		tn := newNet(t, n+1, nil)
+		added := tn.addrs[n]
+		tn.addrs = tn.addrs[:n]
+		tn.joinAll()
+		for _, a := range tn.addrs {
+			tn.step(a, node.Join{Seeds: allSeeds(tn, a)})
+		}
+		tn.after(time.Minute)
+		count := func() int {
+			c := 0
+			for _, v := range tn.started {
+				c += v
+			}
+			return c
+		}
+		before := count()
+		tn.after(20 * time.Second)
+		quiet := count() - before
+		tn.addrs = append(tn.addrs, added)
+		before = count()
+		if c.newFirst {
+			tn.step(added, node.Join{Seeds: allSeeds(tn, added)})
+		}
+		for _, a := range tn.addrs[:n] {
+			tn.step(a, node.Join{Seeds: allSeeds(tn, a)})
+		}
+		if !c.newFirst {
+			tn.step(added, node.Join{Seeds: allSeeds(tn, added)})
+		}
+		tn.after(20 * time.Second)
+		if got := count() - before - quiet; got > 20 {
+			t.Errorf("adding a node to %d started %d syncs, want at most 20", n, got)
+		}
+		if !tn.converged() {
+			t.Fatalf("%d nodes and the one added didn't converge", n)
+		}
+	}
+}
+
 // Forget takes a member out of the view at once, whatever its state, and
 // reports it. From then on the node neither probes it nor gossips it, and
 // ignores every entry of it, at any incarnation, from the member itself or
@@ -2339,9 +2592,9 @@ func TestForgetOfSelfOrAStranger(t *testing.T) {
 	}
 }
 
-// A Join that names a forgotten member as a seed lifts its hold: the join
-// syncs with it, and its next entry is taken at once, whether or not the
-// node knew it before the Forget. A seed the join skips lifts nothing.
+// A Join that names a forgotten member as a seed lifts its hold: its next
+// entry is taken at once, whether or not the node knew it before the
+// Forget. A seed the join skips lifts nothing.
 func TestJoinTakesBackAForgottenSeed(t *testing.T) {
 	for _, known := range []bool{true, false} {
 		ids := []string{"b"}
@@ -2357,10 +2610,7 @@ func TestJoinTakesBackAForgottenSeed(t *testing.T) {
 		if r := n.Step(t0, node.ReceiveSync{Addr: "x", Peer: "x", Sync: msg.Sync{From: early, View: []member.Member{early}}}); len(r.Changes) != 0 {
 			t.Fatalf("known %v: a skipped seed lifted the hold", known)
 		}
-		r := n.Step(t0, node.Join{Seeds: []node.Seed{seed("x")}})
-		if len(r.Syncs) != 1 || r.Syncs[0].To != "x" {
-			t.Fatalf("known %v: join syncs %+v", known, r.Syncs)
-		}
+		n.Step(t0, node.Join{Seeds: []node.Seed{seed("x")}})
 		x := peer("x")
 		x.Incarnation = uint64(t0.UnixMilli())
 		if r := n.Step(t0, node.ReceiveSync{Addr: "x", Peer: "x", Sync: msg.Sync{From: x, View: []member.Member{x}}}); len(r.Changes) == 0 {
@@ -2476,17 +2726,25 @@ func TestForgetEndsAProbeUnderWayWithNoVerdict(t *testing.T) {
 // A sync goes in the highest wire version the node and the member both
 // read, by the member's entry.
 func TestASyncGoesInTheHighestCommonVersion(t *testing.T) {
-	n := solo(func(c *node.Config) { c.MinVersion, c.Version = 1, 3 })
+	n := solo(func(c *node.Config) { c.MinVersion, c.Version, c.SyncEvery = 1, 3, 2 })
 	b := peer("b")
 	b.MinVersion, b.Version = 2, 2
 	r := n.Step(t0, node.ReceiveSync{Addr: "b", Sync: msg.Sync{From: b, View: []member.Member{b}, Reply: true}})
 	if len(r.Syncs) != 1 || r.Syncs[0].To != "b" || r.Syncs[0].Version != 2 {
 		t.Fatalf("answer %+v, want one to b in version 2", r.Syncs)
 	}
-	r = n.Step(t0, node.Join{Seeds: []node.Seed{seed("b")}})
-	if len(r.Syncs) != 1 || r.Syncs[0].Version != 2 {
-		t.Fatalf("join sync %+v, want version 2", r.Syncs)
+	now := t0
+	for range 2000 {
+		r := n.Step(now, node.Tick{})
+		if len(r.Syncs) > 0 {
+			if r.Syncs[0].Version != 2 {
+				t.Fatalf("periodic sync %+v, want version 2", r.Syncs)
+			}
+			return
+		}
+		now = r.Wake
 	}
+	t.Fatal("no periodic sync")
 }
 
 func isAck(p node.Packet) bool { _, ok := p.Packet.Body.(msg.Ack); return ok }

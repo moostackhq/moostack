@@ -52,6 +52,10 @@ const (
 // drainTimeout bounds how long Close sends what was handed to it before.
 const drainTimeout = 2 * time.Second
 
+// handshakeTimeout is how long a handshake goes without hearing from the
+// peer before it fails.
+const handshakeTimeout = 5 * time.Second
+
 // streamReadTimeout bounds how long a stream from a peer is read, and
 // syncTimeout how long a sync waits for a stream and is written.
 var (
@@ -238,7 +242,7 @@ func Listen(cfg Config) (*Transport, error) {
 			// Packets stay at QUIC's smallest size.
 			InitialPacketSize:       1200,
 			DisablePathMTUDiscovery: true,
-			HandshakeIdleTimeout:    time.Second,
+			HandshakeIdleTimeout:    handshakeTimeout,
 			MaxIdleTimeout:          cfg.IdleTimeout,
 			// A peer may have at most maxStreams unidirectional streams
 			// open on one connection, and no bidirectional stream.

@@ -10,7 +10,7 @@ import (
 	"github.com/moostackhq/moostack/pkg/hivemind/membership/member"
 )
 
-// Generated sequences of joins, forgotten seeds, ticks and syncs that
+// Generated sequences of seeds kept, joins, forgotten seeds, ticks and syncs that
 // taught something, against a model of the seeds, of whether the scheduler
 // is joining and of the syncs left to bring forward after a join: after
 // every step the same seeds are found, at their addresses and by their
@@ -35,19 +35,42 @@ func TestSeedsAgainstAModel(t *testing.T) {
 		for step := range 100 {
 			now = now.Add(time.Duration(r.IntN(3000)) * time.Millisecond)
 			var what string
-			switch r.IntN(5) {
+			switch r.IntN(6) {
+			case 4:
+				var in []member.Member
+				for range r.IntN(4) {
+					in = append(in, pool[r.IntN(len(pool))])
+				}
+				what = fmt.Sprintf("Keep(%v)", in)
+				kept := s.Keep(self, in)
+				seeds = slices.DeleteFunc(slices.Clone(in), func(m member.Member) bool { return m.ID == self.ID || m.Addr == self.Addr })
+				if len(seeds) == 0 {
+					joining, catchUp = false, 0
+				}
+				if !slices.Equal(kept, seeds) {
+					t.Fatalf("run %d step %d: %s kept %v, the model %v", run, step, what, kept, seeds)
+				}
 			case 0:
 				var in []member.Member
 				for range r.IntN(4) {
 					in = append(in, pool[r.IntN(len(pool))])
 				}
-				what = fmt.Sprintf("Join(%v)", in)
-				got := s.Join(now, self, in)
+				what = fmt.Sprintf("Reach(%v)", in)
+				kept := s.Keep(self, in)
+				got := s.Reach(now)
 				seeds = slices.DeleteFunc(slices.Clone(in), func(m member.Member) bool { return m.ID == self.ID || m.Addr == self.Addr })
 				joining = len(seeds) > 0
 				catchUp = 0
-				if !slices.Equal(got, seeds) {
-					t.Fatalf("run %d step %d: %s = %v, the model %v", run, step, what, got, seeds)
+				if !slices.Equal(kept, seeds) {
+					t.Fatalf("run %d step %d: %s kept %v, the model %v", run, step, what, kept, seeds)
+				}
+				if len(got) != min(joinSeeds, len(seeds)) {
+					t.Fatalf("run %d step %d: %s syncs %v of %v", run, step, what, got, seeds)
+				}
+				for _, m := range got {
+					if !slices.Contains(seeds, m) {
+						t.Fatalf("run %d step %d: %s syncs %v, not a seed of the model's %v", run, step, what, m, seeds)
+					}
 				}
 			case 1:
 				id := pool[r.IntN(len(pool))].ID
@@ -70,7 +93,11 @@ func TestSeedsAgainstAModel(t *testing.T) {
 			default:
 				others := r.IntN(3) == 0
 				what = fmt.Sprintf("Tick(others %v)", others)
-				for _, m := range s.Tick(now, others, none) {
+				got := s.Tick(now, others, none)
+				if len(got) > joinSeeds+1 {
+					t.Fatalf("run %d step %d: %s synced with %v, more than a few", run, step, what, got)
+				}
+				for _, m := range got {
 					if !slices.Contains(seeds, m) {
 						t.Fatalf("run %d step %d: %s synced %v, not a seed of the model's %v", run, step, what, m, seeds)
 					}

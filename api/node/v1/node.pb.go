@@ -410,7 +410,11 @@ type Membership struct {
 	Dropped map[string]uint64 `protobuf:"bytes,3,rep,name=dropped,proto3" json:"dropped,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
 	// Problem says why membership can't open connections from this node,
 	// empty if the node knows of no reason.
-	Problem       string `protobuf:"bytes,4,opt,name=problem,proto3" json:"problem,omitempty"`
+	Problem string `protobuf:"bytes,4,opt,name=problem,proto3" json:"problem,omitempty"`
+	// Transport counts what the node's transport did since it started:
+	// dials, accepts, syncs_in and syncs_out, and conns, the connections
+	// open now.
+	Transport     map[string]uint64 `protobuf:"bytes,5,rep,name=transport,proto3" json:"transport,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -471,6 +475,13 @@ func (x *Membership) GetProblem() string {
 		return x.Problem
 	}
 	return ""
+}
+
+func (x *Membership) GetTransport() map[string]uint64 {
+	if x != nil {
+		return x.Transport
+	}
+	return nil
 }
 
 // Member is a node as another node's membership knows it.
@@ -2740,14 +2751,18 @@ const file_api_node_v1_node_proto_rawDesc = "" +
 	"containers\x12<\n" +
 	"\n" +
 	"membership\x18\b \x01(\v2\x1c.moostack.node.v1.MembershipR\n" +
-	"membership\"\xfe\x01\n" +
+	"membership\"\x87\x03\n" +
 	"\n" +
 	"Membership\x122\n" +
 	"\amembers\x18\x01 \x03(\v2\x18.moostack.node.v1.MemberR\amembers\x12!\n" +
 	"\fhealth_score\x18\x02 \x01(\rR\vhealthScore\x12C\n" +
 	"\adropped\x18\x03 \x03(\v2).moostack.node.v1.Membership.DroppedEntryR\adropped\x12\x18\n" +
-	"\aproblem\x18\x04 \x01(\tR\aproblem\x1a:\n" +
+	"\aproblem\x18\x04 \x01(\tR\aproblem\x12I\n" +
+	"\ttransport\x18\x05 \x03(\v2+.moostack.node.v1.Membership.TransportEntryR\ttransport\x1a:\n" +
 	"\fDroppedEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\x1a<\n" +
+	"\x0eTransportEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"k\n" +
 	"\x06Member\x12\x12\n" +
@@ -2927,7 +2942,7 @@ func file_api_node_v1_node_proto_rawDescGZIP() []byte {
 }
 
 var file_api_node_v1_node_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_api_node_v1_node_proto_msgTypes = make([]protoimpl.MessageInfo, 46)
+var file_api_node_v1_node_proto_msgTypes = make([]protoimpl.MessageInfo, 47)
 var file_api_node_v1_node_proto_goTypes = []any{
 	(MemberState)(0),                 // 0: moostack.node.v1.MemberState
 	(TaskState)(0),                   // 1: moostack.node.v1.TaskState
@@ -2979,8 +2994,9 @@ var file_api_node_v1_node_proto_goTypes = []any{
 	(*DetachResponse)(nil),           // 47: moostack.node.v1.DetachResponse
 	(*Component)(nil),                // 48: moostack.node.v1.Component
 	nil,                              // 49: moostack.node.v1.Membership.DroppedEntry
-	(*timestamppb.Timestamp)(nil),    // 50: google.protobuf.Timestamp
-	(*durationpb.Duration)(nil),      // 51: google.protobuf.Duration
+	nil,                              // 50: moostack.node.v1.Membership.TransportEntry
+	(*timestamppb.Timestamp)(nil),    // 51: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),      // 52: google.protobuf.Duration
 }
 var file_api_node_v1_node_proto_depIdxs = []int32{
 	2,  // 0: moostack.node.v1.StatusResponse.mode:type_name -> moostack.node.v1.Mode
@@ -2990,68 +3006,69 @@ var file_api_node_v1_node_proto_depIdxs = []int32{
 	6,  // 4: moostack.node.v1.StatusResponse.membership:type_name -> moostack.node.v1.Membership
 	7,  // 5: moostack.node.v1.Membership.members:type_name -> moostack.node.v1.Member
 	49, // 6: moostack.node.v1.Membership.dropped:type_name -> moostack.node.v1.Membership.DroppedEntry
-	0,  // 7: moostack.node.v1.Member.state:type_name -> moostack.node.v1.MemberState
-	1,  // 8: moostack.node.v1.ContainerStatus.state:type_name -> moostack.node.v1.TaskState
-	3,  // 9: moostack.node.v1.ContainerStatus.health:type_name -> moostack.node.v1.Health
-	10, // 10: moostack.node.v1.RecordGenerationRequest.nodes:type_name -> moostack.node.v1.GenerationNode
-	50, // 11: moostack.node.v1.Lock.since:type_name -> google.protobuf.Timestamp
-	50, // 12: moostack.node.v1.Lock.until:type_name -> google.protobuf.Timestamp
-	12, // 13: moostack.node.v1.AcquireLockRequest.lock:type_name -> moostack.node.v1.Lock
-	51, // 14: moostack.node.v1.AcquireLockRequest.ttl:type_name -> google.protobuf.Duration
-	12, // 15: moostack.node.v1.AcquireLockResponse.lock:type_name -> moostack.node.v1.Lock
-	51, // 16: moostack.node.v1.RenewLockRequest.ttl:type_name -> google.protobuf.Duration
-	12, // 17: moostack.node.v1.RenewLockResponse.lock:type_name -> moostack.node.v1.Lock
-	12, // 18: moostack.node.v1.BreakLockResponse.broken:type_name -> moostack.node.v1.Lock
-	26, // 19: moostack.node.v1.Container.capabilities:type_name -> moostack.node.v1.Capabilities
-	25, // 20: moostack.node.v1.RunRequest.container:type_name -> moostack.node.v1.Container
-	32, // 21: moostack.node.v1.RemoveIdentitiesRequest.identities:type_name -> moostack.node.v1.RemovedIdentity
-	48, // 22: moostack.node.v1.UpdaterStatusResponse.updater:type_name -> moostack.node.v1.Component
-	2,  // 23: moostack.node.v1.UpdaterStatusResponse.mode:type_name -> moostack.node.v1.Mode
-	37, // 24: moostack.node.v1.UpdateAgentRequest.update:type_name -> moostack.node.v1.AgentUpdate
-	51, // 25: moostack.node.v1.AgentUpdate.health_timeout:type_name -> google.protobuf.Duration
-	40, // 26: moostack.node.v1.UpdateUpdaterRequest.update:type_name -> moostack.node.v1.UpdaterUpdate
-	51, // 27: moostack.node.v1.UpdaterUpdate.health_timeout:type_name -> google.protobuf.Duration
-	43, // 28: moostack.node.v1.UpdateContainerdRequest.update:type_name -> moostack.node.v1.ContainerdUpdate
-	44, // 29: moostack.node.v1.ContainerdUpdate.files:type_name -> moostack.node.v1.ContainerdFile
-	51, // 30: moostack.node.v1.ContainerdUpdate.health_timeout:type_name -> google.protobuf.Duration
-	3,  // 31: moostack.node.v1.Component.health:type_name -> moostack.node.v1.Health
-	4,  // 32: moostack.node.v1.Agent.Status:input_type -> moostack.node.v1.StatusRequest
-	9,  // 33: moostack.node.v1.Agent.RecordGeneration:input_type -> moostack.node.v1.RecordGenerationRequest
-	13, // 34: moostack.node.v1.Agent.AcquireLock:input_type -> moostack.node.v1.AcquireLockRequest
-	15, // 35: moostack.node.v1.Agent.RenewLock:input_type -> moostack.node.v1.RenewLockRequest
-	17, // 36: moostack.node.v1.Agent.ReleaseLock:input_type -> moostack.node.v1.ReleaseLockRequest
-	19, // 37: moostack.node.v1.Agent.BreakLock:input_type -> moostack.node.v1.BreakLockRequest
-	21, // 38: moostack.node.v1.Agent.ImportImage:input_type -> moostack.node.v1.ImportImageRequest
-	23, // 39: moostack.node.v1.Agent.PullImage:input_type -> moostack.node.v1.PullImageRequest
-	27, // 40: moostack.node.v1.Agent.Run:input_type -> moostack.node.v1.RunRequest
-	29, // 41: moostack.node.v1.Agent.Remove:input_type -> moostack.node.v1.RemoveRequest
-	31, // 42: moostack.node.v1.Agent.RemoveIdentities:input_type -> moostack.node.v1.RemoveIdentitiesRequest
-	39, // 43: moostack.node.v1.Agent.UpdateUpdater:input_type -> moostack.node.v1.UpdateUpdaterRequest
-	42, // 44: moostack.node.v1.Agent.UpdateContainerd:input_type -> moostack.node.v1.UpdateContainerdRequest
-	46, // 45: moostack.node.v1.Agent.Detach:input_type -> moostack.node.v1.DetachRequest
-	34, // 46: moostack.node.v1.Updater.Status:input_type -> moostack.node.v1.UpdaterStatusRequest
-	36, // 47: moostack.node.v1.Updater.UpdateAgent:input_type -> moostack.node.v1.UpdateAgentRequest
-	5,  // 48: moostack.node.v1.Agent.Status:output_type -> moostack.node.v1.StatusResponse
-	11, // 49: moostack.node.v1.Agent.RecordGeneration:output_type -> moostack.node.v1.RecordGenerationResponse
-	14, // 50: moostack.node.v1.Agent.AcquireLock:output_type -> moostack.node.v1.AcquireLockResponse
-	16, // 51: moostack.node.v1.Agent.RenewLock:output_type -> moostack.node.v1.RenewLockResponse
-	18, // 52: moostack.node.v1.Agent.ReleaseLock:output_type -> moostack.node.v1.ReleaseLockResponse
-	20, // 53: moostack.node.v1.Agent.BreakLock:output_type -> moostack.node.v1.BreakLockResponse
-	22, // 54: moostack.node.v1.Agent.ImportImage:output_type -> moostack.node.v1.ImportImageResponse
-	24, // 55: moostack.node.v1.Agent.PullImage:output_type -> moostack.node.v1.PullImageResponse
-	28, // 56: moostack.node.v1.Agent.Run:output_type -> moostack.node.v1.RunResponse
-	30, // 57: moostack.node.v1.Agent.Remove:output_type -> moostack.node.v1.RemoveResponse
-	33, // 58: moostack.node.v1.Agent.RemoveIdentities:output_type -> moostack.node.v1.RemoveIdentitiesResponse
-	41, // 59: moostack.node.v1.Agent.UpdateUpdater:output_type -> moostack.node.v1.UpdateUpdaterResponse
-	45, // 60: moostack.node.v1.Agent.UpdateContainerd:output_type -> moostack.node.v1.UpdateContainerdResponse
-	47, // 61: moostack.node.v1.Agent.Detach:output_type -> moostack.node.v1.DetachResponse
-	35, // 62: moostack.node.v1.Updater.Status:output_type -> moostack.node.v1.UpdaterStatusResponse
-	38, // 63: moostack.node.v1.Updater.UpdateAgent:output_type -> moostack.node.v1.UpdateAgentResponse
-	48, // [48:64] is the sub-list for method output_type
-	32, // [32:48] is the sub-list for method input_type
-	32, // [32:32] is the sub-list for extension type_name
-	32, // [32:32] is the sub-list for extension extendee
-	0,  // [0:32] is the sub-list for field type_name
+	50, // 7: moostack.node.v1.Membership.transport:type_name -> moostack.node.v1.Membership.TransportEntry
+	0,  // 8: moostack.node.v1.Member.state:type_name -> moostack.node.v1.MemberState
+	1,  // 9: moostack.node.v1.ContainerStatus.state:type_name -> moostack.node.v1.TaskState
+	3,  // 10: moostack.node.v1.ContainerStatus.health:type_name -> moostack.node.v1.Health
+	10, // 11: moostack.node.v1.RecordGenerationRequest.nodes:type_name -> moostack.node.v1.GenerationNode
+	51, // 12: moostack.node.v1.Lock.since:type_name -> google.protobuf.Timestamp
+	51, // 13: moostack.node.v1.Lock.until:type_name -> google.protobuf.Timestamp
+	12, // 14: moostack.node.v1.AcquireLockRequest.lock:type_name -> moostack.node.v1.Lock
+	52, // 15: moostack.node.v1.AcquireLockRequest.ttl:type_name -> google.protobuf.Duration
+	12, // 16: moostack.node.v1.AcquireLockResponse.lock:type_name -> moostack.node.v1.Lock
+	52, // 17: moostack.node.v1.RenewLockRequest.ttl:type_name -> google.protobuf.Duration
+	12, // 18: moostack.node.v1.RenewLockResponse.lock:type_name -> moostack.node.v1.Lock
+	12, // 19: moostack.node.v1.BreakLockResponse.broken:type_name -> moostack.node.v1.Lock
+	26, // 20: moostack.node.v1.Container.capabilities:type_name -> moostack.node.v1.Capabilities
+	25, // 21: moostack.node.v1.RunRequest.container:type_name -> moostack.node.v1.Container
+	32, // 22: moostack.node.v1.RemoveIdentitiesRequest.identities:type_name -> moostack.node.v1.RemovedIdentity
+	48, // 23: moostack.node.v1.UpdaterStatusResponse.updater:type_name -> moostack.node.v1.Component
+	2,  // 24: moostack.node.v1.UpdaterStatusResponse.mode:type_name -> moostack.node.v1.Mode
+	37, // 25: moostack.node.v1.UpdateAgentRequest.update:type_name -> moostack.node.v1.AgentUpdate
+	52, // 26: moostack.node.v1.AgentUpdate.health_timeout:type_name -> google.protobuf.Duration
+	40, // 27: moostack.node.v1.UpdateUpdaterRequest.update:type_name -> moostack.node.v1.UpdaterUpdate
+	52, // 28: moostack.node.v1.UpdaterUpdate.health_timeout:type_name -> google.protobuf.Duration
+	43, // 29: moostack.node.v1.UpdateContainerdRequest.update:type_name -> moostack.node.v1.ContainerdUpdate
+	44, // 30: moostack.node.v1.ContainerdUpdate.files:type_name -> moostack.node.v1.ContainerdFile
+	52, // 31: moostack.node.v1.ContainerdUpdate.health_timeout:type_name -> google.protobuf.Duration
+	3,  // 32: moostack.node.v1.Component.health:type_name -> moostack.node.v1.Health
+	4,  // 33: moostack.node.v1.Agent.Status:input_type -> moostack.node.v1.StatusRequest
+	9,  // 34: moostack.node.v1.Agent.RecordGeneration:input_type -> moostack.node.v1.RecordGenerationRequest
+	13, // 35: moostack.node.v1.Agent.AcquireLock:input_type -> moostack.node.v1.AcquireLockRequest
+	15, // 36: moostack.node.v1.Agent.RenewLock:input_type -> moostack.node.v1.RenewLockRequest
+	17, // 37: moostack.node.v1.Agent.ReleaseLock:input_type -> moostack.node.v1.ReleaseLockRequest
+	19, // 38: moostack.node.v1.Agent.BreakLock:input_type -> moostack.node.v1.BreakLockRequest
+	21, // 39: moostack.node.v1.Agent.ImportImage:input_type -> moostack.node.v1.ImportImageRequest
+	23, // 40: moostack.node.v1.Agent.PullImage:input_type -> moostack.node.v1.PullImageRequest
+	27, // 41: moostack.node.v1.Agent.Run:input_type -> moostack.node.v1.RunRequest
+	29, // 42: moostack.node.v1.Agent.Remove:input_type -> moostack.node.v1.RemoveRequest
+	31, // 43: moostack.node.v1.Agent.RemoveIdentities:input_type -> moostack.node.v1.RemoveIdentitiesRequest
+	39, // 44: moostack.node.v1.Agent.UpdateUpdater:input_type -> moostack.node.v1.UpdateUpdaterRequest
+	42, // 45: moostack.node.v1.Agent.UpdateContainerd:input_type -> moostack.node.v1.UpdateContainerdRequest
+	46, // 46: moostack.node.v1.Agent.Detach:input_type -> moostack.node.v1.DetachRequest
+	34, // 47: moostack.node.v1.Updater.Status:input_type -> moostack.node.v1.UpdaterStatusRequest
+	36, // 48: moostack.node.v1.Updater.UpdateAgent:input_type -> moostack.node.v1.UpdateAgentRequest
+	5,  // 49: moostack.node.v1.Agent.Status:output_type -> moostack.node.v1.StatusResponse
+	11, // 50: moostack.node.v1.Agent.RecordGeneration:output_type -> moostack.node.v1.RecordGenerationResponse
+	14, // 51: moostack.node.v1.Agent.AcquireLock:output_type -> moostack.node.v1.AcquireLockResponse
+	16, // 52: moostack.node.v1.Agent.RenewLock:output_type -> moostack.node.v1.RenewLockResponse
+	18, // 53: moostack.node.v1.Agent.ReleaseLock:output_type -> moostack.node.v1.ReleaseLockResponse
+	20, // 54: moostack.node.v1.Agent.BreakLock:output_type -> moostack.node.v1.BreakLockResponse
+	22, // 55: moostack.node.v1.Agent.ImportImage:output_type -> moostack.node.v1.ImportImageResponse
+	24, // 56: moostack.node.v1.Agent.PullImage:output_type -> moostack.node.v1.PullImageResponse
+	28, // 57: moostack.node.v1.Agent.Run:output_type -> moostack.node.v1.RunResponse
+	30, // 58: moostack.node.v1.Agent.Remove:output_type -> moostack.node.v1.RemoveResponse
+	33, // 59: moostack.node.v1.Agent.RemoveIdentities:output_type -> moostack.node.v1.RemoveIdentitiesResponse
+	41, // 60: moostack.node.v1.Agent.UpdateUpdater:output_type -> moostack.node.v1.UpdateUpdaterResponse
+	45, // 61: moostack.node.v1.Agent.UpdateContainerd:output_type -> moostack.node.v1.UpdateContainerdResponse
+	47, // 62: moostack.node.v1.Agent.Detach:output_type -> moostack.node.v1.DetachResponse
+	35, // 63: moostack.node.v1.Updater.Status:output_type -> moostack.node.v1.UpdaterStatusResponse
+	38, // 64: moostack.node.v1.Updater.UpdateAgent:output_type -> moostack.node.v1.UpdateAgentResponse
+	49, // [49:65] is the sub-list for method output_type
+	33, // [33:49] is the sub-list for method input_type
+	33, // [33:33] is the sub-list for extension type_name
+	33, // [33:33] is the sub-list for extension extendee
+	0,  // [0:33] is the sub-list for field type_name
 }
 
 func init() { file_api_node_v1_node_proto_init() }
@@ -3066,7 +3083,7 @@ func file_api_node_v1_node_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_node_v1_node_proto_rawDesc), len(file_api_node_v1_node_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   46,
+			NumMessages:   47,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

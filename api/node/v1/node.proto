@@ -195,6 +195,10 @@ message Membership {
   // Problem says why membership can't open connections from this node,
   // empty if the node knows of no reason.
   string problem = 4;
+  // Transport counts what the node's transport did since it started:
+  // dials, accepts, syncs_in and syncs_out, and conns, the connections
+  // open now.
+  map<string, uint64> transport = 5;
 }
 
 // Member is a node as another node's membership knows it.

@@ -27,8 +27,8 @@ func TestEveryMemberStateIsReported(t *testing.T) {
 		hivemindadapter.Dead:    nodev1.MemberState_MEMBER_STATE_DEAD,
 		hivemindadapter.Left:    nodev1.MemberState_MEMBER_STATE_LEFT,
 	} {
-		m := membershipOf(hivemindadapter.Status{Members: []hivemindadapter.Member{{NodeID: "a", Address: "b", State: state}}, HealthScore: 3, Dropped: map[string]uint64{"unsent": 2}})
-		if e := m.Members[0]; e.Node != "a" || e.Address != "b" || e.State != want || m.HealthScore != 3 || m.Dropped["unsent"] != 2 {
+		m := membershipOf(hivemindadapter.Status{Members: []hivemindadapter.Member{{NodeID: "a", Address: "b", State: state}}, HealthScore: 3, Dropped: map[string]uint64{"unsent": 2}, Transport: map[string]uint64{"dials": 4}})
+		if e := m.Members[0]; e.Node != "a" || e.Address != "b" || e.State != want || m.HealthScore != 3 || m.Dropped["unsent"] != 2 || m.Transport["dials"] != 4 {
 			t.Errorf("%s is reported as %v", state, m)
 		}
 	}

@@ -3,6 +3,7 @@
 package hivemindadapter
 
 import (
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/moostackhq/moostack/internal/identity"
+	"github.com/moostackhq/moostack/pkg/hivemind/membership/transport/quic"
 )
 
 // These tests run membership over QUIC on the loopback, with node
@@ -123,6 +125,36 @@ func TestStatusHasTheTransportsDrops(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "the unsent message counted", func() bool { return m.Status().Dropped["unsent"] > 0 })
+}
+
+// What the transport does shows in the status of each end.
+func TestStatusHasTheTransportsCounts(t *testing.T) {
+	ca := newCA(t)
+	start := func(name string, last byte) *Membership {
+		m, err := Start(t.Context(), Config{Identity: load(t, newIdentity(t, ca, name, t.TempDir())), Address: netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, last}), 17445)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(m.Stop)
+		return m
+	}
+	a, b := start("a", 6), start("b", 7)
+	if err := b.SetSeeds([]Seed{{NodeID: "a", Address: "127.0.0.6:17445"}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the sync counted", func() bool {
+		in, out := a.Status().Transport, b.Status().Transport
+		return in["accepts"] > 0 && in["syncs_in"] > 0 && in["conns"] > 0 && out["dials"] > 0 && out["syncs_out"] > 0 && out["conns"] > 0
+	})
+}
+
+// Each of the transport's counts has its own name.
+func TestQuicCountsNameEachCount(t *testing.T) {
+	got := quicCounts(quic.Stats{Conns: 1, Dials: 2, Accepts: 3, StreamsIn: 4, StreamsOut: 5})
+	want := map[string]uint64{"conns": 1, "dials": 2, "accepts": 3, "syncs_in": 4, "syncs_out": 5}
+	if !maps.Equal(got, want) {
+		t.Fatalf("%v, want %v", got, want)
+	}
 }
 
 // A node that dials a member whose identity it holds as removed doesn't

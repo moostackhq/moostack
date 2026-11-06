@@ -67,7 +67,7 @@ type Config struct {
 	SyncEvery     int
 	SeedSyncEvery int
 	// RetryJoinEvery: while it knows no other live member, a joining node
-	// tries its seeds again this often, in protocol periods.
+	// tries the next few of its seeds this often, in protocol periods.
 	RetryJoinEvery int
 	// DeadTimeout is how long a gone member stays in the view, and
 	// GraveTimeout how long the view then remembers it was forgotten: stale
@@ -185,9 +185,10 @@ type ReceiveSync struct {
 	Sync msg.Sync
 }
 
-// Join contacts the seeds and keeps them for the periodic seed syncs, and
-// lifts the hold Forget put on each seed's grave. A seed with no ID or no
-// address, or with the node's own ID or address, is skipped.
+// Join keeps the seeds for the periodic seed syncs, lifts the hold Forget
+// put on each seed's grave, and contacts a few of the seeds if they are the
+// node's first, it has no other live member, or it had left. A seed with no
+// ID or no address, or with the node's own ID or address, is skipped.
 type Join struct{ Seeds []Seed }
 
 // Seed is a member to join through: its ID and its address.
