@@ -203,6 +203,111 @@ func TestAJoinWhoseK3sFailsToStartIsUndone(t *testing.T) {
 	}
 }
 
+func TestNodeRemove(t *testing.T) {
+	c, home := fakeProd(t)
+	for _, h := range []string{"root@h1", "root@h2", "root@h3"} {
+		mustRun(t, c, home, "cluster", "node-add", h)
+	}
+
+	if out, err := onFake(t, c, home, "cluster", "node-remove", "node1"); err == nil {
+		t.Errorf("the control plane went before the agents:\n%s", out)
+	}
+	out := mustRun(t, c, home, "cluster", "node-remove", "node2")
+	if !strings.Contains(out, "Removed node2 from prod") || !c.ran("root@h1", "drain 'node2'") || !c.ran("root@h2", "uninstall.sh") {
+		t.Errorf("output:\n%s", out)
+	}
+	if _, found := c.nodes["node2"]; found {
+		t.Error("Kubernetes still has node2")
+	}
+
+	// A node whose host is gone goes with --unreachable only.
+	c.hosts["root@h3"].unreachable = true
+	if out, err := onFake(t, c, home, "cluster", "node-remove", "node3"); err == nil {
+		t.Errorf("an unreachable node went without --unreachable:\n%s", out)
+	}
+	mustRun(t, c, home, "cluster", "node-remove", "--unreachable", "node3")
+	if _, found := c.nodes["node3"]; found {
+		t.Error("Kubernetes still has node3")
+	}
+
+	// The last node goes with --yes only.
+	if out, err := onFake(t, c, home, "cluster", "node-remove", "node1"); err == nil {
+		t.Errorf("the last node went without --yes:\n%s", out)
+	}
+	mustRun(t, c, home, "cluster", "node-remove", "--yes", "node1")
+	if names := nodeNames(t, home); len(names) != 0 {
+		t.Errorf("nodes = %v", names)
+	}
+	if c.hosts["root@h1"].k3s {
+		t.Error("k3s is still on h1")
+	}
+}
+
+func TestNodeRemoveOfANodeOnlyKubernetesHas(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.9", arch: "amd64"}
+	mustRun(t, c, home, "cluster", "node-remove", "stray")
+	if _, found := c.nodes["stray"]; found {
+		t.Error("Kubernetes still has the node")
+	}
+}
+
+func TestNodeRemoveWithTheControlPlaneGone(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	mustRun(t, c, home, "cluster", "node-add", "root@h2")
+	c.hosts["root@h1"].unreachable = true
+
+	if out, err := onFake(t, c, home, "cluster", "node-remove", "node2"); err == nil {
+		t.Errorf("node2 went without the control plane or --unreachable:\n%s", out)
+	}
+	if out, err := onFake(t, c, home, "cluster", "node-remove", "--unreachable", "node1"); err == nil {
+		t.Errorf("the control plane went before node2:\n%s", out)
+	}
+	mustRun(t, c, home, "cluster", "node-remove", "--unreachable", "node2")
+	if c.hosts["root@h2"].k3s {
+		t.Error("k3s is still on h2")
+	}
+	mustRun(t, c, home, "cluster", "node-remove", "--unreachable", "--yes", "node1")
+	if names := nodeNames(t, home); len(names) != 0 {
+		t.Errorf("nodes = %v", names)
+	}
+}
+
+func TestAnOperationRefusesWhileAnotherHoldsTheLock(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	c.locked = true
+	if out, err := onFake(t, c, home, "cluster", "node-add", "root@h2"); err == nil || !strings.Contains(err.Error(), "another mooctl operation") {
+		t.Errorf("node-add = %v\n%s", err, out)
+	}
+	if c.ran("root@h2", "INSTALL_K3S_EXEC") {
+		t.Error("node-add went on")
+	}
+	if out, err := onFake(t, c, home, "cluster", "node-remove", "node1", "--yes"); err == nil {
+		t.Errorf("node-remove went on:\n%s", out)
+	}
+	if !c.hosts["root@h1"].k3s {
+		t.Error("node1 was removed")
+	}
+}
+
+func TestNodeRemoveFinishesAPartialRemoval(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	mustRun(t, c, home, "cluster", "node-add", "root@h2")
+	// A run cut off after Kubernetes deleted the node.
+	delete(c.nodes, "node2")
+	mustRun(t, c, home, "cluster", "node-remove", "node2")
+	if c.hosts["root@h2"].k3s {
+		t.Error("k3s is still on h2")
+	}
+	if names := nodeNames(t, home); len(names) != 1 {
+		t.Errorf("nodes = %v", names)
+	}
+}
+
 func TestNodeAddOfARebuiltNodeNamesTheNodeAndItsCluster(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")

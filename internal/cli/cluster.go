@@ -41,6 +41,17 @@ func clusterCommand(env Env) *cli.Command {
 				Action: func(ctx context.Context, cmd *cli.Command) error { return nodeAdd(ctx, env, cmd) },
 			},
 			{
+				Name:      "node-remove",
+				Usage:     "drain a node and remove k3s from it; the control plane goes last",
+				ArgsUsage: "<node>",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "unreachable", Usage: "remove the node even if it, or the control plane, can't be reached"},
+					&cli.BoolFlag{Name: "lose-volumes", Usage: "remove the node even if it holds volumes, which go with it"},
+					&cli.BoolFlag{Name: "yes", Usage: "remove the cluster's last node"},
+				},
+				Action: func(ctx context.Context, cmd *cli.Command) error { return nodeRemove(ctx, env, cmd) },
+			},
+			{
 				Name:      "remote",
 				Usage:     "set the git remote that the cluster directory is pushed to after each operation, and push it",
 				ArgsUsage: "<url>",

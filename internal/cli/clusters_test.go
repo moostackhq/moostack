@@ -22,3 +22,20 @@ func TestClusterInitSaysWhichClusterIsTheDefault(t *testing.T) {
 		t.Fatalf("init = %v\n%s", err, out)
 	}
 }
+
+func TestNodeAndAppCommandsNameTheirClusterFirst(t *testing.T) {
+	c, home := fakeProd(t)
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"cluster", "node-add", "root@h1"}, "Adding node1 to prod ("},
+		{[]string{"cluster", "node-add", "root@h2"}, "Adding node2 to prod ("},
+		{[]string{"cluster", "node-remove", "node2"}, "Removing node2 from prod\n"},
+		{[]string{"cluster", "node-remove", "node1", "--yes"}, "Removing node1 from prod\n"},
+	} {
+		if out := mustRun(t, c, home, tc.args...); !strings.HasPrefix(out, tc.want) {
+			t.Errorf("%v:\n%s\nwant it to start with %q", tc.args, out, tc.want)
+		}
+	}
+}

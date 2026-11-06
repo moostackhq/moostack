@@ -21,6 +21,9 @@ import (
 // undoTimeout bounds undoing a failed node-add.
 const undoTimeout = 5 * time.Minute
 
+// uncordonTimeout bounds putting a node back after a failed drain.
+const uncordonTimeout = 30 * time.Second
+
 // nodeAdd is mooctl cluster node-add.
 func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err := wantArgs(cmd, 1); err != nil {
@@ -301,4 +304,244 @@ func install(ctx context.Context, env Env, d *clusterdir.Dir, cp clusterdir.Node
 		}
 		return <-ready
 	}
+}
+
+// nodeRemove is mooctl cluster node-remove.
+func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {
+	if err := wantArgs(cmd, 1); err != nil {
+		return err
+	}
+	name := cmd.Args().First()
+	if err := clusterdir.CheckName(name); err != nil {
+		return err
+	}
+	unreachable := cmd.Bool("unreachable")
+	ctx, stop := interrupt.Context(ctx, env.Exit)
+	defer stop()
+	d, err := openCluster(env, cmd)
+	if err != nil {
+		return err
+	}
+	cp, hasCP, err := d.ControlPlane()
+	if err != nil {
+		return err
+	}
+	nodes, err := d.Nodes()
+	if err != nil {
+		return err
+	}
+	_, inDir := findNode(nodes, name)
+	if !hasCP {
+		if inDir {
+			return errors.New("the cluster directory has nodes but no control plane")
+		}
+		return fmt.Errorf("the cluster has no node %s", name)
+	}
+	if inDir && len(nodes) == 1 && !cmd.Bool("yes") {
+		return lastNode(name)
+	}
+
+	cpClient, err := dialNode(ctx, env, cp)
+	if err != nil {
+		if !unreachable {
+			return fmt.Errorf("%w\nPass --unreachable to remove nodes without the control plane.", err)
+		}
+		return removeWithoutControlPlane(ctx, env, d, cp, name, cmd.Bool("yes"))
+	}
+	defer cpClient.Close()
+	op, ctx, err := begin(ctx, env, d.Path, remoteHost{cpClient}, true)
+	if err != nil {
+		return err
+	}
+	defer op.release()
+	if d, err = clusterdir.Open(d.Path); err != nil {
+		return err
+	}
+	if err := sameControlPlane(d, cp); err != nil {
+		return err
+	}
+	if nodes, err = d.Nodes(); err != nil {
+		return err
+	}
+	n, inDir := findNode(nodes, name)
+	lastControlPlane := inDir && n.ControlPlane && len(nodes) == 1
+	known, err := kubeNodeNames(ctx, cpClient)
+	if err != nil && !lastControlPlane {
+		return err
+	}
+	inKube := slices.Contains(known, name)
+	if !inDir && !inKube {
+		return fmt.Errorf("the cluster has no node %s", name)
+	}
+	if lastControlPlane && !cmd.Bool("yes") {
+		return lastNode(name)
+	}
+
+	say(env, "Removing %s from %s", name, d.Cluster.Ref)
+	var recordOn lockHost = remoteHost{cpClient}
+	switch {
+	case inDir && n.ControlPlane:
+		var others []string
+		for _, o := range nodes {
+			if o.Name != name {
+				others = append(others, o.Name)
+			}
+		}
+		for _, k := range known {
+			if k != name && !slices.Contains(others, k) {
+				others = append(others, k)
+			}
+		}
+		if len(others) > 0 {
+			return fmt.Errorf("%s is the control plane, which goes last; remove %s first", name, strings.Join(others, ", "))
+		}
+		say(env, "Uninstalling...")
+		if _, err := run(ctx, cpClient, k3s.UninstallScript(k3s.ControlPlane), ""); err != nil {
+			return fmt.Errorf("uninstalling from %s: %w; run node-remove again", name, err)
+		}
+		recordOn = nil
+	default:
+		var host remote
+		if inDir {
+			if host, err = dialNode(ctx, env, n); err != nil {
+				if !unreachable {
+					return fmt.Errorf("%w\nPass --unreachable to remove it from the cluster anyway, leaving k3s on it.", err)
+				}
+				host = nil
+			} else {
+				defer host.Close()
+			}
+		}
+		// A node whose host can't be reached isn't drained: its pods go
+		// with its Node.
+		if inKube && (host != nil || !inDir) {
+			if err := drain(ctx, env, cpClient, name, cmd.Bool("lose-volumes")); err != nil {
+				return err
+			}
+		}
+		if host != nil {
+			say(env, "Uninstalling...")
+			if _, err := run(ctx, host, k3s.UninstallScript(k3s.Agent), ""); err != nil {
+				return fmt.Errorf("uninstalling from %s: %w; run node-remove again", name, err)
+			}
+		}
+		if inKube {
+			if _, err := run(ctx, cpClient, "k3s kubectl delete node "+sshclient.ShellQuote(name)+" --ignore-not-found --request-timeout=60s", ""); err != nil {
+				return fmt.Errorf("deleting node %s: %w", name, err)
+			}
+		}
+		switch {
+		case inDir && host == nil:
+			fmt.Fprintf(env.Stderr, "Warning: %s can't be reached; if k3s still runs there, it registers again: run k3s-agent-uninstall.sh on it.\n", name)
+		case !inDir:
+			fmt.Fprintf(env.Stderr, "Warning: if k3s still runs on %s's host, it registers again: run k3s-agent-uninstall.sh there.\n", name)
+		}
+	}
+	if inDir {
+		if err := d.RemoveNode(name); err != nil {
+			return err
+		}
+	}
+	if err := op.finish(ctx, "node-remove "+name, recordOn); err != nil {
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "Removed %s from %s\n", name, d.Cluster.Ref)
+	return nil
+}
+
+// findNode is the node called name in nodes, and whether there is one.
+func findNode(nodes []clusterdir.Node, name string) (clusterdir.Node, bool) {
+	i := slices.IndexFunc(nodes, func(n clusterdir.Node) bool { return n.Name == name })
+	if i < 0 {
+		return clusterdir.Node{}, false
+	}
+	return nodes[i], true
+}
+
+// drain drains the Kubernetes node called name on the control plane cp,
+// refusing, unless loseVolumes, a node that holds local volumes.
+func drain(ctx context.Context, env Env, cp remote, name string, loseVolumes bool) error {
+	q := sshclient.ShellQuote(name)
+	if !loseVolumes {
+		out, err := run(ctx, cp, `k3s kubectl get pv --request-timeout=30s -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeAffinity.required.nodeSelectorTerms[*].matchExpressions[*].values[*]}{"\n"}{end}'`, "")
+		if err != nil {
+			return fmt.Errorf("listing volumes: %w", err)
+		}
+		var held []string
+		for _, line := range strings.Split(out, "\n") {
+			if f := strings.Fields(line); len(f) > 1 && slices.Contains(f[1:], name) {
+				held = append(held, f[0])
+			}
+		}
+		if len(held) > 0 {
+			return fmt.Errorf("%s holds the volumes %s, which go with it; pass --lose-volumes to remove it anyway", name, strings.Join(held, ", "))
+		}
+	}
+	say(env, "Draining %s...", name)
+	if _, err := run(ctx, cp, "k3s kubectl drain "+q+" --ignore-daemonsets --delete-emptydir-data --timeout=180s", ""); err != nil {
+		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), uncordonTimeout)
+		defer cancel()
+		if _, uerr := run(uctx, cp, "k3s kubectl uncordon "+q+" --request-timeout=20s", ""); uerr != nil {
+			err = errors.Join(err, fmt.Errorf("uncordoning %s: %w", name, uerr))
+		}
+		return fmt.Errorf("draining %s: %w", name, err)
+	}
+	return nil
+}
+
+// lastNode is the refusal to remove the cluster's last node, name,
+// without --yes.
+func lastNode(name string) error {
+	return fmt.Errorf("%s is the cluster's last node: removing it removes the cluster's k3s and everything running on it; pass --yes to remove it", name)
+}
+
+// removeWithoutControlPlane removes the node called name from the
+// cluster directory d, whose control plane cp can't be reached: an
+// agent, uninstalled if its host answers, or the control plane once it
+// is the last node, with yes. It takes no lock.
+func removeWithoutControlPlane(ctx context.Context, env Env, d *clusterdir.Dir, cp clusterdir.Node, name string, yes bool) error {
+	op, ctx, err := begin(ctx, env, d.Path, nil, false)
+	if err != nil {
+		return err
+	}
+	defer op.release()
+	if d, err = clusterdir.Open(d.Path); err != nil {
+		return err
+	}
+	if err := sameControlPlane(d, cp); err != nil {
+		return err
+	}
+	nodes, err := d.Nodes()
+	if err != nil {
+		return err
+	}
+	n, ok := findNode(nodes, name)
+	if !ok {
+		return fmt.Errorf("the cluster has no node %s", name)
+	}
+	if n.ControlPlane && len(nodes) > 1 {
+		return fmt.Errorf("%s is the control plane, which goes last; remove the other %s first, with --unreachable", name, plural(len(nodes)-1, "node"))
+	}
+	if len(nodes) == 1 && !yes {
+		return lastNode(name)
+	}
+	say(env, "Removing %s from %s", name, d.Cluster.Ref)
+	if host, err := dialNode(ctx, env, n); err == nil {
+		say(env, "Uninstalling...")
+		_, err = run(ctx, host, k3s.UninstallScript(k3s.RoleOf(n.ControlPlane)), "")
+		host.Close()
+		if err != nil {
+			return fmt.Errorf("uninstalling from %s: %w; run node-remove again", name, err)
+		}
+	} else {
+		fmt.Fprintf(env.Stderr, "Warning: %s can't be reached; if k3s still runs there, uninstall it there.\n", name)
+	}
+	if err := d.RemoveNode(name); err != nil {
+		return err
+	}
+	if err := op.finish(ctx, "node-remove "+name, nil); err != nil {
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "Removed %s from %s\n", name, d.Cluster.Ref)
+	return nil
 }
