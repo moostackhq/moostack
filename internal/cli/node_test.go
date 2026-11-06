@@ -275,6 +275,43 @@ func TestNodeRemoveWithTheControlPlaneGone(t *testing.T) {
 	}
 }
 
+func TestStatusWithTheControlPlaneDown(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	c.hosts["root@h1"].unreachable = true
+	out, err := onFake(t, c, home, "cluster", "status")
+	if err == nil || !strings.Contains(err.Error(), "can't be reached") || !strings.Contains(out, "node1  control plane") {
+		t.Errorf("status = %v:\n%s", err, out)
+	}
+}
+
+func TestStatusShowsDrift(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	mustRun(t, c, home, "cluster", "node-add", "root@h2")
+	if out := mustRun(t, c, home, "cluster", "status"); strings.Contains(out, "Drift") || !strings.Contains(out, "node2") {
+		t.Errorf("a cluster as its directory says:\n%s", out)
+	}
+	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.9", arch: "amd64"}
+	c.nodes["node2"] = fakeKubeNode{ip: "10.0.0.8", arch: "arm64"}
+	c.hosts["root@h1"].files[k3s.AppliedCommitFile] = strings.Repeat("ab", 20) + "\n"
+	out := mustRun(t, c, home, "cluster", "status")
+	for _, want := range []string{
+		"stray is on the cluster but not in the cluster directory",
+		"node2 is at 10.0.0.8 on the cluster, and at 10.0.0.3",
+		"node2 is arm64 on the cluster, and amd64",
+		"the cluster applied commit abababababab",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("no %q in:\n%s", want, out)
+		}
+	}
+	delete(c.nodes, "node2")
+	if out := mustRun(t, c, home, "cluster", "status"); !strings.Contains(out, "node2 is in the cluster directory but not on the cluster") {
+		t.Errorf("a node gone from the cluster:\n%s", out)
+	}
+}
+
 func TestAnOperationRefusesWhileAnotherHoldsTheLock(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
@@ -305,6 +342,37 @@ func TestNodeRemoveFinishesAPartialRemoval(t *testing.T) {
 	}
 	if names := nodeNames(t, home); len(names) != 1 {
 		t.Errorf("nodes = %v", names)
+	}
+}
+
+func TestStatusOfADirectoryWithNodesButNoControlPlane(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	d := prodDir(t, home)
+	path := filepath.Join(d.Path, "nodes", "node1.yml")
+	data, _ := os.ReadFile(path)
+	os.WriteFile(path, []byte(strings.Replace(string(data), "control_plane: true\n", "", 1)), 0o644)
+	out, err := onFake(t, c, home, "cluster", "status")
+	if err == nil || !strings.Contains(err.Error(), "nodes but no control plane") || !strings.Contains(out, "node1") {
+		t.Errorf("status = %v\n%s", err, out)
+	}
+}
+
+func TestStatusShowsAnAppliedCommitFileThatHoldsNoCommit(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	c.hosts["root@h1"].files[k3s.AppliedCommitFile] = "garbage\n"
+	if out := mustRun(t, c, home, "cluster", "status"); !strings.Contains(out, `doesn't hold a commit: "garbage"`) {
+		t.Errorf("status:\n%s", out)
+	}
+}
+
+func TestStatusShowsACordonedNode(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	c.cordoned = map[string]bool{"node1": true}
+	if out := mustRun(t, c, home, "cluster", "status"); !strings.Contains(out, "cordoned") {
+		t.Errorf("status:\n%s", out)
 	}
 }
 

@@ -143,6 +143,24 @@ func TestRemoteAndClone(t *testing.T) {
 	}
 }
 
+func TestAnEmptyClusterDirectoryIsRefused(t *testing.T) {
+	home := newHome(t)
+	key := sshKey(t, home)
+	if out, err := mooctl(t, home, home, "--ssh-key", key, "cluster", "init", "prod"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if _, err := mooctl(t, home, home, "-C", "", "cluster", "status"); err == nil || !strings.Contains(err.Error(), "-C is empty") {
+		t.Errorf("-C '': %v", err)
+	}
+	if _, err := mooctl(t, home, home, "-c", "", "cluster", "status"); err == nil {
+		t.Error("-c '' was taken")
+	}
+	t.Setenv("MOOCTL_DIR", "")
+	if _, err := mooctl(t, home, home, "cluster", "status"); err == nil || !strings.Contains(err.Error(), "MOOCTL_DIR is set to nothing") {
+		t.Errorf("MOOCTL_DIR='': %v", err)
+	}
+}
+
 func TestInitIntoADirectoryNamedDirectlySetsNoDefault(t *testing.T) {
 	home := newHome(t)
 	key := sshKey(t, home)

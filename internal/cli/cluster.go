@@ -31,6 +31,11 @@ func clusterCommand(env Env) *cli.Command {
 				Action: func(ctx context.Context, cmd *cli.Command) error { return clusterInit(ctx, env, cmd) },
 			},
 			{
+				Name:   "status",
+				Usage:  "show what is on the cluster, and where it differs from the cluster directory",
+				Action: func(ctx context.Context, cmd *cli.Command) error { return clusterStatus(ctx, env, cmd) },
+			},
+			{
 				Name:      "node-add",
 				Usage:     "install k3s on a host: the first becomes the control plane, the others join it",
 				ArgsUsage: "<ssh target>",
