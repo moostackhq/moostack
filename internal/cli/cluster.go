@@ -62,6 +62,15 @@ func clusterCommand(env Env) *cli.Command {
 				Action: func(ctx context.Context, cmd *cli.Command) error { return clusterList(env, cmd) },
 			},
 			{
+				Name:      "remove",
+				Usage:     "remove k3s from every node of a cluster and delete its cluster directory, after asking for the cluster's name",
+				ArgsUsage: "<cluster ref>",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "unreachable", Usage: "remove the cluster even if some of its nodes can't be reached, leaving k3s on them"},
+				},
+				Action: func(ctx context.Context, cmd *cli.Command) error { return clusterRemove(ctx, env, cmd) },
+			},
+			{
 				Name:      "use",
 				Usage:     "make a cluster the default of commands that name none, or print the default",
 				ArgsUsage: "[cluster ref]",
