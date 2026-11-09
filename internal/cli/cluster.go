@@ -57,6 +57,12 @@ func clusterCommand(env Env) *cli.Command {
 				Action: func(ctx context.Context, cmd *cli.Command) error { return nodeRemove(ctx, env, cmd) },
 			},
 			{
+				Name:      "use",
+				Usage:     "make a cluster the default of commands that name none, or print the default",
+				ArgsUsage: "[cluster ref]",
+				Action:    func(ctx context.Context, cmd *cli.Command) error { return clusterUse(env, cmd) },
+			},
+			{
 				Name:      "remote",
 				Usage:     "set the git remote that the cluster directory is pushed to after each operation, and push it",
 				ArgsUsage: "<url>",
@@ -139,6 +145,41 @@ func clusterInit(ctx context.Context, env Env, cmd *cli.Command) error {
 		}
 		fmt.Fprintf(env.Stdout, "Default cluster: %s\n", def)
 	}
+	return nil
+}
+
+// clusterUse is mooctl cluster use.
+func clusterUse(env Env, cmd *cli.Command) error {
+	switch cmd.NArg() {
+	case 0:
+		def, err := defaultCluster(env)
+		if err != nil {
+			return err
+		}
+		if def == "" {
+			return errors.New("no default cluster; set one with mooctl cluster use <cluster ref>")
+		}
+		fmt.Fprintln(env.Stdout, def)
+		return nil
+	case 1:
+	default:
+		return wantArgs(cmd, 1)
+	}
+	ref, err := clusterdir.ParseRef(cmd.Args().First())
+	if err != nil {
+		return err
+	}
+	r, err := root(env)
+	if err != nil {
+		return err
+	}
+	if _, err := clusterdir.Open(ref.Dir(r)); err != nil {
+		return fmt.Errorf("there is no cluster %s in %s; create it with mooctl cluster init, or get it with mooctl cluster clone", ref, r)
+	}
+	if err := setDefaultCluster(env, ref); err != nil {
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "Default cluster: %s\n", ref)
 	return nil
 }
 

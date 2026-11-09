@@ -116,6 +116,19 @@ func TestAFailedInitLeavesNothing(t *testing.T) {
 	}
 }
 
+func TestInitKeepsAnExistingDefault(t *testing.T) {
+	home := newHome(t)
+	key := sshKey(t, home)
+	for _, ref := range []string{"first", "second"} {
+		if out, err := mooctl(t, home, home, "--ssh-key", key, "cluster", "init", ref); err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+	}
+	if out, _ := mooctl(t, home, home, "cluster", "use"); strings.TrimSpace(out) != "first" {
+		t.Errorf("default = %q, want first", out)
+	}
+}
+
 func TestRemoteAndClone(t *testing.T) {
 	home := newHome(t)
 	key := sshKey(t, home)
