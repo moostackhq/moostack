@@ -57,6 +57,11 @@ func clusterCommand(env Env) *cli.Command {
 				Action: func(ctx context.Context, cmd *cli.Command) error { return nodeRemove(ctx, env, cmd) },
 			},
 			{
+				Name:   "list",
+				Usage:  "list the clusters, with the default marked",
+				Action: func(ctx context.Context, cmd *cli.Command) error { return clusterList(env, cmd) },
+			},
+			{
 				Name:      "use",
 				Usage:     "make a cluster the default of commands that name none, or print the default",
 				ArgsUsage: "[cluster ref]",
