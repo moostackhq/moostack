@@ -16,6 +16,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/moostackhq/moostack/internal/clusterdir"
+	"github.com/moostackhq/moostack/internal/deployfile"
 	"github.com/moostackhq/moostack/internal/gitrepo"
 	"github.com/moostackhq/moostack/internal/secretstore"
 	"github.com/moostackhq/moostack/internal/terminal"
@@ -177,6 +178,15 @@ func clusterPath(env Env, cmd *cli.Command) (string, error) {
 	ref := cmd.String("cluster")
 	if cmd.IsSet("cluster") && ref == "" {
 		return "", errors.New("-c is empty; give a cluster ref")
+	}
+	if ref == "" {
+		cluster, _, err := deployfile.ReadRef(".")
+		switch {
+		case err == nil:
+			ref = cluster
+		case !errors.Is(err, fs.ErrNotExist):
+			return "", err
+		}
 	}
 	if ref == "" {
 		def, err := defaultCluster(env)

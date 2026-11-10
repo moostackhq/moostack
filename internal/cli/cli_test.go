@@ -116,6 +116,73 @@ func TestAFailedInitLeavesNothing(t *testing.T) {
 	}
 }
 
+func TestWhichClusterACommandActsOn(t *testing.T) {
+	home := newHome(t)
+	key := sshKey(t, home)
+	for _, ref := range []string{"prod", "acme/staging"} {
+		if out, err := mooctl(t, home, home, "--ssh-key", key, "cluster", "init", ref); err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+	}
+	app := t.TempDir()
+	os.WriteFile(filepath.Join(app, "Dockerfile"), []byte("FROM scratch\n"), 0o644)
+	os.WriteFile(filepath.Join(app, "deploy.yaml"), []byte("cluster: acme/staging\nname: web\ncontainers: {web: {build: {dockerfile: .}, port: 80}}\n"), 0o644)
+
+	status := func(wd string, args ...string) (string, error) {
+		return mooctl(t, home, wd, append(args, "cluster", "status")...)
+	}
+	if out, err := status(app); err != nil || !strings.Contains(out, "Cluster acme/staging") {
+		t.Errorf("from the app's directory: %v\n%s", err, out)
+	}
+	if out, err := status(app, "-c", "prod"); err != nil || !strings.Contains(out, "Cluster prod") {
+		t.Errorf("-c over deploy.yaml: %v\n%s", err, out)
+	}
+	if out, err := status(home, "-C", filepath.Join(home, "clusters", "default", "prod"), "-c", "acme/staging"); err != nil || !strings.Contains(out, "Cluster prod") {
+		t.Errorf("-C over -c: %v\n%s", err, out)
+	}
+	t.Setenv("MOOCTL_DIR", filepath.Join(home, "clusters", "default", "prod"))
+	if out, err := status(app); err != nil || !strings.Contains(out, "Cluster prod") {
+		t.Errorf("MOOCTL_DIR over deploy.yaml: %v\n%s", err, out)
+	}
+	t.Setenv("MOOCTL_DIR", "")
+	os.Unsetenv("MOOCTL_DIR")
+
+	// The first cluster made is the default.
+	if out, err := status(home); err != nil || !strings.Contains(out, "Cluster prod") {
+		t.Errorf("the default set by init: %v\n%s", err, out)
+	}
+	if out, err := mooctl(t, home, home, "cluster", "use", "acme/staging"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if out, err := mooctl(t, home, home, "cluster", "use"); err != nil || strings.TrimSpace(out) != "acme/staging" {
+		t.Errorf("cluster use prints %q, %v", out, err)
+	}
+	if out, err := status(home); err != nil || !strings.Contains(out, "Cluster acme/staging") {
+		t.Errorf("the default: %v\n%s", err, out)
+	}
+	os.WriteFile(filepath.Join(app, "deploy.yaml"), []byte("cluster: prod\nname: web\ncontainers: {web: {build: {dockerfile: .}, port: 80}}\n"), 0o644)
+	if out, err := status(app); err != nil || !strings.Contains(out, "Cluster prod") {
+		t.Errorf("deploy.yaml over the default: %v\n%s", err, out)
+	}
+	if out, err := status(home, "-c", "prod"); err != nil || !strings.Contains(out, "Cluster prod") {
+		t.Errorf("-c over the default: %v\n%s", err, out)
+	}
+	if out, err := mooctl(t, home, home, "cluster", "use", "nope"); err == nil {
+		t.Errorf("an unknown cluster became the default:\n%s", out)
+	}
+	if out, err := status(home, "-c", "nope"); err == nil || !strings.Contains(err.Error(), "no cluster directory") {
+		t.Errorf("an unknown cluster: %v\n%s", err, out)
+	}
+
+	os.Remove(filepath.Join(home, "default-cluster"))
+	if out, err := status(home); err == nil || !strings.Contains(err.Error(), "which cluster?") {
+		t.Errorf("no cluster named and no default: %v\n%s", err, out)
+	}
+	if out, err := mooctl(t, home, home, "cluster", "use"); err == nil {
+		t.Errorf("cluster use with no default:\n%s", out)
+	}
+}
+
 func TestInitKeepsAnExistingDefault(t *testing.T) {
 	home := newHome(t)
 	key := sshKey(t, home)
