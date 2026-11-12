@@ -102,6 +102,7 @@ func New(env Env) *cli.Command {
 			clusterCommand(env),
 			secretCommand(env),
 			deployCommand(env),
+			logsCommand(env),
 		},
 	}
 }

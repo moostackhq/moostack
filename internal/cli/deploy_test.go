@@ -122,6 +122,35 @@ func TestDeployRefusesBadObjectsBeforeConnecting(t *testing.T) {
 	}
 }
 
+func TestLogsOfAnApp(t *testing.T) {
+	c, home := deployingProd(t)
+	app := manifestsApp(t, webDeployment)
+	t.Chdir(app)
+	mustRun(t, c, home, "deploy")
+
+	if out := mustRun(t, c, home, "logs", "--tail", "5"); !strings.Contains(out, "a log line") || !c.ran("root@h1", "logs -n 'web'") || !c.ran("root@h1", "--tail=5") {
+		t.Errorf("logs:\n%s", out)
+	}
+	if out := mustRun(t, c, home, "logs", "-f", "web"); !strings.Contains(out, "Stopped: the pods followed have ended.") || !c.ran("root@h1", "--follow") {
+		t.Errorf("logs -f:\n%s", out)
+	}
+	if _, err := onFake(t, c, home, "logs", "other"); err == nil || !strings.Contains(err.Error(), "no app other") {
+		t.Errorf("an app that isn't there: %v", err)
+	}
+	if _, err := onFake(t, c, home, "logs", "Web;rm"); err == nil {
+		t.Error("a name that isn't an app's was taken")
+	}
+	c.noPods = true
+	if _, err := onFake(t, c, home, "logs", "-f", "web"); err == nil || !strings.Contains(err.Error(), "web has no pods") {
+		t.Errorf("an app without pods: %v", err)
+	}
+	c.noPods = false
+	t.Chdir(home)
+	if _, err := onFake(t, c, home, "logs"); err == nil || !strings.Contains(err.Error(), "which app?") {
+		t.Errorf("no app named: %v", err)
+	}
+}
+
 func TestDeployWaitsForTheClustersServices(t *testing.T) {
 	c, home := deployingProd(t)
 	app := manifestsApp(t, webDeployment)
