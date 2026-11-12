@@ -45,22 +45,31 @@ type fakeCluster struct {
 	// workloads are the Deployments, StatefulSets, DaemonSets and
 	// Ingresses of every namespace, as kubectl prints them.
 	workloads []map[string]any
-	t         *testing.T
-	mu        sync.Mutex
+	// unissued is the name of a certificate that is never issued.
+	unissued string
+	t        *testing.T
+	mu       sync.Mutex
 	// hosts are the hosts by SSH target.
 	hosts map[string]*fakeNode
 	// nodes are the Kubernetes nodes by name.
 	nodes map[string]fakeKubeNode
 	// apps are the app namespaces, with the objects applied in each.
 	apps map[string]map[string]bool
+	// deleted are the objects deleted from app namespaces, as
+	// namespace/object.
+	deleted []string
 	// locked says the operation lock is held.
 	locked bool
 	// runs are the scripts run, as "target: first line".
 	runs []string
 	// registry is what DialTCP connects to.
 	registry string
+	// manifests are what was applied, in order.
+	manifests []string
 	// noPods makes every app have no pods.
 	noPods bool
+	// rolloutFails makes every app's rollout fail.
+	rolloutFails bool
 	// cordoned are the Kubernetes nodes marked unschedulable.
 	cordoned map[string]bool
 	// servicesDown makes the cluster's services not ready, until a wait
@@ -216,6 +225,9 @@ var (
 	readyAtInScript  = regexp.MustCompile(`= "([0-9.]+) True"`)
 	quotedName       = regexp.MustCompile(`(?:delete node|drain|uncordon) '([^']+)'`)
 	labelInScript    = regexp.MustCompile(`moostack\.dev/app=([a-z0-9-]+)`)
+	namespaceFlag    = regexp.MustCompile(`-n '([^']+)'`)
+	quotedObject     = regexp.MustCompile(`--request-timeout=120s '([^']+)'`)
+	deletedNamespace = regexp.MustCompile(`(?m)^k3s kubectl delete namespace '([^']+)'`)
 )
 
 func ok(stdout string) (sshclient.Result, error) {
@@ -236,6 +248,11 @@ func fail(code int, stderr string) (sshclient.Result, error) {
 
 // Run answers the scripts mooctl runs, and fails any other.
 func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclient.Result, error) {
+	var in string
+	if stdin != nil {
+		data, _ := io.ReadAll(stdin)
+		in = string(data)
+	}
 	c, n := f.c, f.n
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -385,9 +402,114 @@ func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclien
 			out = append(out, "namespace/"+a)
 		}
 		return ok(strings.Join(out, "\n"))
+	case strings.Contains(first, "k3s kubectl get nodes") && strings.Contains(first, "architecture"):
+		var arches []string
+		for _, kn := range c.nodes {
+			arches = append(arches, kn.arch)
+		}
+		return ok(strings.Join(arches, " "))
+	case strings.HasPrefix(first, "k3s kubectl api-resources --namespaced=false"):
+		return ok("namespaces                ns    v1                          false   Namespace\nnodes                     no    v1                          false   Node\nclusterroles                    rbac.authorization.k8s.io/v1   false   ClusterRole\n")
+	case strings.HasPrefix(first, "k3s kubectl apply --server-side"):
+		return f.apply(first, in)
+	case strings.HasPrefix(first, "k3s kubectl delete helmchart"):
+		return ok("")
+	case strings.Contains(first, "get configmap "+objectsConfigMap):
+		ns := namespaceFlag.FindStringSubmatch(first)[1]
+		var objs []string
+		for o := range c.apps[ns] {
+			objs = append(objs, o)
+		}
+		sort.Strings(objs)
+		if len(objs) == 0 {
+			return ok("")
+		}
+		return ok(strings.Join(objs, "\n"))
+	case strings.HasPrefix(first, "out=$(k3s kubectl delete -n"):
+		ns := namespaceFlag.FindStringSubmatch(first)[1]
+		o := quotedObject.FindStringSubmatch(first)[1]
+		c.deleted = append(c.deleted, ns+"/"+o)
+		delete(c.apps[ns], o)
+		return ok("")
+	case strings.HasPrefix(first, "k3s kubectl delete -n"):
+		ns := namespaceFlag.FindStringSubmatch(first)[1]
+		for _, o := range strings.Fields(first)[5:] {
+			if strings.HasPrefix(o, "-") {
+				continue
+			}
+			o = strings.Trim(o, "'")
+			c.deleted = append(c.deleted, ns+"/"+o)
+			delete(c.apps[ns], o)
+		}
+		return ok("")
+	case strings.HasPrefix(first, "set -e") && strings.Contains(cmd, "rollout status"):
+		if c.rolloutFails {
+			return fail(1, "the rollout timed out")
+		}
+		return ok("")
+	case strings.Contains(cmd, "kubectl wait --for=condition=Ready 'certificate/"):
+		if c.unissued != "" && strings.Contains(cmd, "'certificate/"+c.unissued+"'") {
+			return fail(1, "the challenge is pending")
+		}
+		return ok("")
+	case strings.HasPrefix(first, `g=$(k3s kubectl get helmchart`):
+		return ok("|\n")
+	case strings.HasPrefix(first, "set -e") && strings.Contains(cmd, "delete namespace"):
+		if m := deletedNamespace.FindStringSubmatch(cmd); m != nil {
+			delete(c.apps, m[1])
+		}
+		return ok("")
 	}
 	c.t.Errorf("the fake cluster has no answer to a script on %s:\n%s", n.target, cmd)
 	return fail(127, "fake: unknown script")
+}
+
+// apply applies, server side, the objects in manifest: an app's
+// namespace is kept, its moostack-objects ConfigMap becomes its applied
+// objects, and, with -n, the names of the objects are printed.
+func (f *fakeConn) apply(cmd, manifest string) (sshclient.Result, error) {
+	f.c.manifests = append(f.c.manifests, manifest)
+	ns := ""
+	if m := namespaceFlag.FindStringSubmatch(cmd); m != nil {
+		ns = m[1]
+	}
+	dec := yaml.NewDecoder(strings.NewReader(manifest))
+	var names []string
+	for {
+		var doc struct {
+			Kind     string
+			Metadata struct {
+				Name      string
+				Namespace string
+			}
+			Data map[string]string
+		}
+		err := dec.Decode(&doc)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fail(1, err.Error())
+		}
+		switch {
+		case doc.Kind == "Bad":
+			return fail(1, `error: resource mapping not found for name: "bad"`)
+		case doc.Kind == "Namespace":
+			if f.c.apps[doc.Metadata.Name] == nil {
+				f.c.apps[doc.Metadata.Name] = map[string]bool{}
+			}
+		case doc.Kind == "ConfigMap" && doc.Metadata.Name == objectsConfigMap:
+			objs := map[string]bool{}
+			for _, o := range strings.Fields(doc.Data["objects"]) {
+				objs[o] = true
+			}
+			f.c.apps[doc.Metadata.Namespace] = objs
+		case ns != "":
+			name := strings.ToLower(doc.Kind) + "/" + doc.Metadata.Name
+			names = append(names, name)
+		}
+	}
+	return ok(strings.Join(names, "\n"))
 }
 
 // goArchOf is the Go architecture of what uname prints.

@@ -277,6 +277,33 @@ func TestClusterRemoveWaitsForNoOtherOperation(t *testing.T) {
 	}
 }
 
+func TestStatusShowsAnAppOfSeveralContainers(t *testing.T) {
+	c, home := deployingProd(t)
+	c.apps["shop"] = map[string]bool{}
+	deployment := func(name, image string, replicas, ready int) map[string]any {
+		return map[string]any{
+			"kind":     "Deployment",
+			"metadata": map[string]string{"name": name, "namespace": "shop"},
+			"spec": map[string]any{
+				"replicas": replicas,
+				"template": map[string]any{"spec": map[string]any{"containers": []map[string]string{{"image": image}}}},
+			},
+			"status": map[string]int{"readyReplicas": ready},
+		}
+	}
+	c.workloads = []map[string]any{
+		deployment("jobs", "moostack.local/shop/jobs@sha256:1", 1, 1),
+		deployment("web", "moostack.local/shop/jobs@sha256:1", 2, 1),
+		deployment("cache", "valkey/valkey:8", 1, 1),
+		{"kind": "Ingress", "metadata": map[string]string{"name": "web", "namespace": "shop"}, "spec": map[string]any{"rules": []map[string]string{{"host": "shop.example.com"}}}},
+	}
+	out := mustRun(t, c, home, "cluster", "status")
+	want := "shop  3/4    moostack.local/shop/jobs@sha256:1, valkey/valkey:8  shop.example.com\n"
+	if !strings.Contains(out, want) {
+		t.Errorf("no %q in:\n%s", want, out)
+	}
+}
+
 // A cluster directory named with -C is removed only under its own name.
 func TestClusterRemoveRefusesANameThatIsntTheDirectorysCluster(t *testing.T) {
 	c, home := fakeProd(t)

@@ -15,6 +15,7 @@ import (
 	"github.com/moostackhq/moostack/internal/clusterdir"
 	"github.com/moostackhq/moostack/internal/interrupt"
 	"github.com/moostackhq/moostack/internal/k3s"
+	"github.com/moostackhq/moostack/internal/objects"
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
@@ -194,6 +195,11 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 		return err
 	}
 	fmt.Fprintf(env.Stdout, "Added %s to %s\n", name, d.Cluster.Ref)
+	if hasCP && !slices.ContainsFunc(nodes, func(n clusterdir.Node) bool { return n.Architecture == node.Architecture }) {
+		if apps, err := run(ctx, cpClient, "k3s kubectl get namespaces -l "+objects.AppLabel+" -o name --request-timeout=30s", ""); err == nil && strings.TrimSpace(apps) != "" {
+			fmt.Fprintf(env.Stderr, "Warning: %s is the cluster's first %s node; deploy its built apps again to run them there.\n", name, node.Architecture)
+		}
+	}
 	return nil
 }
 

@@ -41,6 +41,9 @@ type Env struct {
 	Terminal func(exit func(code int)) (terminal.Terminal, io.Closer)
 	// Exit ends mooctl.
 	Exit func(code int)
+	// Docker and Railpack are the commands deploy builds with, docker and
+	// railpack on the PATH if empty.
+	Docker, Railpack string
 	// Root is the directory of cluster directories; clusterdir.Root if
 	// empty.
 	Root string
@@ -98,6 +101,7 @@ func New(env Env) *cli.Command {
 		Commands: []*cli.Command{
 			clusterCommand(env),
 			secretCommand(env),
+			deployCommand(env),
 		},
 	}
 }
