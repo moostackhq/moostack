@@ -1,0 +1,56 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir dist
+          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${platform%/*}
+            arch=${platform#*/}
+            dir=$(mktemp -d)
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags=-s -o "$dir/mooctl" ./cmd/mooctl
+            cp LICENSE "$dir/"
+            tar -C "$dir" -czf "dist/mooctl-$os-$arch.tar.gz" mooctl LICENSE
+          done
+          cd dist
+          sha256sum mooctl-*.tar.gz > sha256sums.txt
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="mooctl built from main at $GITHUB_SHA."
+          if gh release view edge >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/edge" -f sha="$GITHUB_SHA" -F force=true
+            gh release upload edge dist/* --clobber
+            gh release edit edge --notes "$notes"
+          else
+            gh release create edge dist/* --prerelease --target "$GITHUB_SHA" --title edge --notes "$notes"
+          fi
