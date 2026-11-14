@@ -394,6 +394,12 @@ Match host=web1 all # comment
 		name:   "a target's user may hold characters OpenSSH allows",
 		target: "a$b\\c d*@web1",
 		want:   sshconfig.Settings{HostName: "web1", User: "a$b\\c d*", Port: 22, IdentityFiles: defaultIdentityFiles},
+		noSSH:  "OpenSSH versions differ on $ and \\ in a user",
+	},
+	{
+		name:   "a target's user may hold a space and a *",
+		target: "a b*@web1",
+		want:   sshconfig.Settings{HostName: "web1", User: "a b*", Port: 22, IdentityFiles: defaultIdentityFiles},
 	},
 	{
 		name:   "a [ whose only ] is its first character is a plain character",
@@ -876,8 +882,9 @@ var errorCases = []errorCase{
 			"inc":         "HostName elsewhere\n",
 			"link":        "-> {home}/inc",
 		},
-		modes:   map[string]os.FileMode{"inc": 0o620},
-		wantErr: `{home}/.ssh/config:1: bad owner or permissions on {home}/link`,
+		modes:      map[string]os.FileMode{"inc": 0o620},
+		wantErr:    `{home}/.ssh/config:1: bad owner or permissions on {home}/link`,
+		sshAccepts: "Debian's and Ubuntu's ssh accept a file that only its owner's own group can write to",
 	},
 	{
 		name: "a directory an Include glob matches, which others can write to",
