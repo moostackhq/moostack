@@ -304,6 +304,50 @@ func TestStatusShowsAnAppOfSeveralContainers(t *testing.T) {
 	}
 }
 
+func TestStatusShowsTwelveCharactersOfAnImagesDigest(t *testing.T) {
+	c, home := deployingProd(t)
+	c.apps["shop"] = map[string]bool{}
+	container := func(name, image string) map[string]any {
+		return map[string]any{
+			"kind":     "Deployment",
+			"metadata": map[string]string{"name": name, "namespace": "shop"},
+			"spec":     map[string]any{"template": map[string]any{"spec": map[string]any{"containers": []map[string]string{{"image": image}}}}},
+			"status":   map[string]int{"readyReplicas": 1},
+		}
+	}
+	digest := "0661d8f5d56599a9d355618bc035ff3ff6e45800674aa9e8063287a57637e17c"
+	c.workloads = []map[string]any{
+		container("web", "moostack.local/shop/web@sha256:"+digest),
+		container("jobs", "moostack.local/shop/web@sha256:"+digest),
+		container("cache", "valkey/valkey:8"),
+	}
+	out := mustRun(t, c, home, "cluster", "status")
+	want := "shop  3/3    moostack.local/shop/web@sha256:0661d8f5d565, valkey/valkey:8  \n"
+	if !strings.Contains(out, want) {
+		t.Errorf("no %q in:\n%s", want, out)
+	}
+	if strings.Contains(out, digest) {
+		t.Errorf("the whole digest is in:\n%s", out)
+	}
+}
+
+func TestShortImage(t *testing.T) {
+	for image, want := range map[string]string{
+		"moostack.local/shop/web@sha256:0661d8f5d56599a9d355618bc035ff3ff6e45800674aa9e8063287a57637e17c": "moostack.local/shop/web@sha256:0661d8f5d565",
+		"moostack.local/shop/web@sha256:0661d8f5d565":                                                     "moostack.local/shop/web@sha256:0661d8f5d565",
+		"moostack.local/shop/web@sha256:0661d8f5d5659":                                                    "moostack.local/shop/web@sha256:0661d8f5d565",
+		"moostack.local/shop/jobs@sha256:1":                                                               "moostack.local/shop/jobs@sha256:1",
+		"valkey/valkey:8":                                                                                 "valkey/valkey:8",
+		"registry.example.com:5000/app:v1.2.3-0123456789abcdef":                                           "registry.example.com:5000/app:v1.2.3-0123456789abcdef",
+		"app@0123456789abcdef0123":                                                                        "app@0123456789abcdef0123",
+		"":                                                                                                "",
+	} {
+		if got := shortImage(image); got != want {
+			t.Errorf("%q is shown as %q, want %q", image, got, want)
+		}
+	}
+}
+
 // A cluster directory named with -C is removed only under its own name.
 func TestClusterRemoveRefusesANameThatIsntTheDirectorysCluster(t *testing.T) {
 	c, home := fakeProd(t)

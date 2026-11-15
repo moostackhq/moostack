@@ -208,8 +208,8 @@ func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
 					}
 				}
 				for _, c := range o.Spec.Template.Spec.Containers {
-					if !slices.Contains(images, c.Image) {
-						images = append(images, c.Image)
+					if image := shortImage(c.Image); !slices.Contains(images, image) {
+						images = append(images, image)
 					}
 				}
 			}
@@ -225,6 +225,23 @@ func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
 		}
 	}
 	return nil
+}
+
+// shortDigest is how many characters of an image's digest status shows.
+const shortDigest = 12
+
+// shortImage is image with its digest, if it has one, cut to
+// shortDigest characters.
+func shortImage(image string) string {
+	name, digest, ok := strings.Cut(image, "@")
+	if !ok {
+		return image
+	}
+	algorithm, hex, ok := strings.Cut(digest, ":")
+	if !ok || len(hex) <= shortDigest {
+		return image
+	}
+	return name + "@" + algorithm + ":" + hex[:shortDigest]
 }
 
 // printDirNodes prints the nodes of the cluster directory alone.
