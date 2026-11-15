@@ -372,7 +372,7 @@ func TestABuildStoppedEndsWithWhatItStarted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := exec.Command("kill", "-0", strings.TrimSpace(string(pid))).Run(); err == nil {
+	if !ended(strings.TrimSpace(string(pid))) {
 		t.Errorf("the plugin, process %s, runs on after the build stopped", strings.TrimSpace(string(pid)))
 	}
 }
@@ -704,7 +704,7 @@ func TestABuildStoppedKillsWhatIgnoresTheStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := exec.Command("kill", "-0", strings.TrimSpace(string(pid))).Run(); err == nil {
+	if !ended(strings.TrimSpace(string(pid))) {
 		t.Errorf("the plugin, process %s, which ignores SIGTERM, runs on after the build stopped", strings.TrimSpace(string(pid)))
 	}
 }
@@ -721,8 +721,23 @@ func TestACheckStoppedKillsWhatIgnoresTheStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if exec.Command("kill", "-0", strings.TrimSpace(string(pid))).Run() == nil {
+	if !ended(strings.TrimSpace(string(pid))) {
 		exec.Command("kill", "-9", strings.TrimSpace(string(pid))).Run()
 		t.Errorf("docker's child, process %s, which ignores SIGTERM, outlived the stopped check", strings.TrimSpace(string(pid)))
+	}
+}
+
+// ended reports whether the process pid ends within 5 seconds: it is
+// gone, or a zombie that its parent has yet to reap. A kill takes effect
+// a moment after it is sent.
+func ended(pid string) bool {
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		state, err := exec.Command("ps", "-o", "stat=", "-p", pid).Output()
+		if err != nil || strings.HasPrefix(strings.TrimSpace(string(state)), "Z") {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
 	}
 }
