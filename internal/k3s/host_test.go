@@ -536,10 +536,23 @@ func TestTheConsolesObjects(t *testing.T) {
 }
 
 func TestTheConsolesCommandsQuoteWhatAShellWouldExpand(t *testing.T) {
-	for name, script := range map[string]string{"ConsoleImageScript": k3s.ConsoleImageScript, "ConsoleReadyScript": k3s.ConsoleReadyScript} {
+	for name, script := range map[string]string{
+		"ConsoleImageScript": k3s.ConsoleImageScript, "ConsoleReadyScript": k3s.ConsoleReadyScript, "ConsoleTokenScript": k3s.ConsoleTokenScript,
+	} {
 		unquoted := regexp.MustCompile(`'[^']*'`).ReplaceAllString(script, "")
 		if strings.ContainsAny(unquoted, "[]{}*?$`\\\"<>|&;()~#") {
 			t.Errorf("%s has, outside single quotes, what a shell would expand: %s", name, unquoted)
+		}
+	}
+}
+
+func TestTheConsolesURLIsItsLoginPageAtTheAddress(t *testing.T) {
+	for address, want := range map[string]string{
+		"203.0.113.7": "https://203.0.113.7/console/login",
+		"2001:db8::7": "https://[2001:db8::7]/console/login",
+	} {
+		if got := k3s.ConsoleURL(netip.MustParseAddr(address)); got != want {
+			t.Errorf("the console's URL at %s is %q, want %q", address, got, want)
 		}
 	}
 }

@@ -47,6 +47,8 @@ type Env struct {
 	// Go is the command a development build is compiled with, go on the
 	// PATH if empty.
 	Go string
+	// Browser opens url in the operator's browser.
+	Browser func(url string) error
 	// Root is the directory of cluster directories; clusterdir.Root if
 	// empty.
 	Root string
@@ -78,6 +80,7 @@ func OSEnv() (Env, error) {
 		Terminal:  terminal.Open,
 		Exit:      os.Exit,
 		Release:   os.Getenv("MOOCTL_RELEASE_URL"),
+		Browser:   openBrowser,
 	}, nil
 }
 
@@ -110,6 +113,7 @@ func New(env Env) *cli.Command {
 			secretCommand(env),
 			deployCommand(env),
 			logsCommand(env),
+			consoleCommand(env),
 		}, devCommands(env)...),
 	}
 }

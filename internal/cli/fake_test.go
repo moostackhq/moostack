@@ -2,18 +2,24 @@ package cli
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +31,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
@@ -87,6 +94,16 @@ type fakeCluster struct {
 	// consoleRuns is the image the console's Deployment runs, and
 	// consoleSeen the one a command was last told it runs.
 	consoleRuns, consoleSeen string
+	// tokens are the login tokens the console issued.
+	tokens []string
+	// consolePageAfter is how many requests for the console's login page
+	// the ingress answers with 404 first, of pageProbes so far.
+	consolePageAfter, pageProbes int
+	// consolePageStalls makes the ingress leave the requests unanswered
+	// that it would answer with 200.
+	consolePageStalls bool
+	// ingressDials are the addresses the ingress was connected to at.
+	ingressDials []string
 	// consoleFails makes the console never get ready.
 	consoleFails bool
 	// manifests are what was applied, in order.
@@ -260,7 +277,10 @@ func (f *fakeConn) Upload(_ context.Context, file string, r io.Reader, _ fs.File
 	return nil
 }
 
-func (f *fakeConn) DialTCP(ctx context.Context, _ string) (net.Conn, error) {
+func (f *fakeConn) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
+	if _, port, _ := net.SplitHostPort(addr); port == "443" {
+		return f.c.ingress(addr), nil
+	}
 	if f.c.registry == "" {
 		return nil, errors.New("no registry")
 	}
@@ -539,6 +559,13 @@ func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclien
 			return fail(1, `deployments.apps "moostack-console" not found`)
 		}
 		return ok(answer)
+	case cmd == k3s.ConsoleTokenScript:
+		if _, written := n.files[k3s.AutoDeployFile("console")]; !written {
+			return fail(1, `Error from server (NotFound): deployments.apps "moostack-console" not found`)
+		}
+		token := strings.Repeat("A", 25) + string(rune('A'+len(c.tokens)))
+		c.tokens = append(c.tokens, token)
+		return ok(token + "\n")
 	case cmd == k3s.ConsoleReadyScript:
 		if c.consoleFails {
 			return fail(1, "error: timed out waiting for the condition")
@@ -626,3 +653,54 @@ func goArchOf(uname string) string {
 func fakeEnvFor(c *fakeCluster, home string, out *bytes.Buffer) Env {
 	return Env{Home: home, LocalUser: "op", Stdout: out, Stderr: out, Root: home + "/clusters", Connect: c.connect, Exit: func(int) {}, Release: c.release}
 }
+
+// ingress is a connection to the cluster's ingress at addr, which
+// answers one request over TLS: the console's login page with 200 once
+// consolePageAfter requests for it were answered 404, and anything else
+// with 404.
+func (c *fakeCluster) ingress(addr string) net.Conn {
+	client, server := net.Pipe()
+	c.mu.Lock()
+	c.ingressDials = append(c.ingressDials, addr)
+	c.mu.Unlock()
+	go func() {
+		defer server.Close()
+		server.SetDeadline(time.Now().Add(time.Minute))
+		conn := tls.Server(server, &tls.Config{Certificates: []tls.Certificate{ingressCert()}})
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			return
+		}
+		status := http.StatusNotFound
+		c.mu.Lock()
+		stalls := false
+		if _, installed := c.hosts["root@h1"].files[k3s.AutoDeployFile("console")]; installed && req.URL.Path == "/console/login" {
+			c.pageProbes++
+			if c.pageProbes > c.consolePageAfter {
+				status, stalls = http.StatusOK, c.consolePageStalls
+			}
+		}
+		c.mu.Unlock()
+		if stalls {
+			conn.Read(make([]byte, 1))
+			return
+		}
+		fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status, http.StatusText(status))
+	}()
+	return client
+}
+
+// ingressCert is a certificate signed by itself, as the ingress's
+// default one is.
+var ingressCert = sync.OnceValue(func() tls.Certificate {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+})

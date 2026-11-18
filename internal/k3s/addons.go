@@ -237,10 +237,22 @@ const (
 	// ConsoleImageScript prints the image the console's Deployment runs,
 	// and fails while there is none.
 	ConsoleImageScript = "k3s kubectl get deployment " + ConsoleName + " -n " + ConsoleNamespace + " -o jsonpath='{.spec.template.spec.containers[0].image}' --request-timeout=20s"
+	// ConsoleTokenScript prints a new login token of the console.
+	ConsoleTokenScript = "k3s kubectl exec deployment/" + ConsoleName + " -n " + ConsoleNamespace + " -- console token"
 	// ConsoleReadyScript waits up to 5 minutes for the console to be
 	// ready.
 	ConsoleReadyScript = "k3s kubectl rollout status deployment/" + ConsoleName + " -n " + ConsoleNamespace + " --timeout=300s"
 )
+
+// ConsoleURL is the URL of the console's login page at address, one of
+// the control plane node's.
+func ConsoleURL(address netip.Addr) string {
+	host := address.String()
+	if address.Is6() {
+		host = "[" + host + "]"
+	}
+	return "https://" + host + "/console/login"
+}
 
 // Console is the console's objects: its account, which may only list
 // pods, one replica of the image of digest on the control plane's node,
