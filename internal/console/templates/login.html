@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+{{template "head"}}
+<body>
+<header>
+<h1>Console</h1>
+</header>
+<main>
+{{- if .Problem}}
+<p class="problem">{{.Problem}}</p>
+{{- end}}
+<form method="post" action="/console/login" class="login">
+<label for="token">Token</label>
+<input id="token" name="token" type="password" autocomplete="off" required autofocus>
+<button>Log in</button>
+</form>
+</main>
+</body>
+</html>

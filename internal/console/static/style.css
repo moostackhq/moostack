@@ -11,8 +11,34 @@ body {
 	font: 1rem/1.5 system-ui, sans-serif;
 }
 
+header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+}
+
 h1 {
 	font-size: 1.25rem;
+}
+
+button,
+input {
+	padding: 0.25rem 0.75rem;
+	font: inherit;
+}
+
+.login {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.5rem;
+	margin-top: 1rem;
+}
+
+.login input {
+	flex: 1 1 16rem;
+	max-width: 24rem;
+	font-family: ui-monospace, monospace;
 }
 
 h2 {

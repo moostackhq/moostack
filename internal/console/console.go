@@ -7,6 +7,7 @@ import (
 	"embed"
 	"html/template"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -16,59 +17,65 @@ import (
 //go:embed templates static
 var files embed.FS
 
-// readTimeout is how long reading the cluster for a page may take.
-const readTimeout = 20 * time.Second
-
 var templates = template.Must(template.ParseFS(files, "templates/*.html"))
 
-type containersPage struct {
-	Groups  []containerGroup
-	Problem string
+// Every route of Console is under /console.
+type Console struct {
+	orchestrator orchestrator.Orchestrator
+	tokens       *tokens
+	sessions     *sessions
+	mux          *http.ServeMux
 }
 
-// containerGroup is the containers of one namespace.
-type containerGroup struct {
-	Namespace  string
-	Containers []orchestrator.Container
+func New(o orchestrator.Orchestrator) *Console {
+	c := &Console{orchestrator: o, tokens: newTokens(), sessions: newSessions(), mux: http.NewServeMux()}
+	c.mux.Handle("GET /console", http.RedirectHandler("/console/", http.StatusPermanentRedirect))
+	c.mux.HandleFunc("GET /console/{$}", c.handleContainers)
+	c.mux.HandleFunc("GET /console/login", c.handleLoginPage)
+	c.mux.HandleFunc("POST /console/login", c.handleLogin)
+	c.mux.HandleFunc("POST /console/logout", c.handleLogout)
+	c.mux.HandleFunc("GET /console/static/{file}", c.handleStatic)
+	return c
 }
 
-// New returns the console's handler. Every route is under /console.
-func New(o orchestrator.Orchestrator) http.Handler {
-	mux := http.NewServeMux()
-	mux.Handle("GET /console", http.RedirectHandler("/console/", http.StatusPermanentRedirect))
-	mux.HandleFunc("GET /console/{$}", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
-		defer cancel()
-		containers, err := o.Running(ctx)
-		if err != nil {
-			slog.ErrorContext(ctx, "reading the cluster", "err", err)
-			render(w, http.StatusBadGateway, "containers.html", containersPage{Problem: "The cluster can't be read."})
-			return
-		}
-		render(w, http.StatusOK, "containers.html", containersPage{Groups: groupByNamespace(containers)})
-	})
-	mux.HandleFunc("GET /console/static/{file}", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFileFS(w, r, files, "static/"+r.PathValue("file"))
-	})
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		mux.ServeHTTP(w, r)
-	})
+func (c *Console) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	c.mux.ServeHTTP(w, r)
 }
 
-// groupByNamespace splits containers, which are ordered by namespace,
-// into one group per namespace.
-func groupByNamespace(containers []orchestrator.Container) []containerGroup {
-	var groups []containerGroup
-	for _, c := range containers {
-		if len(groups) == 0 || groups[len(groups)-1].Namespace != c.Namespace {
-			groups = append(groups, containerGroup{Namespace: c.Namespace})
-		}
-		last := &groups[len(groups)-1]
-		last.Containers = append(last.Containers, c)
+// Serve serves the console on web, and its login tokens on
+// tokenSocket, until ctx ends or web fails. It then closes both: the
+// requests in flight get 20 seconds to end, and those still open after
+// that are cut.
+func (c *Console) Serve(ctx context.Context, web, tokenSocket net.Listener) error {
+	pages := &http.Server{
+		Handler:           c,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      time.Minute,
+		IdleTimeout:       2 * time.Minute,
 	}
-	return groups
+	go c.serveTokens(tokenSocket)
+	ended := make(chan error, 1)
+	go func() { ended <- pages.Serve(web) }()
+	var err error
+	select {
+	case err = <-ended:
+	case <-ctx.Done():
+	}
+
+	tokenSocket.Close()
+	shutdown, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if pages.Shutdown(shutdown) != nil {
+		pages.Close()
+	}
+	return err
+}
+
+func (c *Console) handleStatic(w http.ResponseWriter, r *http.Request) {
+	http.ServeFileFS(w, r, files, "static/"+r.PathValue("file"))
 }
 
 func render(w http.ResponseWriter, code int, name string, data any) {

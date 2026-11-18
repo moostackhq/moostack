@@ -1,0 +1,3 @@
+Usage of console token:
+  -socket string
+    	the socket file the console issues login tokens on (default "/run/console/console.sock")

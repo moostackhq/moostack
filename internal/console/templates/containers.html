@@ -1,14 +1,12 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Console</title>
-<link rel="stylesheet" href="/console/static/style.css">
-</head>
+{{template "head"}}
 <body>
 <header>
 <h1>Console</h1>
+<form method="post" action="/console/logout">
+<button>Log out</button>
+</form>
 </header>
 <main>
 {{- if .Problem}}

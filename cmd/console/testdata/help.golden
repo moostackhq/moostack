@@ -1,0 +1,5 @@
+Usage of console:
+  -listen string
+    	the address to serve on (default ":8080")
+  -socket string
+    	the socket file to issue login tokens on (default "/run/console/console.sock")

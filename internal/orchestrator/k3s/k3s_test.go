@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -192,8 +194,7 @@ func addPod(pod *corev1.Pod, st corev1.PodStatus) error {
 	return err
 }
 
-// unique is name with a suffix of this call's own, so that a test run
-// again finds nothing a run before it left.
+// unique is name with a random suffix.
 func unique(name string) string {
 	return name + "-" + strings.ToLower(rand.Text()[:8])
 }
@@ -388,9 +389,48 @@ func TestTheConsolesPageShowsTheCluster(t *testing.T) {
 	o := setup(t, []orchestratortest.Pod{{Namespace: ns, Name: "web-1", Containers: []orchestratortest.PodContainer{
 		{Name: "web", Image: "example.test/web:1", Status: orchestratortest.Running},
 	}}})
-	srv := httptest.NewServer(console.New(o))
-	defer srv.Close()
-	res, err := http.Get(srv.URL + "/console/")
+	dir, err := os.MkdirTemp("", "console")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	socket := filepath.Join(dir, "console.sock")
+	tokens, err := console.ListenTokenSocket(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	web, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- console.New(o).Serve(ctx, web, tokens) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	base := "http://" + web.Addr().String()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	token, err := console.RequestToken(ctx, socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := client.PostForm(base+"/console/login", url.Values{"token": {token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	login.Body.Close()
+	if len(login.Cookies()) != 1 {
+		t.Fatalf("logging in: status %d, no session", login.StatusCode)
+	}
+	req, err := http.NewRequest(http.MethodGet, base+"/console/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(login.Cookies()[0])
+	res, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
