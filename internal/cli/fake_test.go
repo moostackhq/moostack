@@ -3,6 +3,7 @@ package cli
 import (
 	"archive/tar"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -83,6 +84,9 @@ type fakeCluster struct {
 	// consoles are the digests of the console's images in the release,
 	// by architecture.
 	consoles map[string]string
+	// consoleRuns is the image the console's Deployment runs, and
+	// consoleSeen the one a command was last told it runs.
+	consoleRuns, consoleSeen string
 	// consoleFails makes the console never get ready.
 	consoleFails bool
 	// manifests are what was applied, in order.
@@ -520,11 +524,21 @@ func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclien
 			delete(c.apps[ns], o)
 		}
 		return ok("")
-	case cmd == k3s.ConsoleExistsScript:
-		if _, ok := n.files[k3s.AutoDeployFile("console")]; !ok {
-			return fail(1, `deployments.apps "console" not found`)
+	case cmd == k3s.ConsoleImageScript:
+		// k3s applies the objects it is given a moment after they are
+		// written: the first answer after a change is the image before.
+		objects, written := n.files[k3s.AutoDeployFile("console")]
+		if !written {
+			return fail(1, `deployments.apps "moostack-console" not found`)
 		}
-		return ok("deployment.apps/console\n")
+		_, image, _ := strings.Cut(objects, "          image: ")
+		image, _, _ = strings.Cut(image, "\n")
+		answer := cmp.Or(c.consoleRuns, image)
+		c.consoleRuns, c.consoleSeen = image, answer
+		if answer == "" {
+			return fail(1, `deployments.apps "moostack-console" not found`)
+		}
+		return ok(answer)
 	case cmd == k3s.ConsoleReadyScript:
 		if c.consoleFails {
 			return fail(1, "error: timed out waiting for the condition")

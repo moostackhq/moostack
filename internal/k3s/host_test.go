@@ -534,3 +534,12 @@ func TestTheConsolesObjects(t *testing.T) {
 		t.Errorf("the route of a node with one address:\n%s", one)
 	}
 }
+
+func TestTheConsolesCommandsQuoteWhatAShellWouldExpand(t *testing.T) {
+	for name, script := range map[string]string{"ConsoleImageScript": k3s.ConsoleImageScript, "ConsoleReadyScript": k3s.ConsoleReadyScript} {
+		unquoted := regexp.MustCompile(`'[^']*'`).ReplaceAllString(script, "")
+		if strings.ContainsAny(unquoted, "[]{}*?$`\\\"<>|&;()~#") {
+			t.Errorf("%s has, outside single quotes, what a shell would expand: %s", name, unquoted)
+		}
+	}
+}

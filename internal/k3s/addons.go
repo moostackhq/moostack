@@ -234,8 +234,9 @@ const (
 	// ConsoleRepository is the console's repository in the cluster's
 	// registry, under a name no app can have.
 	ConsoleRepository = ConsoleNamespace + "/console"
-	// ConsoleExistsScript succeeds once the console's Deployment exists.
-	ConsoleExistsScript = "k3s kubectl get deployment " + ConsoleName + " -n " + ConsoleNamespace + " -o name --request-timeout=20s"
+	// ConsoleImageScript prints the image the console's Deployment runs,
+	// and fails while there is none.
+	ConsoleImageScript = "k3s kubectl get deployment " + ConsoleName + " -n " + ConsoleNamespace + " -o jsonpath='{.spec.template.spec.containers[0].image}' --request-timeout=20s"
 	// ConsoleReadyScript waits up to 5 minutes for the console to be
 	// ready.
 	ConsoleReadyScript = "k3s kubectl rollout status deployment/" + ConsoleName + " -n " + ConsoleNamespace + " --timeout=300s"
@@ -246,6 +247,15 @@ const (
 // replaced and never rolled, and its route on addresses, the node's,
 // for /console and what is under it.
 func Console(digest string, addresses []netip.Addr) string {
+	return consoleObjects(ConsoleImage(digest), addresses)
+}
+
+// ConsoleImage is the console's image of digest, as nodes pull it.
+func ConsoleImage(digest string) string {
+	return Registry + "/" + ConsoleRepository + "@sha256:" + digest
+}
+
+func consoleObjects(image string, addresses []netip.Addr) string {
 	var hosts []string
 	for _, a := range addresses {
 		hosts = append(hosts, "Host(`"+a.String()+"`)")
@@ -253,13 +263,13 @@ func Console(digest string, addresses []netip.Addr) string {
 	return fmt.Sprintf(`apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: %[6]s
+  name: %[4]s
   namespace: %[1]s
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: %[6]s
+  name: %[4]s
 rules:
   - apiGroups: [""]
     resources: [pods]
@@ -268,20 +278,20 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: %[6]s
+  name: %[4]s
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: %[6]s
+  name: %[4]s
 subjects:
   - kind: ServiceAccount
-    name: %[6]s
+    name: %[4]s
     namespace: %[1]s
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: %[6]s
+  name: %[4]s
   namespace: %[1]s
 spec:
   replicas: 1
@@ -289,13 +299,13 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      app: %[6]s
+      app: %[4]s
   template:
     metadata:
       labels:
-        app: %[6]s
+        app: %[4]s
     spec:
-      serviceAccountName: %[6]s
+      serviceAccountName: %[4]s
       nodeSelector:
         node-role.kubernetes.io/control-plane: "true"
       securityContext:
@@ -305,7 +315,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: console
-          image: %[2]s/%[3]s@sha256:%[4]s
+          image: %[2]s
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -329,11 +339,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: %[6]s
+  name: %[4]s
   namespace: %[1]s
 spec:
   selector:
-    app: %[6]s
+    app: %[4]s
   ports:
     - name: http
       port: 80
@@ -342,18 +352,18 @@ spec:
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
-  name: %[6]s
+  name: %[4]s
   namespace: %[1]s
 spec:
   entryPoints: [websecure]
   routes:
-    - match: (%[5]s) && (Path(`+"`/console`"+`) || PathPrefix(`+"`/console/`"+`))
+    - match: (%[3]s) && (Path(`+"`/console`"+`) || PathPrefix(`+"`/console/`"+`))
       kind: Rule
       services:
-        - name: %[6]s
+        - name: %[4]s
           port: http
   tls: {}
-`, ConsoleNamespace, Registry, ConsoleRepository, digest, strings.Join(hosts, " || "), ConsoleName)
+`, ConsoleNamespace, image, strings.Join(hosts, " || "), ConsoleName)
 }
 
 // AutoDeployFile is the path of the manifest called name in the control

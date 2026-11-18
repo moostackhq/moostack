@@ -545,6 +545,9 @@ func TestAConsoleThatDoesntGetReadyUndoesTheControlPlane(t *testing.T) {
 	if !strings.Contains(out, "Uninstalling...") || c.hosts["root@h1"].k3s {
 		t.Errorf("the control plane wasn't uninstalled:\n%s", out)
 	}
+	if tags, _ := consoleImage(t, c, "amd64"); len(tags) != 1 || tags[0] == k3s.LiveTag {
+		t.Errorf("the console's images are tagged %q, want the digest alone: the image never ran", tags)
+	}
 	if nodes := nodeNames(t, home); len(nodes) != 0 {
 		t.Errorf("the cluster directory has the nodes %v", nodes)
 	}

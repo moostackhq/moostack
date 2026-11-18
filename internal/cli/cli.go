@@ -44,6 +44,9 @@ type Env struct {
 	// Docker and Railpack are the commands deploy builds with, docker and
 	// railpack on the PATH if empty.
 	Docker, Railpack string
+	// Go is the command a development build is compiled with, go on the
+	// PATH if empty.
+	Go string
 	// Root is the directory of cluster directories; clusterdir.Root if
 	// empty.
 	Root string
@@ -102,14 +105,18 @@ func New(env Env) *cli.Command {
 				Usage: "the private key file to read the secret store with, instead of finding one in ~/.ssh",
 			},
 		},
-		Commands: []*cli.Command{
+		Commands: append([]*cli.Command{
 			clusterCommand(env),
 			secretCommand(env),
 			deployCommand(env),
 			logsCommand(env),
-		},
+		}, devCommands(env)...),
 	}
 }
+
+// devCommands are the commands for developing Moostack, which a build
+// with the release tag has none of.
+var devCommands = func(Env) []*cli.Command { return nil }
 
 // wantArgs refuses a command that wasn't given n arguments.
 func wantArgs(cmd *cli.Command, n int) error {

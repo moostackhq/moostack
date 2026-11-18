@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -19,5 +20,21 @@ func TestMooctlBuildsForEveryPlatform(t *testing.T) {
 				t.Errorf("%v\n%s", err, out)
 			}
 		})
+	}
+}
+
+func TestAReleaseBuildHasNoDevCommands(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds mooctl twice")
+	}
+	for tags, has := range map[string]bool{"": true, "release": false} {
+		mooctl := filepath.Join(t.TempDir(), "mooctl")
+		if out, err := exec.Command("go", "build", "-tags", tags, "-o", mooctl, ".").CombinedOutput(); err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		out, err := exec.Command(mooctl, "dev", "console", "deploy", "--help").CombinedOutput()
+		if got := err == nil && strings.Contains(string(out), "mooctl dev console deploy"); got != has {
+			t.Errorf("built with the tags %q, mooctl dev console deploy --help: %v\n%s", tags, err, out)
+		}
 	}
 }

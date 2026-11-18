@@ -334,17 +334,21 @@ func install(ctx context.Context, env Env, d *clusterdir.Dir, cp clusterdir.Node
 }
 
 // installConsole pushes the console's image, the archive at console, to
-// the registry on node, the control plane, at host, has k3s apply the
-// console's objects, and waits for the console to be ready.
+// the registry on node, the control plane, at host, and runs it.
 func installConsole(ctx context.Context, env Env, host remote, node clusterdir.Node, console string) error {
 	say(env, "Installing the console...")
 	digest, err := registry.Push(ctx, map[string]string{node.Architecture: console}, registryAddr(node), k3s.ConsoleRepository, host.DialTCP)
 	if err != nil {
 		return fmt.Errorf("the console's image: %w", err)
 	}
-	if err := registry.Tag(ctx, registryAddr(node), k3s.ConsoleRepository, digest, k3s.LiveTag, host.DialTCP); err != nil {
-		return fmt.Errorf("the console's image: %w", err)
-	}
+	return runConsole(ctx, host, node, digest)
+}
+
+// runConsole has k3s on node, the control plane, at host, apply the
+// console's objects with its image of digest, which is in the node's
+// registry, and waits for the console to run it and be ready. It then
+// marks the image as the one that runs.
+func runConsole(ctx context.Context, host remote, node clusterdir.Node, digest string) error {
 	addresses := []netip.Addr{node.PrivateAddress}
 	if node.PublicAddress.IsValid() {
 		addresses = []netip.Addr{node.PublicAddress, node.PrivateAddress}
@@ -353,12 +357,12 @@ func installConsole(ctx context.Context, env Env, host remote, node clusterdir.N
 		return fmt.Errorf("writing the console's objects: %w", err)
 	}
 	for deadline := time.Now().Add(consoleAppliedTimeout); ; {
-		_, err := run(ctx, host, k3s.ConsoleExistsScript, "")
-		if err == nil {
+		image, err := run(ctx, host, k3s.ConsoleImageScript, "")
+		if err == nil && strings.TrimSpace(image) == k3s.ConsoleImage(digest) {
 			break
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("the console's objects weren't applied: %w", err)
+			return fmt.Errorf("the console's objects weren't applied: %w", cmp.Or(err, fmt.Errorf("the console runs %s", strings.TrimSpace(image))))
 		}
 		select {
 		case <-ctx.Done():
@@ -368,6 +372,9 @@ func installConsole(ctx context.Context, env Env, host remote, node clusterdir.N
 	}
 	if _, err := runStoppable(ctx, host, k3s.ConsoleReadyScript); err != nil {
 		return fmt.Errorf("the console isn't ready: %w", err)
+	}
+	if err := registry.Tag(ctx, registryAddr(node), k3s.ConsoleRepository, digest, k3s.LiveTag, host.DialTCP); err != nil {
+		return fmt.Errorf("the console's image: %w", err)
 	}
 	return nil
 }
