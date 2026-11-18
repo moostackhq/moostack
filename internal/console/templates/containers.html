@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Console</title>
+<link rel="stylesheet" href="/console/static/style.css">
+</head>
+<body>
+<header>
+<h1>Console</h1>
+</header>
+<main>
+{{- if .Problem}}
+<p class="problem">{{.Problem}}</p>
+{{- else if not .Groups}}
+<p class="empty">No running containers.</p>
+{{- end}}
+{{- range .Groups}}
+<section>
+<h2>{{.Namespace}}</h2>
+<table>
+<thead>
+<tr><th>Pod</th><th>Container</th><th>Image</th></tr>
+</thead>
+<tbody>
+{{- range .Containers}}
+<tr><td>{{.Pod}}</td><td>{{.Name}}</td><td>{{.Image}}</td></tr>
+{{- end}}
+</tbody>
+</table>
+</section>
+{{- end}}
+</main>
+</body>
+</html>

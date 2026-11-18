@@ -1,0 +1,68 @@
+:root {
+	color-scheme: light dark;
+	--line: color-mix(in srgb, currentColor 20%, transparent);
+	--dim: color-mix(in srgb, currentColor 60%, transparent);
+}
+
+body {
+	margin: 0 auto;
+	padding: 1rem;
+	max-width: 60rem;
+	font: 1rem/1.5 system-ui, sans-serif;
+}
+
+h1 {
+	font-size: 1.25rem;
+}
+
+h2 {
+	margin: 2rem 0 0.5rem;
+	font-size: 1rem;
+}
+
+section {
+	overflow-x: auto;
+}
+
+table {
+	width: 100%;
+	border-collapse: collapse;
+	table-layout: fixed;
+}
+
+th:nth-child(1) {
+	width: 28%;
+}
+
+th:nth-child(2) {
+	width: 18%;
+}
+
+th,
+td {
+	padding: 0.25rem 1rem 0.25rem 0;
+	border-bottom: 1px solid var(--line);
+	text-align: left;
+	vertical-align: top;
+}
+
+th {
+	color: var(--dim);
+	font-weight: normal;
+}
+
+td {
+	font-family: ui-monospace, monospace;
+	font-size: 0.875rem;
+	overflow-wrap: anywhere;
+}
+
+.empty {
+	margin: 0;
+	color: var(--dim);
+}
+
+.problem {
+	padding: 0.5rem 1rem;
+	border: 1px solid var(--line);
+}

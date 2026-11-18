@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Console</title>
+<link rel="stylesheet" href="/console/static/style.css">
+</head>
+<body>
+<header>
+<h1>Console</h1>
+</header>
+<main>
+<section>
+<h2>kube-system</h2>
+<table>
+<thead>
+<tr><th>Pod</th><th>Container</th><th>Image</th></tr>
+</thead>
+<tbody>
+<tr><td>coredns-7b98449c4-x2x9v</td><td>coredns</td><td>rancher/mirrored-coredns-coredns:1.12.0</td></tr>
+</tbody>
+</table>
+</section>
+<section>
+<h2>shop</h2>
+<table>
+<thead>
+<tr><th>Pod</th><th>Container</th><th>Image</th></tr>
+</thead>
+<tbody>
+<tr><td>web-f6dfb8fb4-f9fsd</td><td>web</td><td>registry.moostack.internal:5000/shop/web@sha256:0a1b</td></tr>
+<tr><td>web-f6dfb8fb4-f9fsd</td><td>worker</td><td>registry.moostack.internal:5000/shop/worker@sha256:2c3d</td></tr>
+<tr><td>web-f6dfb8fb4-k2lmn</td><td>web</td><td>registry.moostack.internal:5000/shop/web@sha256:0a1b</td></tr>
+</tbody>
+</table>
+</section>
+</main>
+</body>
+</html>
