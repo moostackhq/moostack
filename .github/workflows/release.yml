@@ -36,18 +36,24 @@ jobs:
             os=${platform%/*}
             arch=${platform#*/}
             dir=$(mktemp -d)
-            GOOS=$os GOARCH=$arch go build -trimpath -ldflags=-s -o "$dir/mooctl" ./cmd/mooctl
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags=-s -tags release -o "$dir/mooctl" ./cmd/mooctl
             cp LICENSE "$dir/"
             tar -C "$dir" -czf "dist/mooctl-$os-$arch.tar.gz" mooctl LICENSE
           done
+          for arch in amd64 arm64; do
+            dir=$(mktemp -d)
+            GOOS=linux GOARCH=$arch go build -trimpath -ldflags=-s -o "$dir/console" ./cmd/console
+            cp LICENSE "$dir/"
+            tar -C "$dir" -czf "dist/console-linux-$arch.tar.gz" console LICENSE
+          done
           cd dist
-          sha256sum mooctl-*.tar.gz > sha256sums.txt
+          sha256sum mooctl-*.tar.gz console-*.tar.gz > sha256sums.txt
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes="mooctl built from main at $GITHUB_SHA."
+          notes="mooctl and console built from main at $GITHUB_SHA."
           if gh release view edge >/dev/null 2>&1; then
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/edge" -f sha="$GITHUB_SHA" -F force=true
             gh release upload edge dist/* --clobber
