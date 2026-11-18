@@ -12,6 +12,7 @@ import (
 
 // Close returns on a connection that just went silent.
 func TestCloseReturnsOnAConnectionThatJustWentSilent(t *testing.T) {
+	t.Parallel()
 	signer, file, _ := newKey(t)
 	d := startSSHD(t, signer.PublicKey())
 	proxy := newSilentProxy(t, "127.0.0.1:"+d.port)
@@ -43,6 +44,7 @@ func TestCloseReturnsOnAConnectionThatJustWentSilent(t *testing.T) {
 // A command RunStoppable started is killed on the node once its
 // connection goes silent, after its context ended.
 func TestRunStoppableEndsTheCommandOverASilentConnection(t *testing.T) {
+	t.Parallel()
 	signer, file, _ := newKey(t)
 	d := startSSHD(t, signer.PublicKey())
 	proxy := newSilentProxy(t, "127.0.0.1:"+d.port)

@@ -1,6 +1,14 @@
 package cli
 
 import (
+	"context"
+	"maps"
+	"net"
+	"slices"
+
+	"github.com/google/go-containerregistry/pkg/name"
+	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
+
 	"bytes"
 	"os"
 	"path/filepath"
@@ -8,7 +16,9 @@ import (
 	"testing"
 
 	"github.com/moostackhq/moostack/internal/clusterdir"
+	"github.com/moostackhq/moostack/internal/deployfile"
 	"github.com/moostackhq/moostack/internal/k3s"
+	"github.com/moostackhq/moostack/internal/registry"
 )
 
 // onFake runs mooctl with args on the cluster prod of home, whose hosts
@@ -423,5 +433,148 @@ func TestNodeAddMakesThePublicAddressTheNodesExternalOne(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "public_address: \"\"\n") {
 		t.Errorf("node2's file:\n%s", data)
+	}
+}
+
+// consoleImage is the tags of the console's images in the cluster's
+// registry, and the digest of the image for linux and arch among those
+// of the first tag.
+func consoleImage(t *testing.T, c *fakeCluster, arch string) (tags []string, digest string) {
+	t.Helper()
+	repo, err := name.NewRepository(c.registry+"/"+k3s.ConsoleRepository, name.Insecure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tags, err = ggcrremote.List(repo); err != nil || len(tags) == 0 {
+		return nil, ""
+	}
+	slices.Sort(tags)
+	idx, err := ggcrremote.Index(repo.Tag(tags[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := idx.IndexManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range m.Manifests {
+		if d.Platform != nil && d.Platform.OS == "linux" && d.Platform.Architecture == arch {
+			digest = d.Digest.String()
+		}
+	}
+	return tags, digest
+}
+
+func TestAddingTheControlPlaneInstallsTheConsoleAndAddingAnotherNodeDoesnt(t *testing.T) {
+	c, home := fakeProd(t)
+	t.Setenv("TMPDIR", t.TempDir())
+	out := mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	for _, want := range []string{"Downloading the console...", "Installing the console...", "Added node1 to prod"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the output lacks %q:\n%s", want, out)
+		}
+	}
+	tags, digest := consoleImage(t, c, "amd64")
+	if len(tags) != 2 || tags[1] != k3s.LiveTag {
+		t.Fatalf("the console's images are tagged %q, want its digest and %s", tags, k3s.LiveTag)
+	}
+	if digest != c.consoles["amd64"] {
+		t.Errorf("the registry's image for amd64 is %s, the release's is %s", digest, c.consoles["amd64"])
+	}
+	objects := c.hosts["root@h1"].files[k3s.AutoDeployFile("console")]
+	for _, want := range []string{
+		"image: moostack.local/" + k3s.ConsoleRepository + "@sha256:" + tags[0],
+		"match: (Host(`192.0.2.10`) || Host(`10.0.0.2`)) && (Path(`/console`) || PathPrefix(`/console/`))",
+	} {
+		if !strings.Contains(objects, want) {
+			t.Errorf("the console's objects lack %q:\n%s", want, objects)
+		}
+	}
+	if !c.ran("root@h1", k3s.ConsoleReadyScript) {
+		t.Error("node-add didn't wait for the console to be ready")
+	}
+	if left, _ := filepath.Glob(filepath.Join(os.TempDir(), "mooctl-console-*")); len(left) != 0 {
+		t.Errorf("the downloaded archive was left in %v", left)
+	}
+
+	downloads := c.downloads.Load()
+	mustRun(t, c, home, "cluster", "node-add", "root@h2")
+	if _, ok := c.hosts["root@h2"].files[k3s.AutoDeployFile("console")]; ok {
+		t.Error("a node that isn't the control plane got the console's objects")
+	}
+	if got := c.downloads.Load(); got != downloads {
+		t.Errorf("adding a node that isn't the control plane downloaded %d files", got-downloads)
+	}
+	if got, _ := consoleImage(t, c, "amd64"); !slices.Equal(got, tags) {
+		t.Errorf("the console's images are tagged %q after another node, were %q", got, tags)
+	}
+}
+
+func TestTheConsoleOfTheControlPlanesArchitectureIsInstalled(t *testing.T) {
+	c, home := fakeProd(t)
+	c.hosts["root@h1"].arch = "aarch64"
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	if _, digest := consoleImage(t, c, "arm64"); digest != c.consoles["arm64"] {
+		t.Errorf("the registry's image for arm64 is %q, the release's is %s", digest, c.consoles["arm64"])
+	}
+}
+
+func TestAConsoleThatCantBeDownloadedRefusesTheNodeBeforeChangingIt(t *testing.T) {
+	c, home := fakeProd(t)
+	c.release += "/nothing"
+	out, err := onFake(t, c, home, "cluster", "node-add", "root@h1")
+	if err == nil || !strings.Contains(err.Error(), "sha256sums.txt: 404 Not Found") {
+		t.Errorf("node-add without a console to download: %v\n%s", err, out)
+	}
+	h1 := c.hosts["root@h1"]
+	if h1.k3s || len(h1.files) != 0 || c.ran("root@h1", "INSTALL_K3S") {
+		t.Errorf("the host was changed: k3s %v, files %v", h1.k3s, slices.Collect(maps.Keys(h1.files)))
+	}
+	if nodes := nodeNames(t, home); len(nodes) != 0 {
+		t.Errorf("the cluster directory has the nodes %v", nodes)
+	}
+}
+
+func TestAConsoleThatDoesntGetReadyUndoesTheControlPlane(t *testing.T) {
+	c, home := fakeProd(t)
+	c.consoleFails = true
+	out, err := onFake(t, c, home, "cluster", "node-add", "root@h1")
+	if err == nil || !strings.Contains(err.Error(), "the console isn't ready") {
+		t.Errorf("node-add with a console that doesn't get ready: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Uninstalling...") || c.hosts["root@h1"].k3s {
+		t.Errorf("the control plane wasn't uninstalled:\n%s", out)
+	}
+	if nodes := nodeNames(t, home); len(nodes) != 0 {
+		t.Errorf("the cluster directory has the nodes %v", nodes)
+	}
+}
+
+func TestNoAppCanHaveTheConsolesNamespaceOrItsRepositorysPrefix(t *testing.T) {
+	prefix, _, _ := strings.Cut(k3s.ConsoleRepository, "/")
+	for _, name := range []string{k3s.ConsoleNamespace, prefix} {
+		if err := deployfile.CheckName(name); err == nil {
+			t.Errorf("an app may be named %s, and removing it would remove the console's objects or images", name)
+		}
+	}
+}
+
+func TestRemovingAnAppNamedMoostackLeavesTheConsolesImage(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	tags, _ := consoleImage(t, c, "amd64")
+	if len(tags) != 2 {
+		t.Fatalf("the console's images are tagged %q", tags)
+	}
+	dial := func(ctx context.Context, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", c.registry)
+	}
+	for _, app := range []string{"moostack", "console", "moostack-console"} {
+		if err := registry.Remove(t.Context(), c.registry, app, dial); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, _ := consoleImage(t, c, "amd64"); !slices.Equal(got, tags) {
+		t.Errorf("the console's images are tagged %q after apps were removed, were %q", got, tags)
 	}
 }

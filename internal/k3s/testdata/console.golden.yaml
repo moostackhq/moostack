@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: moostack-console
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: moostack-console
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: moostack-console
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: moostack-console
+subjects:
+  - kind: ServiceAccount
+    name: moostack-console
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moostack-console
+  namespace: kube-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: moostack-console
+  template:
+    metadata:
+      labels:
+        app: moostack-console
+    spec:
+      serviceAccountName: moostack-console
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: console
+          image: moostack.local/kube-system/console@sha256:0a1b2c
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /console/login
+              port: http
+          volumeMounts:
+            - name: run
+              mountPath: /run/console
+      volumes:
+        - name: run
+          emptyDir:
+            medium: Memory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moostack-console
+  namespace: kube-system
+spec:
+  selector:
+    app: moostack-console
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: moostack-console
+  namespace: kube-system
+spec:
+  entryPoints: [websecure]
+  routes:
+    - match: (Host(`203.0.113.7`) || Host(`10.0.0.2`)) && (Path(`/console`) || PathPrefix(`/console/`))
+      kind: Rule
+      services:
+        - name: moostack-console
+          port: http
+  tls: {}

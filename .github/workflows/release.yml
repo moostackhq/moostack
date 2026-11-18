@@ -44,10 +44,12 @@ jobs:
             dir=$(mktemp -d)
             GOOS=linux GOARCH=$arch go build -trimpath -ldflags=-s -o "$dir/console" ./cmd/console
             cp LICENSE "$dir/"
-            tar -C "$dir" -czf "dist/console-linux-$arch.tar.gz" console LICENSE
+            docker buildx build --file cmd/console/Dockerfile --platform "linux/$arch" \
+              --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH=0 \
+              --output "type=oci,dest=dist/console-linux-$arch.tar,rewrite-timestamp=true" "$dir"
           done
           cd dist
-          sha256sum mooctl-*.tar.gz console-*.tar.gz > sha256sums.txt
+          sha256sum mooctl-*.tar.gz console-*.tar > sha256sums.txt
 
       - name: Publish
         env:

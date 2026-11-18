@@ -1,7 +1,9 @@
 package k3s_test
 
 import (
+	"flag"
 	"fmt"
+	"io"
 	"maps"
 	"net/netip"
 	"os"
@@ -11,8 +13,9 @@ import (
 	"strings"
 	"testing"
 
-	"gopkg.in/yaml.v3"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/moostackhq/moostack/internal/k3s"
 )
@@ -486,5 +489,48 @@ func TestTraefikConfigKeepsTheVisitorsAddress(t *testing.T) {
 		if p.HostPort != 0 {
 			t.Errorf("port %s has a host port, which stops a new Traefik from starting beside the old", name)
 		}
+	}
+}
+
+var update = flag.Bool("update", false, "rewrite the golden files")
+
+func TestTheConsolesObjects(t *testing.T) {
+	got := k3s.Console("0a1b2c", []netip.Addr{netip.MustParseAddr("203.0.113.7"), netip.MustParseAddr("10.0.0.2")})
+	const golden = "testdata/console.golden.yaml"
+	if *update {
+		if err := os.WriteFile(golden, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(golden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != string(want) {
+		t.Errorf("the console's objects aren't %s; run with -update and review the change:\n%s", golden, got)
+	}
+	kinds := []string{}
+	documents := yaml.NewDecoder(strings.NewReader(got))
+	for {
+		var object struct {
+			Kind     string
+			Metadata struct{ Namespace string }
+		}
+		if err := documents.Decode(&object); err != nil {
+			if err != io.EOF {
+				t.Fatalf("the objects aren't YAML: %v", err)
+			}
+			break
+		}
+		if object.Metadata.Namespace != "kube-system" && !strings.HasPrefix(object.Kind, "ClusterRole") {
+			t.Errorf("the %s is in the namespace %q", object.Kind, object.Metadata.Namespace)
+		}
+		kinds = append(kinds, object.Kind)
+	}
+	if got := strings.Join(kinds, " "); got != "ServiceAccount ClusterRole ClusterRoleBinding Deployment Service IngressRoute" {
+		t.Errorf("the objects are %s", got)
+	}
+	if one := k3s.Console("0a1b2c", []netip.Addr{netip.MustParseAddr("10.0.0.2")}); !strings.Contains(one, "match: (Host(`10.0.0.2`)) && (Path(`/console`) || PathPrefix(`/console/`))") {
+		t.Errorf("the route of a node with one address:\n%s", one)
 	}
 }

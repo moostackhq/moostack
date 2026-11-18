@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/netip"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -16,6 +19,8 @@ import (
 	"github.com/moostackhq/moostack/internal/interrupt"
 	"github.com/moostackhq/moostack/internal/k3s"
 	"github.com/moostackhq/moostack/internal/objects"
+	"github.com/moostackhq/moostack/internal/registry"
+	"github.com/moostackhq/moostack/internal/release"
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
@@ -168,9 +173,23 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 		ControlPlane:   role.ControlPlane,
 	}
 
-	// Install, undoing it all if it fails.
 	say(env, "Adding %s to %s (%s, %s, %d MiB, %s)", name, d.Cluster.Ref, role, facts.Architecture, facts.MemoryMiB, private.Addr)
-	if err := install(ctx, env, d, cp, host, cpClient, node, token); err != nil {
+	var console string
+	if role.ControlPlane {
+		say(env, "Downloading the console...")
+		dir, err := os.MkdirTemp("", "mooctl-console-")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(dir)
+		client := &http.Client{Timeout: 10 * time.Minute}
+		if console, err = release.Fetch(ctx, client, cmp.Or(env.Release, release.URL), "console-linux-"+facts.Architecture+".tar", dir); err != nil {
+			return err
+		}
+	}
+
+	// Install, undoing it all if it fails.
+	if err := install(ctx, env, d, cp, host, cpClient, node, token, console); err != nil {
 		say(env, "Uninstalling...")
 		undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoTimeout)
 		defer cancel()
@@ -241,9 +260,9 @@ func freeName(nodes []clusterdir.Node, known []string) string {
 
 // install installs k3s on host as node, joining the control plane cp at
 // cpClient with token, or, if node is the control plane, with token as
-// its agent token, beside zot, Traefik's config, cert-manager and its
-// issuer.
-func install(ctx context.Context, env Env, d *clusterdir.Dir, cp clusterdir.Node, host, cpClient remote, node clusterdir.Node, token string) error {
+// its agent token, beside zot, Traefik's config, cert-manager, its
+// issuer and the console, whose image archive is at console.
+func install(ctx context.Context, env Env, d *clusterdir.Dir, cp clusterdir.Node, host, cpClient remote, node clusterdir.Node, token, console string) error {
 	role := k3s.RoleOf(node.ControlPlane)
 	kn := k3s.Node{Name: node.Name, PrivateAddress: node.PrivateAddress, Interface: node.Interface, PublicAddress: node.PublicAddress}
 	registry := cp.PrivateAddress
@@ -283,8 +302,10 @@ func install(ctx context.Context, env Env, d *clusterdir.Dir, cp clusterdir.Node
 	say(env, "Waiting for %s to be Ready...", node.Name)
 	wait := k3s.WaitReadyScript(node.Name, node.PrivateAddress)
 	if role.ControlPlane {
-		_, err = runStoppable(ctx, host, wait)
-		return err
+		if _, err = runStoppable(ctx, host, wait); err != nil {
+			return err
+		}
+		return installConsole(ctx, env, host, node, console)
 	}
 	// The node is Ready before k3s says it has started: the wait for
 	// Ready ends the wait for the start, whose failure ends both.
@@ -311,6 +332,49 @@ func install(ctx context.Context, env Env, d *clusterdir.Dir, cp clusterdir.Node
 		return <-ready
 	}
 }
+
+// installConsole pushes the console's image, the archive at console, to
+// the registry on node, the control plane, at host, has k3s apply the
+// console's objects, and waits for the console to be ready.
+func installConsole(ctx context.Context, env Env, host remote, node clusterdir.Node, console string) error {
+	say(env, "Installing the console...")
+	digest, err := registry.Push(ctx, map[string]string{node.Architecture: console}, registryAddr(node), k3s.ConsoleRepository, host.DialTCP)
+	if err != nil {
+		return fmt.Errorf("the console's image: %w", err)
+	}
+	if err := registry.Tag(ctx, registryAddr(node), k3s.ConsoleRepository, digest, k3s.LiveTag, host.DialTCP); err != nil {
+		return fmt.Errorf("the console's image: %w", err)
+	}
+	addresses := []netip.Addr{node.PrivateAddress}
+	if node.PublicAddress.IsValid() {
+		addresses = []netip.Addr{node.PublicAddress, node.PrivateAddress}
+	}
+	if err := upload(ctx, host, k3s.AutoDeployFile("console"), k3s.Console(digest, addresses), 0o600); err != nil {
+		return fmt.Errorf("writing the console's objects: %w", err)
+	}
+	for deadline := time.Now().Add(consoleAppliedTimeout); ; {
+		_, err := run(ctx, host, k3s.ConsoleExistsScript, "")
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the console's objects weren't applied: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-time.After(2 * time.Second):
+		}
+	}
+	if _, err := runStoppable(ctx, host, k3s.ConsoleReadyScript); err != nil {
+		return fmt.Errorf("the console isn't ready: %w", err)
+	}
+	return nil
+}
+
+// consoleAppliedTimeout is how long k3s gets to apply the console's
+// objects.
+const consoleAppliedTimeout = 2 * time.Minute
 
 // nodeRemove is mooctl cluster node-remove.
 func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {

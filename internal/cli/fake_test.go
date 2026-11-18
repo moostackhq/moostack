@@ -1,25 +1,37 @@
 package cli
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"regexp"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
+
+	ggcrregistry "github.com/google/go-containerregistry/pkg/registry"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/layout"
+	"github.com/google/go-containerregistry/pkg/v1/random"
 
 	"github.com/moostackhq/moostack/internal/k3s"
 	"github.com/moostackhq/moostack/internal/sshclient"
@@ -64,6 +76,15 @@ type fakeCluster struct {
 	runs []string
 	// registry is what DialTCP connects to.
 	registry string
+	// release is the URL of the release the console is downloaded from,
+	// and downloads counts the requests to it.
+	release   string
+	downloads atomic.Int32
+	// consoles are the digests of the console's images in the release,
+	// by architecture.
+	consoles map[string]string
+	// consoleFails makes the console never get ready.
+	consoleFails bool
 	// manifests are what was applied, in order.
 	manifests []string
 	// noPods makes every app have no pods.
@@ -102,8 +123,65 @@ type fakeNode struct {
 	noReach bool
 }
 
+// imageArchive is an OCI image layout archive of a random image, as
+// buildx writes one, and the image's digest.
+func imageArchive(t *testing.T) ([]byte, string) {
+	t.Helper()
+	img, err := random.Image(256, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	p, err := layout.Write(dir, empty.Index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.AppendImage(img); err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := tw.AddFS(os.DirFS(dir)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	digest, _ := img.Digest()
+	return archive.Bytes(), digest.String()
+}
+
+// newFakeCluster is a cluster with no hosts, a registry, and a release
+// that holds the console's image for amd64 and arm64.
 func newFakeCluster(t *testing.T) *fakeCluster {
-	return &fakeCluster{t: t, hosts: map[string]*fakeNode{}, nodes: map[string]fakeKubeNode{}, apps: map[string]map[string]bool{}}
+	c := &fakeCluster{t: t, hosts: map[string]*fakeNode{}, nodes: map[string]fakeKubeNode{}, apps: map[string]map[string]bool{}}
+	registry := httptest.NewServer(ggcrregistry.New(ggcrregistry.Logger(log.New(io.Discard, "", 0))))
+	t.Cleanup(registry.Close)
+	c.registry = registry.Listener.Addr().String()
+
+	files := map[string][]byte{}
+	var sums strings.Builder
+	c.consoles = map[string]string{}
+	for _, arch := range []string{"amd64", "arm64"} {
+		archive, digest := imageArchive(t)
+		c.consoles[arch] = digest
+		name := "console-linux-" + arch + ".tar"
+		files[name] = archive
+		fmt.Fprintf(&sums, "%x  %s\n", sha256.Sum256(archive), name)
+	}
+	files["sha256sums.txt"] = []byte(sums.String())
+	release := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.downloads.Add(1)
+		content, ok := files[strings.TrimPrefix(r.URL.Path, "/edge/")]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write(content)
+	}))
+	t.Cleanup(release.Close)
+	c.release = release.URL + "/edge"
+	return c
 }
 
 // host adds a 2 GB amd64 host at target, with the private address addr.
@@ -442,6 +520,16 @@ func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclien
 			delete(c.apps[ns], o)
 		}
 		return ok("")
+	case cmd == k3s.ConsoleExistsScript:
+		if _, ok := n.files[k3s.AutoDeployFile("console")]; !ok {
+			return fail(1, `deployments.apps "console" not found`)
+		}
+		return ok("deployment.apps/console\n")
+	case cmd == k3s.ConsoleReadyScript:
+		if c.consoleFails {
+			return fail(1, "error: timed out waiting for the condition")
+		}
+		return ok("")
 	case strings.HasPrefix(first, "set -e") && strings.Contains(cmd, "rollout status"):
 		if c.rolloutFails {
 			return fail(1, "the rollout timed out")
@@ -522,5 +610,5 @@ func goArchOf(uname string) string {
 
 // fakeEnvFor is an Env that reaches the hosts of c, in home.
 func fakeEnvFor(c *fakeCluster, home string, out *bytes.Buffer) Env {
-	return Env{Home: home, LocalUser: "op", Stdout: out, Stderr: out, Root: home + "/clusters", Connect: c.connect, Exit: func(int) {}}
+	return Env{Home: home, LocalUser: "op", Stdout: out, Stderr: out, Root: home + "/clusters", Connect: c.connect, Exit: func(int) {}, Release: c.release}
 }

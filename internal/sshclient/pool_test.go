@@ -141,6 +141,7 @@ func TestPoolConnectsAgainWhenTheCallerItWaitedForGivesUp(t *testing.T) {
 }
 
 func TestPoolReconnectsAfterAConnectionGoesSilent(t *testing.T) {
+	t.Parallel()
 	s, p, n := inProcessPool(t)
 	if err := run(t, p, n); err != nil {
 		t.Fatal(err)
@@ -188,6 +189,7 @@ func TestPoolCloseDoesntWaitForAConnectionBeingMade(t *testing.T) {
 }
 
 func TestCallersWithShortDeadlinesGetPastASilentConnection(t *testing.T) {
+	t.Parallel()
 	s, p, n := inProcessPool(t)
 	if err := run(t, p, n); err != nil {
 		t.Fatal(err)
@@ -209,6 +211,7 @@ func TestCallersWithShortDeadlinesGetPastASilentConnection(t *testing.T) {
 }
 
 func TestABusyConnectionIsntTakenForASilentOne(t *testing.T) {
+	t.Parallel()
 	s, p, n := inProcessPool(t)
 	ctx := testContext(t)
 	c, err := p.Client(ctx, n)

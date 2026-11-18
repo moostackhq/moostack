@@ -47,6 +47,9 @@ type Env struct {
 	// Root is the directory of cluster directories; clusterdir.Root if
 	// empty.
 	Root string
+	// Release is the URL of the release the console is downloaded from,
+	// MOOCTL_RELEASE_URL in the environment; release.URL if empty.
+	Release string
 	// Connect connects to a node by its SSH target, trusting only
 	// hostKey, or, if hostKey is nil, the key the node offers, which it
 	// returns. Nil means over SSH, with the operator's SSH config and
@@ -71,6 +74,7 @@ func OSEnv() (Env, error) {
 		Stderr:    os.Stderr,
 		Terminal:  terminal.Open,
 		Exit:      os.Exit,
+		Release:   os.Getenv("MOOCTL_RELEASE_URL"),
 	}, nil
 }
 

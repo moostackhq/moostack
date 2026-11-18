@@ -188,6 +188,7 @@ func (p *silentProxy) port() string {
 }
 
 func TestTheLockIsReleasedWhenItsConnectionGoesSilent(t *testing.T) {
+	t.Parallel()
 	signer, file, _ := newKey(t)
 	d := startSSHD(t, signer.PublicKey())
 	proxy := newSilentProxy(t, "127.0.0.1:"+d.port)
@@ -246,6 +247,7 @@ func TestTheLockIsReleasedWhenItsConnectionGoesSilent(t *testing.T) {
 }
 
 func TestRunStoppableEndsTheCommandWithItsContext(t *testing.T) {
+	t.Parallel()
 	for _, user := range []string{"root", "op"} {
 		t.Run(user, func(t *testing.T) {
 			d, h := startNode(t, user)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"strings"
 
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
@@ -222,6 +223,137 @@ spec:
           ingress:
             ingressClassName: traefik
 `, Issuer, email)
+}
+
+// The console, which runs on the control plane's node.
+const (
+	// ConsoleNamespace is the namespace of the console's objects, each
+	// named ConsoleName. No app can have its name.
+	ConsoleNamespace = "kube-system"
+	ConsoleName      = "moostack-console"
+	// ConsoleRepository is the console's repository in the cluster's
+	// registry, under a name no app can have.
+	ConsoleRepository = ConsoleNamespace + "/console"
+	// ConsoleExistsScript succeeds once the console's Deployment exists.
+	ConsoleExistsScript = "k3s kubectl get deployment " + ConsoleName + " -n " + ConsoleNamespace + " -o name --request-timeout=20s"
+	// ConsoleReadyScript waits up to 5 minutes for the console to be
+	// ready.
+	ConsoleReadyScript = "k3s kubectl rollout status deployment/" + ConsoleName + " -n " + ConsoleNamespace + " --timeout=300s"
+)
+
+// Console is the console's objects: its account, which may only list
+// pods, one replica of the image of digest on the control plane's node,
+// replaced and never rolled, and its route on addresses, the node's,
+// for /console and what is under it.
+func Console(digest string, addresses []netip.Addr) string {
+	var hosts []string
+	for _, a := range addresses {
+		hosts = append(hosts, "Host(`"+a.String()+"`)")
+	}
+	return fmt.Sprintf(`apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: %[6]s
+  namespace: %[1]s
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: %[6]s
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: %[6]s
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: %[6]s
+subjects:
+  - kind: ServiceAccount
+    name: %[6]s
+    namespace: %[1]s
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %[6]s
+  namespace: %[1]s
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: %[6]s
+  template:
+    metadata:
+      labels:
+        app: %[6]s
+    spec:
+      serviceAccountName: %[6]s
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: console
+          image: %[2]s/%[3]s@sha256:%[4]s
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /console/login
+              port: http
+          volumeMounts:
+            - name: run
+              mountPath: /run/console
+      volumes:
+        - name: run
+          emptyDir:
+            medium: Memory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: %[6]s
+  namespace: %[1]s
+spec:
+  selector:
+    app: %[6]s
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: %[6]s
+  namespace: %[1]s
+spec:
+  entryPoints: [websecure]
+  routes:
+    - match: (%[5]s) && (Path(`+"`/console`"+`) || PathPrefix(`+"`/console/`"+`))
+      kind: Rule
+      services:
+        - name: %[6]s
+          port: http
+  tls: {}
+`, ConsoleNamespace, Registry, ConsoleRepository, digest, strings.Join(hosts, " || "), ConsoleName)
 }
 
 // AutoDeployFile is the path of the manifest called name in the control
