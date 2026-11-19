@@ -248,12 +248,46 @@ func TestEveryRouteForbidsFramingAndOtherOrigins(t *testing.T) {
 	} {
 		for _, cookie := range []*http.Cookie{nil, session} {
 			res, _ := send(t, c, request[0], request[1], cookie, nil)
-			if got := res.Header.Get("Content-Security-Policy"); got != "default-src 'self'; frame-ancestors 'none'" {
+			if got := res.Header.Get("Content-Security-Policy"); got != "default-src 'self'; form-action 'self'; frame-ancestors 'none'" {
 				t.Errorf("%s %s: Content-Security-Policy %q", request[0], request[1], got)
 			}
 			if got := res.Header.Get("X-Content-Type-Options"); got != "nosniff" {
 				t.Errorf("%s %s: X-Content-Type-Options %q", request[0], request[1], got)
 			}
 		}
+	}
+}
+
+func TestALoginOrLogoutSentFromAnotherSiteIsRefused(t *testing.T) {
+	c := console.New(cluster)
+	session := newSession(t, c)
+	token := c.IssueToken()
+	request := func(path string, header, value string, form url.Values) *http.Response {
+		req := httptest.NewRequest(http.MethodPost, "https://console.test"+path, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set(header, value)
+		req.AddCookie(session)
+		rec := httptest.NewRecorder()
+		c.ServeHTTP(rec, req)
+		return rec.Result()
+	}
+	for _, from := range [][2]string{{"Sec-Fetch-Site", "cross-site"}, {"Sec-Fetch-Site", "same-site"}, {"Origin", "https://elsewhere.test"}} {
+		if res := request("/console/login", from[0], from[1], url.Values{"token": {token}}); res.StatusCode != http.StatusForbidden || len(res.Cookies()) != 0 {
+			t.Errorf("a login with %s: %s: status %d with %d cookies, want 403 and none", from[0], from[1], res.StatusCode, len(res.Cookies()))
+		}
+		if res := request("/console/logout", from[0], from[1], nil); res.StatusCode != http.StatusForbidden || len(res.Cookies()) != 0 {
+			t.Errorf("a logout with %s: %s: status %d with %d cookies, want 403 and none", from[0], from[1], res.StatusCode, len(res.Cookies()))
+		}
+	}
+	if res, _ := send(t, c, http.MethodGet, "/console/", session, nil); res.StatusCode != http.StatusOK {
+		t.Errorf("the session after the refused logouts: status %d, want 200", res.StatusCode)
+	}
+	for _, from := range [][2]string{{"Sec-Fetch-Site", "same-origin"}, {"Sec-Fetch-Site", "none"}, {"Origin", "https://console.test"}} {
+		if res := request("/console/logout", from[0], from[1], nil); res.StatusCode != http.StatusSeeOther {
+			t.Errorf("a logout with %s: %s: status %d, want 303", from[0], from[1], res.StatusCode)
+		}
+	}
+	if res := request("/console/login", "Sec-Fetch-Site", "same-origin", url.Values{"token": {token}}); res.StatusCode != http.StatusSeeOther {
+		t.Errorf("the token after the refused logins: status %d, want 303: a refused login used it up", res.StatusCode)
 	}
 }

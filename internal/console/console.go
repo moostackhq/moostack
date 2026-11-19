@@ -25,6 +25,7 @@ type Console struct {
 	tokens       *tokens
 	sessions     *sessions
 	mux          *http.ServeMux
+	sameOrigin http.Handler
 }
 
 func New(o orchestrator.Orchestrator) *Console {
@@ -35,13 +36,14 @@ func New(o orchestrator.Orchestrator) *Console {
 	c.mux.HandleFunc("POST /console/login", c.handleLogin)
 	c.mux.HandleFunc("POST /console/logout", c.handleLogout)
 	c.mux.HandleFunc("GET /console/static/{file}", c.handleStatic)
+	c.sameOrigin = http.NewCrossOriginProtection().Handler(c.mux)
 	return c
 }
 
 func (c *Console) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; form-action 'self'; frame-ancestors 'none'")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	c.mux.ServeHTTP(w, r)
+	c.sameOrigin.ServeHTTP(w, r)
 }
 
 // Serve serves the console on web, and its login tokens on
