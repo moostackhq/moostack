@@ -16,7 +16,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/layout"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/moostackhq/moostack/internal/k3s"
+
+	"github.com/moostackhq/moostack/internal/registry"
 )
 
 // ociArchive writes an OCI image layout archive of a random image to
@@ -123,7 +124,7 @@ func TestDeployRunsTheBuildByDigestOnEveryArchitecture(t *testing.T) {
 	}
 	repo, _ := name.NewRepository(c.registry+"/web/web", name.Insecure)
 	tags, err := ggcrremote.List(repo)
-	tags = slices.DeleteFunc(tags, func(tag string) bool { return tag == k3s.LiveTag })
+	tags = slices.DeleteFunc(tags, func(tag string) bool { return tag == registry.LiveTag })
 	if err != nil || len(tags) != 1 {
 		t.Fatalf("zot has %v, %v", tags, err)
 	}
@@ -187,7 +188,7 @@ containers:
 	ref := func(container string) string {
 		repo, _ := name.NewRepository(c.registry+"/shop/"+container, name.Insecure)
 		tags, err := ggcrremote.List(repo)
-		tags = slices.DeleteFunc(tags, func(tag string) bool { return tag == k3s.LiveTag })
+		tags = slices.DeleteFunc(tags, func(tag string) bool { return tag == registry.LiveTag })
 		if err != nil || len(tags) != 1 {
 			t.Fatalf("the registry has %v of %s, %v", tags, container, err)
 		}
@@ -312,7 +313,7 @@ func deployWith(t *testing.T, c *fakeCluster, home, docker string, args ...strin
 // running one, empty if it keeps none.
 func liveOf(t *testing.T, c *fakeCluster, repo string) string {
 	t.Helper()
-	ref, err := name.NewTag(c.registry+"/"+repo+":"+k3s.LiveTag, name.Insecure)
+	ref, err := name.NewTag(c.registry+"/"+repo+":"+registry.LiveTag, name.Insecure)
 	if err != nil {
 		t.Fatal(err)
 	}

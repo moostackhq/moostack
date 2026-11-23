@@ -258,8 +258,8 @@ func apply(ctx context.Context, cp remote, app *deployfile.App, objs objects.Obj
 	}
 	var recorded []string
 	for _, o := range strings.Fields(before) {
-		// An object without a name was never applied, and one that
-		// isn't in a namespace is never the app's to delete.
+		// Recorded objects without a name, and those outside namespaces,
+		// are left out.
 		if _, name, _ := strings.Cut(o, "/"); name != "" && !unscoped[kindOf(plainName(o))] {
 			recorded = append(recorded, plainName(o))
 		}
@@ -277,7 +277,8 @@ func apply(ctx context.Context, cp remote, app *deployfile.App, objs objects.Obj
 		if slices.Contains(planned, o) {
 			continue
 		}
-		// A kind the cluster no longer has leaves nothing to delete.
+		// A delete that fails on a kind the cluster doesn't have counts
+		// as done.
 		script := "out=$(k3s kubectl delete -n " + ns + " --ignore-not-found --request-timeout=120s " + sshclient.ShellQuote(o) + ` 2>&1) || { echo "$out" | grep -q "doesn't have a resource type" || { echo "$out" >&2; exit 1; }; }`
 		if _, err := run(ctx, cp, script, ""); err != nil {
 			return fmt.Errorf("deleting %s's %s, which it no longer has: %w", app.Name, o, err)
@@ -531,7 +532,7 @@ func buildAndPush(ctx context.Context, env Env, repo, label string, build deploy
 			return "", err
 		}
 	}
-	tag := k3s.Registry + "/" + repo + ":build"
+	tag := registry.Name + "/" + repo + ":build"
 	layouts := map[string]string{}
 	for _, arch := range arches {
 		say(env, "Building %s for linux/%s...", label, arch)
@@ -547,7 +548,7 @@ func buildAndPush(ctx context.Context, env Env, repo, label string, build deploy
 	if err != nil {
 		return "", err
 	}
-	return k3s.Registry + "/" + repo + "@sha256:" + digest, nil
+	return registry.Image(repo, digest), nil
 }
 
 // pushing says that the image called label is being pushed. Where
@@ -601,11 +602,11 @@ func keepRunning(ctx context.Context, cp clusterdir.Node, cpClient remote, image
 	}
 	var marked []string
 	for _, ref := range refs {
-		repo, digest, ok := strings.Cut(strings.TrimPrefix(ref, k3s.Registry+"/"), "@sha256:")
+		repo, digest, ok := strings.Cut(strings.TrimPrefix(ref, registry.Name+"/"), "@sha256:")
 		if !ok || slices.Contains(marked, ref) {
 			continue
 		}
-		if err := registry.Tag(ctx, registryAddr(cp), repo, digest, k3s.LiveTag, cpClient.DialTCP); err != nil {
+		if err := registry.Tag(ctx, registryAddr(cp), repo, digest, registry.LiveTag, cpClient.DialTCP); err != nil {
 			return err
 		}
 		marked = append(marked, ref)
@@ -637,7 +638,7 @@ func hold(ctx context.Context, cp remote) (_ context.Context, release func(), er
 
 // registryAddr is zot's address on the control plane cp.
 func registryAddr(cp clusterdir.Node) string {
-	return netip.AddrPortFrom(cp.PrivateAddress, k3s.RegistryPort).String()
+	return netip.AddrPortFrom(cp.PrivateAddress, registry.Port).String()
 }
 
 // buildDirName matches the name of a build's temporary directory, with

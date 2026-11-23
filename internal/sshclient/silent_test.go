@@ -6,11 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/moostackhq/moostack/internal/k3s"
+	"github.com/moostackhq/moostack/internal/cli"
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
-// Close returns on a connection that just went silent.
 func TestCloseReturnsOnAConnectionThatJustWentSilent(t *testing.T) {
 	t.Parallel()
 	signer, file, _ := newKey(t)
@@ -25,7 +24,7 @@ func TestCloseReturnsOnAConnectionThatJustWentSilent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	held, err := a.Hold(ctx, k3s.LockScript, k3s.LockReady)
+	held, err := a.Hold(ctx, cli.LockScript, cli.LockReady)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +70,7 @@ func TestRunStoppableEndsTheCommandOverASilentConnection(t *testing.T) {
 	}
 }
 
-// Taking the lock gives up when the node goes silent before it answers.
+// The node goes silent before it answers.
 func TestHoldGivesUpOnASilentNode(t *testing.T) {
 	defer sshclient.SetReadyTimeout(3 * time.Second)()
 	signer, file, _ := newKey(t)
@@ -87,7 +86,7 @@ func TestHoldGivesUpOnASilentNode(t *testing.T) {
 	proxy.silence.Store(true)
 	done := make(chan error, 1)
 	go func() {
-		_, err := a.Hold(t.Context(), k3s.LockScript, k3s.LockReady)
+		_, err := a.Hold(t.Context(), cli.LockScript, cli.LockReady)
 		done <- err
 	}()
 	select {

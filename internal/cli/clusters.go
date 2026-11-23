@@ -205,7 +205,7 @@ func clusterRemove(ctx context.Context, env Env, cmd *cli.Command) error {
 			continue
 		}
 		say(env, "Uninstalling k3s from %s...", n.Name)
-		if _, err := run(ctx, c, k3s.UninstallScript(k3s.RoleOf(n.ControlPlane)), ""); err != nil {
+		if _, err := run(ctx, c, uninstallScript(k3s.RoleOf(n.ControlPlane)), ""); err != nil {
 			return fmt.Errorf("uninstalling from %s: %w; run cluster remove again", n.Name, err)
 		}
 	}

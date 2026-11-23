@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/moostackhq/moostack/internal/k3s"
+	"github.com/moostackhq/moostack/internal/cli"
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
@@ -26,17 +26,17 @@ func TestTheOperationLockIsHeldUntilClosedThroughSudo(t *testing.T) {
 	}
 	first, second := dial(), dial()
 
-	held, err := first.Hold(ctx, k3s.LockScript, k3s.LockReady)
+	held, err := first.Hold(ctx, cli.LockScript, cli.LockReady)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := second.Hold(ctx, k3s.LockScript, k3s.LockReady); err == nil || !strings.Contains(err.Error(), "another mooctl operation") {
+	if _, err := second.Hold(ctx, cli.LockScript, cli.LockReady); err == nil || !strings.Contains(err.Error(), "another mooctl operation") {
 		t.Fatalf("a second Hold = %v, want it refused", err)
 	}
 	if err := held.Close(); err != nil {
 		t.Errorf("Close = %v", err)
 	}
-	again, err := second.Hold(ctx, k3s.LockScript, k3s.LockReady)
+	again, err := second.Hold(ctx, cli.LockScript, cli.LockReady)
 	if err != nil {
 		t.Fatalf("Hold after Close = %v", err)
 	}
@@ -51,7 +51,7 @@ func TestTheOperationLockIsHeldUntilClosedThroughSudo(t *testing.T) {
 	third := dial()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		l, err := third.Hold(ctx, k3s.LockScript, k3s.LockReady)
+		l, err := third.Hold(ctx, cli.LockScript, cli.LockReady)
 		if err == nil {
 			l.Close()
 			break
@@ -204,7 +204,7 @@ func TestTheLockIsReleasedWhenItsConnectionGoesSilent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	held, err := a.Hold(ctx, k3s.LockScript, k3s.LockReady)
+	held, err := a.Hold(ctx, cli.LockScript, cli.LockReady)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestTheLockIsReleasedWhenItsConnectionGoesSilent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close()
-	if _, err := b.Hold(ctx, k3s.LockScript, k3s.LockReady); err == nil {
+	if _, err := b.Hold(ctx, cli.LockScript, cli.LockReady); err == nil {
 		t.Fatal("a lock held for 50 s over a healthy connection was taken from it")
 	}
 
@@ -234,7 +234,7 @@ func TestTheLockIsReleasedWhenItsConnectionGoesSilent(t *testing.T) {
 		t.Error("Close didn't return on a silent connection")
 	}
 	for {
-		l, err := b.Hold(ctx, k3s.LockScript, k3s.LockReady)
+		l, err := b.Hold(ctx, cli.LockScript, cli.LockReady)
 		if err == nil {
 			l.Close()
 			break

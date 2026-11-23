@@ -101,13 +101,24 @@ func TestNodeAddMakesTheFirstTheControlPlaneAndJoinsTheOthers(t *testing.T) {
 	if !strings.Contains(h1.files[k3s.ConfigFile], "agent-token:") {
 		t.Errorf("the control plane has no agent token:\n%s", h1.files[k3s.ConfigFile])
 	}
+	if !h1.zot || h2.zot {
+		t.Errorf("zot on h1 %v, on h2 %v", h1.zot, h2.zot)
+	}
+	if !c.ran("root@h1", "set -e\n"+k3s.DownloadedScript+"\ncurl ") {
+		t.Error("zot's install doesn't wait for k3s's download")
+	}
+	for name, h := range map[string]*fakeNode{"h1": h1, "h2": h2} {
+		if got, want := h.files[k3s.RegistriesFile], "mirrors:\n    moostack.local:\n        endpoint:\n            - http://10.0.0.2:5000\n"; got != want {
+			t.Errorf("%s's registries:\n%s\nwant:\n%s", name, got, want)
+		}
+	}
 	if cfg := h2.files[k3s.ConfigFile]; !strings.Contains(cfg, "K10agent::node:token") || !strings.Contains(cfg, "https://10.0.0.2:6443") {
 		t.Errorf("the agent joins with:\n%s", cfg)
 	}
 	if c.locked {
 		t.Error("the lock is still held")
 	}
-	if applied := strings.TrimSpace(h1.files[k3s.AppliedCommitFile]); applied != git(t, d.Path, "rev-parse", "HEAD") {
+	if applied := strings.TrimSpace(h1.files[AppliedCommitFile]); applied != git(t, d.Path, "rev-parse", "HEAD") {
 		t.Errorf("applied %q", applied)
 	}
 	if msg := git(t, d.Path, "log", "-1", "--format=%s"); msg != "node-add node2" {
@@ -248,8 +259,8 @@ func TestNodeRemove(t *testing.T) {
 	if names := nodeNames(t, home); len(names) != 0 {
 		t.Errorf("nodes = %v", names)
 	}
-	if c.hosts["root@h1"].k3s {
-		t.Error("k3s is still on h1")
+	if l := left(c.hosts["root@h1"]); l != "" {
+		t.Errorf("h1 still has %s", l)
 	}
 }
 
@@ -304,7 +315,7 @@ func TestStatusShowsDrift(t *testing.T) {
 	}
 	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.9", arch: "amd64"}
 	c.nodes["node2"] = fakeKubeNode{ip: "10.0.0.8", arch: "arm64"}
-	c.hosts["root@h1"].files[k3s.AppliedCommitFile] = strings.Repeat("ab", 20) + "\n"
+	c.hosts["root@h1"].files[AppliedCommitFile] = strings.Repeat("ab", 20) + "\n"
 	out := mustRun(t, c, home, "cluster", "status")
 	for _, want := range []string{
 		"stray is on the cluster but not in the cluster directory",
@@ -371,7 +382,7 @@ func TestStatusOfADirectoryWithNodesButNoControlPlane(t *testing.T) {
 func TestStatusShowsAnAppliedCommitFileThatHoldsNoCommit(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
-	c.hosts["root@h1"].files[k3s.AppliedCommitFile] = "garbage\n"
+	c.hosts["root@h1"].files[AppliedCommitFile] = "garbage\n"
 	if out := mustRun(t, c, home, "cluster", "status"); !strings.Contains(out, `doesn't hold a commit: "garbage"`) {
 		t.Errorf("status:\n%s", out)
 	}
@@ -475,8 +486,8 @@ func TestAddingTheControlPlaneInstallsTheConsoleAndAddingAnotherNodeDoesnt(t *te
 		}
 	}
 	tags, digest := consoleImage(t, c, "amd64")
-	if len(tags) != 2 || tags[1] != k3s.LiveTag {
-		t.Fatalf("the console's images are tagged %q, want its digest and %s", tags, k3s.LiveTag)
+	if len(tags) != 2 || tags[1] != registry.LiveTag {
+		t.Fatalf("the console's images are tagged %q, want its digest and %s", tags, registry.LiveTag)
 	}
 	if digest != c.consoles["amd64"] {
 		t.Errorf("the registry's image for amd64 is %s, the release's is %s", digest, c.consoles["amd64"])
@@ -542,10 +553,10 @@ func TestAConsoleThatDoesntGetReadyUndoesTheControlPlane(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "the console isn't ready") {
 		t.Errorf("node-add with a console that doesn't get ready: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "Uninstalling...") || c.hosts["root@h1"].k3s {
-		t.Errorf("the control plane wasn't uninstalled:\n%s", out)
+	if l := left(c.hosts["root@h1"]); !strings.Contains(out, "Uninstalling...") || l != "" {
+		t.Errorf("the control plane wasn't uninstalled, it still has %q:\n%s", l, out)
 	}
-	if tags, _ := consoleImage(t, c, "amd64"); len(tags) != 1 || tags[0] == k3s.LiveTag {
+	if tags, _ := consoleImage(t, c, "amd64"); len(tags) != 1 || tags[0] == registry.LiveTag {
 		t.Errorf("the console's images are tagged %q, want the digest alone: the image never ran", tags)
 	}
 	if nodes := nodeNames(t, home); len(nodes) != 0 {

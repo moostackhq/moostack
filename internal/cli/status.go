@@ -129,7 +129,7 @@ func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
 	if applied, err := (remoteHost{cpClient}).appliedCommit(ctx); err != nil {
 		drift = append(drift, err.Error())
 	} else if applied != "" && !commitID.MatchString(applied) {
-		drift = append(drift, fmt.Sprintf("the control plane's %s doesn't hold a commit: %q; operations are refused until it does", k3s.AppliedCommitFile, applied))
+		drift = append(drift, fmt.Sprintf("the control plane's %s doesn't hold a commit: %q; operations are refused until it does", AppliedCommitFile, applied))
 	} else if applied != "" {
 		if repo, err := gitrepo.Open(ctx, d.Path); err == nil {
 			if ok, err := repo.IsAncestor(ctx, applied); err == nil && !ok {

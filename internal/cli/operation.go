@@ -11,7 +11,6 @@ import (
 
 	"github.com/moostackhq/moostack/internal/clusterdir"
 	"github.com/moostackhq/moostack/internal/gitrepo"
-	"github.com/moostackhq/moostack/internal/k3s"
 )
 
 // operation is a change to a cluster, under its operation lock.
@@ -23,11 +22,33 @@ type operation struct {
 	stop   context.CancelFunc
 }
 
-// held is a held operation lock.
 type held interface {
 	Done() <-chan struct{}
 	Close() error
 }
+
+// LockScript holds the operation lock, printing LockReady once it has it,
+// until its stdin closes or no line has come on it for 45 seconds.
+const LockScript = `mkdir -p /run/moostack
+exec 9>>/run/moostack/operation.lock
+flock -n 9 || {
+	echo "another mooctl operation is running on this cluster; wait for it to finish" >&2
+	exit 1
+}
+echo ` + LockReady + `
+while timeout 45 sh -c 'IFS= read -r _' 9>&-; do :; done`
+
+// LockReady is what LockScript prints once it holds the lock.
+const LockReady = "operation-lock-held"
+
+// AppliedCommitFile holds, on the control plane, the commit of the
+// cluster directory the cluster last applied.
+const AppliedCommitFile = "/var/lib/moostack/applied-commit"
+
+// AppliedCommitScript prints the commit the cluster last applied, nothing
+// if it has applied none, or "empty" if its file is empty, and fails if
+// the file can't be read.
+const AppliedCommitScript = `if [ -e ` + AppliedCommitFile + ` ]; then c=$(cat ` + AppliedCommitFile + `) || exit 1; echo "${c:-empty}"; fi`
 
 // lockHost is the host that holds a cluster's operation lock and the
 // commit it last applied: its control plane, or its first node.
@@ -37,13 +58,12 @@ type lockHost interface {
 	recordCommit(ctx context.Context, commit string) error
 }
 
-// remoteHost is a lockHost on a remote.
 type remoteHost struct{ r remote }
 
 func (h remoteHost) lock(ctx context.Context) (held, error) { return h.r.Lock(ctx) }
 
 func (h remoteHost) appliedCommit(ctx context.Context) (string, error) {
-	out, err := run(ctx, h.r, k3s.AppliedCommitScript, "")
+	out, err := run(ctx, h.r, AppliedCommitScript, "")
 	if err != nil {
 		return "", fmt.Errorf("reading the commit the cluster applied: %w", err)
 	}
@@ -51,10 +71,10 @@ func (h remoteHost) appliedCommit(ctx context.Context) (string, error) {
 }
 
 func (h remoteHost) recordCommit(ctx context.Context, commit string) error {
-	return upload(ctx, h.r, k3s.AppliedCommitFile, commit+"\n", 0o644)
+	return upload(ctx, h.r, AppliedCommitFile, commit+"\n", 0o644)
 }
 
-// commitID is what a commit's ID is.
+// commitID matches a commit's ID: 40 or 64 hex digits.
 var commitID = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 
 // finishTimeout bounds finishing an operation once the cluster changed,
@@ -122,7 +142,7 @@ func begin(ctx context.Context, env Env, dir string, lockOn lockHost, checkAppli
 	}
 	if !commitID.MatchString(applied) {
 		o.release()
-		return nil, nil, fmt.Errorf("the control plane's %s doesn't hold a commit: %q", k3s.AppliedCommitFile, applied)
+		return nil, nil, fmt.Errorf("the control plane's %s doesn't hold a commit: %q", AppliedCommitFile, applied)
 	}
 	ok, err := repo.IsAncestor(opCtx, applied)
 	if err != nil {

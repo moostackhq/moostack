@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -334,5 +335,52 @@ func TestSameControlPlaneComparesTheHost(t *testing.T) {
 	otherKey.HostKey = testHostKey(t)
 	if err := sameControlPlane(d, otherKey); err == nil {
 		t.Error("a control plane with another host key passed")
+	}
+}
+
+func TestTheOperationsScriptsParse(t *testing.T) {
+	scripts := map[string]string{"lock": LockScript, "applied": AppliedCommitScript}
+	for _, sh := range []string{"sh", "bash", "dash"} {
+		if _, err := exec.LookPath(sh); err != nil {
+			continue
+		}
+		for name, script := range scripts {
+			if out, err := exec.Command(sh, "-n", "-c", script).CombinedOutput(); err != nil {
+				t.Errorf("%s: %s doesn't parse: %v\n%s", sh, name, err, out)
+			}
+		}
+	}
+}
+
+func TestTheAppliedCommitScriptTellsAnEmptyFileFromNone(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "applied-commit")
+	script := strings.ReplaceAll(AppliedCommitScript, AppliedCommitFile, file)
+	runIt := func() string {
+		out, err := exec.Command("sh", "-c", script).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if got := runIt(); got != "" {
+		t.Errorf("no file: %q", got)
+	}
+	os.WriteFile(file, nil, 0o644)
+	if got := runIt(); got != "empty" {
+		t.Errorf("an empty file: %q", got)
+	}
+	os.WriteFile(file, []byte("abc123\n"), 0o644)
+	if got := runIt(); got != "abc123" {
+		t.Errorf("a commit: %q", got)
+	}
+}
+
+func TestTheLockAndTheAppliedCommitAreWhereEveryMooctlLooks(t *testing.T) {
+	if AppliedCommitFile != "/var/lib/moostack/applied-commit" || LockReady != "operation-lock-held" {
+		t.Errorf("the applied commit is at %s, and the lock's ready line is %s", AppliedCommitFile, LockReady)
+	}
+	if !strings.Contains(LockScript, "exec 9>>/run/moostack/operation.lock\nflock -n 9 ") {
+		t.Errorf("the lock isn't on /run/moostack/operation.lock:\n%s", LockScript)
 	}
 }

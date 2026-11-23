@@ -168,7 +168,7 @@ func TestConfigs(t *testing.T) {
 			t.Errorf("agent config lacks %q:\n%s", want, agent)
 		}
 	}
-	reg := k3s.Registries(netip.MustParseAddr("10.0.0.2"))
+	reg := k3s.Registries("moostack.local", netip.MustParseAddrPort("10.0.0.2:5000"))
 	if !strings.Contains(reg, "moostack.local:") || !strings.Contains(reg, "http://10.0.0.2:5000") {
 		t.Errorf("registries:\n%s", reg)
 	}
@@ -260,12 +260,10 @@ func TestNodeScriptsParse(t *testing.T) {
 		"wait":           k3s.WaitReadyScript("node1", netip.MustParseAddr("10.0.0.2")),
 		"uninstall cp":   k3s.UninstallScript(k3s.ControlPlane),
 		"uninstall node": k3s.UninstallScript(k3s.Agent),
-		"lock":           k3s.LockScript,
-		"applied":        k3s.AppliedCommitScript,
+		"downloaded":     k3s.DownloadedScript,
 		"services ready": k3s.ServicesReadyScript,
 		"wait services":  k3s.WaitServicesScript,
 		"reach":          k3s.ReachScript(netip.MustParseAddr("10.0.0.2")),
-		"zot":            k3s.ZotScript("amd64", netip.MustParseAddr("10.0.0.2")),
 	}
 	for _, sh := range []string{"sh", "bash", "dash"} {
 		if _, err := exec.LookPath(sh); err != nil {
@@ -281,24 +279,15 @@ func TestNodeScriptsParse(t *testing.T) {
 
 func TestUninstallRemovesOnlyWhatMooctlWrote(t *testing.T) {
 	agent := k3s.UninstallScript(k3s.Agent)
-	for _, never := range []string{"/var/lib/moostack", "/etc/moostack", "/var/lib/zot", "rm -rf"} {
+	for _, never := range []string{"/var/lib/moostack", "/etc/moostack", "rm -rf"} {
 		if strings.Contains(agent, never) {
 			t.Errorf("a node's uninstall touches %s:\n%s", never, agent)
 		}
 	}
 	cp := k3s.UninstallScript(k3s.ControlPlane)
-	for _, want := range []string{k3s.ConfigFile, k3s.KubeletDropIn, k3s.AppliedCommitFile, "rmdir"} {
+	for _, want := range []string{k3s.ConfigFile, k3s.KubeletDropIn, "rmdir"} {
 		if !strings.Contains(cp, want) {
 			t.Errorf("the control plane's uninstall lacks %s:\n%s", want, cp)
-		}
-	}
-}
-
-func TestZotKeepsTheLastImagesAndRestarts(t *testing.T) {
-	got := k3s.ZotScript("amd64", netip.MustParseAddr("10.0.0.2"))
-	for _, want := range []string{`"mostRecentlyPushedCount":3`, "RestartSec=5", "StartLimitIntervalSec=0", `"readTimeout":"30m"`} {
-		if !strings.Contains(got, want) {
-			t.Errorf("lacks %s:\n%s", want, got)
 		}
 	}
 }
@@ -374,6 +363,51 @@ func TestWaitServicesScriptEndsOnceReady(t *testing.T) {
 	}
 }
 
+func TestWrittenFilesNameTheRegistryAndUninstallRemovesEachOfThem(t *testing.T) {
+	for _, role := range []k3s.Role{k3s.ControlPlane, k3s.Agent} {
+		w := k3s.Written{
+			Node:         k3s.Node{Name: "node2", PrivateAddress: netip.MustParseAddr("10.0.0.3"), Interface: "ens10"},
+			Role:         role,
+			MemoryMiB:    4096,
+			GOMEMLIMIT:   "409MiB",
+			ControlPlane: netip.MustParseAddr("10.0.0.2"),
+			Token:        "t",
+			Registry:     "registry.test",
+			RegistryPort: 5001,
+		}
+		files := map[string]string{}
+		uninstall := k3s.UninstallScript(role)
+		for _, f := range w.Files() {
+			files[f.Path] = f.Content
+			if !strings.Contains(uninstall, " "+f.Path) {
+				t.Errorf("%s: the uninstall leaves %s:\n%s", role, f.Path, uninstall)
+			}
+		}
+		if got, want := files[k3s.RegistriesFile], "mirrors:\n    registry.test:\n        endpoint:\n            - http://10.0.0.2:5001\n"; got != want {
+			t.Errorf("%s: registries:\n%s\nwant:\n%s", role, got, want)
+		}
+	}
+}
+
+func TestTheWaitsForAnInstallFindARunningOne(t *testing.T) {
+	install, err := k3s.InstallScript("v1.37.2+k3s1", k3s.Agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, script := range map[string]string{"uninstall": k3s.UninstallScript(k3s.Agent), "downloaded": k3s.DownloadedScript} {
+		m := regexp.MustCompile(`pgrep -f '([^']+)'`).FindStringSubmatch(script)
+		if m == nil {
+			t.Fatalf("%s: no pgrep in\n%s", name, script)
+		}
+		if !regexp.MustCompile(m[1]).MatchString(install) {
+			t.Errorf("%s: its pgrep pattern %q doesn't match the install's command line:\n%s", name, m[1], install)
+		}
+		if regexp.MustCompile(m[1]).MatchString(script) {
+			t.Errorf("%s: its own command line matches its pgrep pattern %q", name, m[1])
+		}
+	}
+}
+
 func TestUninstallDoesntWaitForItself(t *testing.T) {
 	for _, role := range []k3s.Role{k3s.ControlPlane, k3s.Agent} {
 		script := k3s.UninstallScript(role)
@@ -387,30 +421,6 @@ func TestUninstallDoesntWaitForItself(t *testing.T) {
 		if !strings.Contains(script, "exit $s") {
 			t.Errorf("%s: the script doesn't exit with the uninstall's status", role)
 		}
-	}
-}
-
-func TestTheAppliedCommitScriptTellsAnEmptyFileFromNone(t *testing.T) {
-	dir := t.TempDir()
-	file := filepath.Join(dir, "applied-commit")
-	script := strings.ReplaceAll(k3s.AppliedCommitScript, k3s.AppliedCommitFile, file)
-	runIt := func() string {
-		out, err := exec.Command("sh", "-c", script).Output()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	if got := runIt(); got != "" {
-		t.Errorf("no file: %q", got)
-	}
-	os.WriteFile(file, nil, 0o644)
-	if got := runIt(); got != "empty" {
-		t.Errorf("an empty file: %q", got)
-	}
-	os.WriteFile(file, []byte("abc123\n"), 0o644)
-	if got := runIt(); got != "abc123" {
-		t.Errorf("a commit: %q", got)
 	}
 }
 
@@ -495,7 +505,7 @@ func TestTraefikConfigKeepsTheVisitorsAddress(t *testing.T) {
 var update = flag.Bool("update", false, "rewrite the golden files")
 
 func TestTheConsolesObjects(t *testing.T) {
-	got := k3s.Console("0a1b2c", []netip.Addr{netip.MustParseAddr("203.0.113.7"), netip.MustParseAddr("10.0.0.2")})
+	got := k3s.Console("moostack.local/kube-system/console@sha256:0a1b2c", []netip.Addr{netip.MustParseAddr("203.0.113.7"), netip.MustParseAddr("10.0.0.2")})
 	const golden = "testdata/console.golden.yaml"
 	if *update {
 		if err := os.WriteFile(golden, []byte(got), 0o644); err != nil {
@@ -530,7 +540,7 @@ func TestTheConsolesObjects(t *testing.T) {
 	if got := strings.Join(kinds, " "); got != "ServiceAccount ClusterRole ClusterRoleBinding Deployment Service IngressRoute" {
 		t.Errorf("the objects are %s", got)
 	}
-	if one := k3s.Console("0a1b2c", []netip.Addr{netip.MustParseAddr("10.0.0.2")}); !strings.Contains(one, "match: (Host(`10.0.0.2`)) && (Path(`/console`) || PathPrefix(`/console/`))") {
+	if one := k3s.Console("moostack.local/kube-system/console@sha256:0a1b2c", []netip.Addr{netip.MustParseAddr("10.0.0.2")}); !strings.Contains(one, "match: (Host(`10.0.0.2`)) && (Path(`/console`) || PathPrefix(`/console/`))") {
 		t.Errorf("the route of a node with one address:\n%s", one)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path"
 	"slices"
 	"strings"
 	"time"
@@ -193,7 +194,7 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 		say(env, "Uninstalling...")
 		undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoTimeout)
 		defer cancel()
-		if _, uerr := run(undoCtx, host, k3s.UninstallScript(role), ""); uerr != nil {
+		if _, uerr := run(undoCtx, host, uninstallScript(role), ""); uerr != nil {
 			err = errors.Join(err, fmt.Errorf("uninstalling from %s: %w", target, uerr))
 		}
 		if hasCP {
@@ -258,6 +259,17 @@ func freeName(nodes []clusterdir.Node, known []string) string {
 	}
 }
 
+// uninstallScript removes k3s from a node of role, and from the control
+// plane the registry and the applied commit as well, and fails if k3s's
+// uninstall fails.
+func uninstallScript(role k3s.Role) string {
+	script := k3s.UninstallScript(role)
+	if !role.ControlPlane {
+		return script
+	}
+	return "(\n" + script + "\n)\ns=$?\n" + registry.ZotUninstallScript + "\nrm -f " + AppliedCommitFile + "\nrmdir " + path.Dir(AppliedCommitFile) + " 2>/dev/null\nexit $s"
+}
+
 // install installs k3s on host as node, joining the control plane cp at
 // cpClient with token, or, if node is the control plane, with token as
 // its agent token, beside zot, Traefik's config, cert-manager, its
@@ -265,11 +277,11 @@ func freeName(nodes []clusterdir.Node, known []string) string {
 func install(ctx context.Context, env Env, d *clusterdir.Dir, cp clusterdir.Node, host, cpClient remote, node clusterdir.Node, token, console string) error {
 	role := k3s.RoleOf(node.ControlPlane)
 	kn := k3s.Node{Name: node.Name, PrivateAddress: node.PrivateAddress, Interface: node.Interface, PublicAddress: node.PublicAddress}
-	registry := cp.PrivateAddress
+	cpAddr := cp.PrivateAddress
 	if role.ControlPlane {
-		registry = node.PrivateAddress
+		cpAddr = node.PrivateAddress
 	}
-	files := k3s.Written{Node: kn, Role: role, MemoryMiB: node.MemoryMiB, GOGC: node.GOGC, GOMEMLIMIT: node.GOMEMLIMIT, ControlPlane: registry, Token: token, Email: d.Cluster.Email}.Files()
+	files := k3s.Written{Node: kn, Role: role, MemoryMiB: node.MemoryMiB, GOGC: node.GOGC, GOMEMLIMIT: node.GOMEMLIMIT, ControlPlane: cpAddr, Token: token, Registry: registry.Name, RegistryPort: registry.Port, Email: d.Cluster.Email}.Files()
 	for _, f := range files {
 		if err := upload(ctx, host, f.Path, f.Content, 0o600); err != nil {
 			return fmt.Errorf("writing %s: %w", f.Path, err)
@@ -283,7 +295,7 @@ func install(ctx context.Context, env Env, d *clusterdir.Dir, cp clusterdir.Node
 	if role.ControlPlane {
 		say(env, "Installing k3s and zot...")
 		go func() {
-			if _, err := runStoppable(ctx, host, k3s.ZotScript(node.Architecture, node.PrivateAddress)); err != nil {
+			if _, err := runStoppable(ctx, host, registry.ZotScript(node.Architecture, node.PrivateAddress, k3s.DownloadedScript)); err != nil {
 				zot <- fmt.Errorf("installing zot: %w", err)
 				return
 			}
@@ -307,8 +319,8 @@ func install(ctx context.Context, env Env, d *clusterdir.Dir, cp clusterdir.Node
 		}
 		return installConsole(ctx, env, host, node, console)
 	}
-	// The node is Ready before k3s says it has started: the wait for
-	// Ready ends the wait for the start, whose failure ends both.
+	// The wait for Ready ends the wait for the start, whose failure ends
+	// both.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	started, ready := make(chan error, 1), make(chan error, 1)
@@ -353,12 +365,12 @@ func runConsole(ctx context.Context, host remote, node clusterdir.Node, digest s
 	if node.PublicAddress.IsValid() {
 		addresses = []netip.Addr{node.PublicAddress, node.PrivateAddress}
 	}
-	if err := upload(ctx, host, k3s.AutoDeployFile("console"), k3s.Console(digest, addresses), 0o600); err != nil {
+	if err := upload(ctx, host, k3s.AutoDeployFile("console"), k3s.Console(registry.Image(k3s.ConsoleRepository, digest), addresses), 0o600); err != nil {
 		return fmt.Errorf("writing the console's objects: %w", err)
 	}
 	for deadline := time.Now().Add(consoleAppliedTimeout); ; {
 		image, err := run(ctx, host, k3s.ConsoleImageScript, "")
-		if err == nil && strings.TrimSpace(image) == k3s.ConsoleImage(digest) {
+		if err == nil && strings.TrimSpace(image) == registry.Image(k3s.ConsoleRepository, digest) {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -373,7 +385,7 @@ func runConsole(ctx context.Context, host remote, node clusterdir.Node, digest s
 	if _, err := runStoppable(ctx, host, k3s.ConsoleReadyScript); err != nil {
 		return fmt.Errorf("the console isn't ready: %w", err)
 	}
-	if err := registry.Tag(ctx, registryAddr(node), k3s.ConsoleRepository, digest, k3s.LiveTag, host.DialTCP); err != nil {
+	if err := registry.Tag(ctx, registryAddr(node), k3s.ConsoleRepository, digest, registry.LiveTag, host.DialTCP); err != nil {
 		return fmt.Errorf("the console's image: %w", err)
 	}
 	return nil
@@ -473,7 +485,7 @@ func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {
 			return fmt.Errorf("%s is the control plane, which goes last; remove %s first", name, strings.Join(others, ", "))
 		}
 		say(env, "Uninstalling...")
-		if _, err := run(ctx, cpClient, k3s.UninstallScript(k3s.ControlPlane), ""); err != nil {
+		if _, err := run(ctx, cpClient, uninstallScript(k3s.ControlPlane), ""); err != nil {
 			return fmt.Errorf("uninstalling from %s: %w; run node-remove again", name, err)
 		}
 		recordOn = nil
@@ -498,7 +510,7 @@ func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {
 		}
 		if host != nil {
 			say(env, "Uninstalling...")
-			if _, err := run(ctx, host, k3s.UninstallScript(k3s.Agent), ""); err != nil {
+			if _, err := run(ctx, host, uninstallScript(k3s.Agent), ""); err != nil {
 				return fmt.Errorf("uninstalling from %s: %w; run node-remove again", name, err)
 			}
 		}
@@ -605,7 +617,7 @@ func removeWithoutControlPlane(ctx context.Context, env Env, d *clusterdir.Dir, 
 	say(env, "Removing %s from %s", name, d.Cluster.Ref)
 	if host, err := dialNode(ctx, env, n); err == nil {
 		say(env, "Uninstalling...")
-		_, err = run(ctx, host, k3s.UninstallScript(k3s.RoleOf(n.ControlPlane)), "")
+		_, err = run(ctx, host, uninstallScript(k3s.RoleOf(n.ControlPlane)), "")
 		host.Close()
 		if err != nil {
 			return fmt.Errorf("uninstalling from %s: %w; run node-remove again", name, err)

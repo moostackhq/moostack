@@ -45,7 +45,6 @@ import (
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
-// testHostKey is a new host key.
 func testHostKey(t *testing.T) ssh.PublicKey {
 	t.Helper()
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
@@ -119,21 +118,21 @@ type fakeCluster struct {
 	servicesDown, servicesComeUp bool
 }
 
-// fakeKubeNode is a Kubernetes node.
 type fakeKubeNode struct {
 	ip, arch string
 }
 
-// fakeNode is a host.
 type fakeNode struct {
-	target      string
-	key         ssh.PublicKey
-	arch        string
-	memMiB      int
-	addrs       []string
-	routes      []string
-	k3s         bool
-	server      bool
+	target string
+	key    ssh.PublicKey
+	arch   string
+	memMiB int
+	addrs  []string
+	routes []string
+	k3s    bool
+	server bool
+	// zot says zot is installed.
+	zot         bool
 	version     string
 	files       map[string]string
 	unreachable bool
@@ -257,7 +256,22 @@ func (f *fakeConn) RunStoppable(ctx context.Context, cmd string) (sshclient.Resu
 	return f.Run(ctx, cmd, nil)
 }
 
-// hostsOf are the hosts of a map.
+// left is what an uninstall left on n, empty if nothing.
+func left(n *fakeNode) string {
+	var has []string
+	for path := range n.files {
+		has = append(has, path)
+	}
+	sort.Strings(has)
+	if n.k3s {
+		has = append(has, "k3s")
+	}
+	if n.zot {
+		has = append(has, "zot")
+	}
+	return strings.Join(has, " ")
+}
+
 func hostsOf(hosts map[string]*fakeNode) []*fakeNode {
 	var out []*fakeNode
 	for _, h := range hosts {
@@ -421,8 +435,8 @@ func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclien
 		return ok("pod/web-1\n")
 	case strings.HasPrefix(cmd, "mkdir -p "):
 		return ok("")
-	case cmd == k3s.AppliedCommitScript:
-		return ok(n.files[k3s.AppliedCommitFile])
+	case cmd == AppliedCommitScript:
+		return ok(n.files[AppliedCommitFile])
 	case cmd == k3s.NodeNamesScript:
 		var out []string
 		for name := range c.nodes {
@@ -440,6 +454,7 @@ func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclien
 	case cmd == "cat "+k3s.AgentTokenFile:
 		return ok("K10agent::node:token\n")
 	case strings.Contains(cmd, "zot serve"):
+		n.zot = true
 		return ok("")
 	case cmd == k3s.StartScript:
 		if n.failStart {
@@ -466,8 +481,16 @@ func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclien
 		}
 		return fail(1, name+" isn't Ready at "+ip+" after 10 minutes")
 	case strings.Contains(cmd, "uninstall.sh"):
+		// The files under k3s's directory go, and those the script names.
 		n.k3s = false
-		n.files = map[string]string{}
+		for path := range n.files {
+			if strings.HasPrefix(path, "/var/lib/rancher/k3s/") || strings.Contains(cmd, " "+path) {
+				delete(n.files, path)
+			}
+		}
+		if strings.Contains(cmd, "systemctl disable --now moostack-zot.service") && strings.Contains(cmd, "rm -rf /var/lib/zot /var/lib/private/zot") {
+			n.zot = false
+		}
 		if n.server {
 			c.nodes = map[string]fakeKubeNode{}
 		}

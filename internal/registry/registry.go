@@ -1,5 +1,7 @@
-// Package registry pushes an app's built images, as OCI image layouts,
-// one per architecture, to the cluster's registry as one image index.
+// Package registry is the cluster's registry: its name and port, the
+// scripts that install and remove zot on the control plane, and the push
+// of an app's built images, as OCI image layouts, one per architecture,
+// as one image index.
 package registry
 
 import (

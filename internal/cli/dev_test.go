@@ -17,6 +17,7 @@ import (
 	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
 
 	"github.com/moostackhq/moostack/internal/k3s"
+	"github.com/moostackhq/moostack/internal/registry"
 )
 
 // These tests compile the console with the go command and build its
@@ -86,17 +87,17 @@ func TestDevConsoleDeployRunsTheCheckoutsConsoleOnTheCluster(t *testing.T) {
 		t.Fatalf("the image deployed, %s, is the release's", digest)
 	}
 	tags, _ := consoleImage(t, c, "amd64")
-	if !slices.Contains(tags, digest) || !slices.Contains(tags, k3s.LiveTag) {
+	if !slices.Contains(tags, digest) || !slices.Contains(tags, registry.LiveTag) {
 		t.Errorf("the registry's tags are %q, want %s among them", tags, digest)
 	}
 	objects := c.hosts["root@h1"].files[k3s.AutoDeployFile("console")]
-	if !strings.Contains(objects, "image: "+k3s.ConsoleImage(digest)+"\n") {
+	if !strings.Contains(objects, "image: "+registry.Image(k3s.ConsoleRepository, digest)+"\n") {
 		t.Errorf("the console's objects don't run the new image:\n%s", objects)
 	}
 	if mode := consoleFileMode(t, c, digest); mode != 0o755 {
 		t.Errorf("the console in the image has the mode %o, want 755, which the image's user can run", mode)
 	}
-	if c.consoleSeen != k3s.ConsoleImage(digest) {
+	if c.consoleSeen != registry.Image(k3s.ConsoleRepository, digest) {
 		t.Errorf("deploy ended when it had seen the console run %s", c.consoleSeen)
 	}
 	if left, _ := filepath.Glob(filepath.Join(os.Getenv("TMPDIR"), "mooctl-*")); len(left) != 0 {
@@ -201,12 +202,12 @@ func TestADevConsoleThatDoesntGetReadyLeavesTheOneThatRunsMarked(t *testing.T) {
 		t.Fatalf("deploy of a console that doesn't get ready: %v\n%s", err, out)
 	}
 	repo, _ := name.NewRepository(c.registry+"/"+k3s.ConsoleRepository, name.Insecure)
-	live, err := ggcrremote.Head(repo.Tag(k3s.LiveTag))
+	live, err := ggcrremote.Head(repo.Tag(registry.LiveTag))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if live.Digest.Hex != released[0] {
-		t.Errorf("%s marks %s, want the console that still runs, %s", k3s.LiveTag, live.Digest.Hex, released[0])
+		t.Errorf("%s marks %s, want the console that still runs, %s", registry.LiveTag, live.Digest.Hex, released[0])
 	}
 }
 

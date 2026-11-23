@@ -19,20 +19,10 @@ const (
 	// AgentTokenFile holds, on the control plane, the token that nodes
 	// join it with, which can't join a server.
 	AgentTokenFile = "/var/lib/rancher/k3s/server/agent-token"
-	// AppliedCommitFile holds, on the control plane, the commit of the
-	// cluster directory the cluster last applied.
-	AppliedCommitFile = "/var/lib/moostack/applied-commit"
 	// KubeletDropIn is the kubelet config drop-in that reserves memory
 	// for the system and k3s, beside k3s's own 00-k3s-defaults.conf.
 	KubeletDropIn = "/var/lib/rancher/k3s/agent/etc/kubelet.conf.d/10-moostack.conf"
 )
-
-// Registry is the registry name that nodes pull the cluster's own app
-// images from, mirrored to zot.
-const Registry = "moostack.local"
-
-// RegistryPort is zot's port on the control plane's private address.
-const RegistryPort = 5000
 
 // installScriptSHA256 are the checksums of k3s's install script, by k3s
 // version.
@@ -124,13 +114,13 @@ func AgentConfig(n Node, server netip.Addr, token string) string {
 	}, n))
 }
 
-// Registries is the registry config that mirrors Registry to zot on the
-// control plane at controlPlane.
-func Registries(controlPlane netip.Addr) string {
+// Registries is the registry config that mirrors the registry called
+// name to the one at addr.
+func Registries(name string, addr netip.AddrPort) string {
 	return marshal(map[string]any{
 		"mirrors": map[string]any{
-			Registry: map[string]any{
-				"endpoint": []string{"http://" + netip.AddrPortFrom(controlPlane, RegistryPort).String()},
+			name: map[string]any{
+				"endpoint": []string{"http://" + addr.String()},
 			},
 		},
 	})
@@ -161,6 +151,15 @@ echo "%s  $script" | sha256sum -c --quiet
 INSTALL_K3S_VERSION=%s INSTALL_K3S_EXEC=%s INSTALL_K3S_SKIP_START=%t sh "$script"`,
 		downloadLimits, sshclient.ShellQuote("https://raw.githubusercontent.com/k3s-io/k3s/"+version+"/install.sh"), sum, sshclient.ShellQuote(version), role.exec, !role.ControlPlane), nil
 }
+
+// DownloadedScript waits until k3s's install has downloaded k3s, or no
+// install runs, or a minute has passed.
+const DownloadedScript = `i=0
+until [ -e /usr/local/bin/k3s ] || [ "$i" -ge 300 ]; do
+	[ "$i" -ge 10 ] && ! pgrep -f 'INSTALL_K3[S]_EXEC' >/dev/null && break
+	i=$((i + 1))
+	sleep 0.2
+done`
 
 // StartScript starts k3s on a node that joins the control plane, waits
 // until it has started, and prints its last log lines if it fails to.
@@ -200,51 +199,26 @@ func ReachScript(addr netip.Addr) string {
 }`, api)
 }
 
-// UninstallScript removes k3s from a node of role, and the files mooctl
-// wrote there, after waiting up to a minute for an install still running
-// to end, and fails if k3s's own uninstall script fails.
+// UninstallScript removes k3s from a node of role, and the files of
+// Written.Files, after waiting up to a minute for an install still
+// running to end, and fails if k3s's own uninstall script fails.
 func UninstallScript(role Role) string {
-	// The quotes keep the script's own command line from matching the
-	// pgrep pattern below.
-	files := []string{ConfigFile, RegistriesFile, DropIn(role), KubeletDropIn, `/usr/local/bin/zot.downloa"d"`}
+	files := []string{ConfigFile, RegistriesFile, DropIn(role), KubeletDropIn}
 	dirs := []string{"/etc/rancher/k3s", "/etc/systemd/system/" + role.service + ".service.d"}
-	extra := ""
 	if role.ControlPlane {
-		files = append(files, "/usr/local/bin/zot", zotConfig, "/etc/systemd/system/"+ZotUnit, AppliedCommitFile,
-			AutoDeployFile("traefik-config"), AutoDeployFile("cert-manager"), AutoDeployFile("issuer"))
-		dirs = append(dirs, "/etc/moostack", "/var/lib/moostack")
-		extra = fmt.Sprintf("systemctl disable --now %s 2>/dev/null\nrm -rf /var/lib/zot /var/lib/private/zot\n", ZotUnit)
+		files = append(files, AutoDeployFile("traefik-config"), AutoDeployFile("cert-manager"), AutoDeployFile("issuer"))
 	}
 	return fmt.Sprintf(`for i in $(seq 60); do
-	pgrep -f 'INSTALL_K3[S]_EXEC|zot[.]downloa[d]' >/dev/null || break
+	pgrep -f 'INSTALL_K3[S]_EXEC' >/dev/null || break
 	sleep 1
 done
 s=0
 if [ -x /usr/local/bin/%[1]s ]; then /usr/local/bin/%[1]s || s=$?; fi
-%[2]srm -f %[3]s
-for d in %[4]s; do rmdir "$d" 2>/dev/null; done
+rm -f %[2]s
+for d in %[3]s; do rmdir "$d" 2>/dev/null; done
 systemctl daemon-reload
-exit $s`, role.uninstall, extra, strings.Join(files, " "), strings.Join(dirs, " "))
+exit $s`, role.uninstall, strings.Join(files, " "), strings.Join(dirs, " "))
 }
-
-// LockScript holds the operation lock, printing LockReady once it has it,
-// until its stdin closes or no line has come on it for 45 seconds.
-const LockScript = `mkdir -p /run/moostack
-exec 9>>/run/moostack/operation.lock
-flock -n 9 || {
-	echo "another mooctl operation is running on this cluster; wait for it to finish" >&2
-	exit 1
-}
-echo ` + LockReady + `
-while timeout 45 sh -c 'IFS= read -r _' 9>&-; do :; done`
-
-// LockReady is what LockScript prints once it holds the lock.
-const LockReady = "operation-lock-held"
-
-// AppliedCommitScript prints the commit the cluster last applied, nothing
-// if it has applied none, or "empty" if its file is empty, and fails if
-// the file can't be read.
-const AppliedCommitScript = `if [ -e ` + AppliedCommitFile + ` ]; then c=$(cat ` + AppliedCommitFile + `) || exit 1; echo "${c:-empty}"; fi`
 
 // File is a file mooctl writes on a node.
 type File struct {
@@ -263,6 +237,10 @@ type Written struct {
 	ControlPlane netip.Addr
 	// Token is the token nodes join with.
 	Token string
+	// Registry is the name of the cluster's registry, and RegistryPort
+	// its port on the control plane.
+	Registry     string
+	RegistryPort uint16
 	// Email is the ACME account's email, empty for a self-signed issuer.
 	Email string
 }
@@ -275,7 +253,7 @@ func (w Written) Files() []File {
 	}
 	files := []File{
 		{ConfigFile, config},
-		{RegistriesFile, Registries(w.ControlPlane)},
+		{RegistriesFile, Registries(w.Registry, netip.AddrPortFrom(w.ControlPlane, w.RegistryPort))},
 		{DropIn(w.Role), MemoryDropIn(w.GOGC, w.GOMEMLIMIT)},
 		{KubeletDropIn, KubeletConfig(w.MemoryMiB, w.Role)},
 	}

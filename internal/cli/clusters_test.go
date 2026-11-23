@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/moostackhq/moostack/internal/k3s"
 	"github.com/moostackhq/moostack/internal/terminal"
 )
 
@@ -131,6 +130,11 @@ func TestClusterRemoveUninstallsEveryNodeAndDeletesTheDirectory(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	for _, h := range []string{"root@h1", "root@h2"} {
+		if l := left(c.hosts[h]); l != "" {
+			t.Errorf("%s still has %s", h, l)
 		}
 	}
 	if strings.Contains(out, "remote") {
@@ -397,7 +401,7 @@ func teammateAddsNode2(t *testing.T, c *fakeCluster, home string) string {
 func TestClusterRemoveTakesTheNodesFromTheRemote(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
-	c.hosts["root@h1"].files[k3s.AppliedCommitFile] = teammateAddsNode2(t, c, home) + "\n"
+	c.hosts["root@h1"].files[AppliedCommitFile] = teammateAddsNode2(t, c, home) + "\n"
 	out, err := typing(t, c, home, []string{"prod"}, "cluster", "remove", "prod")
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
@@ -414,7 +418,7 @@ func TestClusterRemoveRefusesACommitTheDirectoryLacks(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	dir := prodDir(t, home).Path
-	c.hosts["root@h1"].files[k3s.AppliedCommitFile] = strings.Repeat("ab", 20) + "\n"
+	c.hosts["root@h1"].files[AppliedCommitFile] = strings.Repeat("ab", 20) + "\n"
 	out, err := typing(t, c, home, []string{"prod"}, "cluster", "remove", "prod")
 	if err == nil || !strings.Contains(err.Error(), "another machine changed the cluster") {
 		t.Errorf("remove = %v\n%s", err, out)

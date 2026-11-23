@@ -12,7 +12,6 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/moostackhq/moostack/internal/clusterdir"
-	"github.com/moostackhq/moostack/internal/k3s"
 	"github.com/moostackhq/moostack/internal/sshclient"
 	"github.com/moostackhq/moostack/internal/sshconfig"
 )
@@ -29,11 +28,10 @@ type remote interface {
 	Close() error
 }
 
-// sshRemote is a remote over SSH.
 type sshRemote struct{ *sshclient.Client }
 
 func (r sshRemote) Lock(ctx context.Context) (held, error) {
-	h, err := r.Hold(ctx, k3s.LockScript, k3s.LockReady)
+	h, err := r.Hold(ctx, LockScript, LockReady)
 	if err != nil {
 		return nil, err
 	}
