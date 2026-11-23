@@ -65,7 +65,7 @@ func ociArchive(t *testing.T, path string) {
 }
 
 // fakeDocker is a docker command on the containerd image store that
-// builds by copying an archive of its own for the platform asked, and
+// builds by extracting an archive of its own for the platform asked, and
 // logs the platforms it built for in dir's builds.
 func fakeDocker(t *testing.T) (path, dir string) {
 	t.Helper()
@@ -89,7 +89,7 @@ buildx)
 		shift
 	done
 	echo "$arch" >> "$fake/builds"
-	cp "$fake/$arch.tar" "$dest"
+	mkdir "$dest" && tar -xf "$fake/$arch.tar" -C "$dest"
 	;;
 esac
 `

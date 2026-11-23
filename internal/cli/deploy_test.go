@@ -302,3 +302,22 @@ func TestDeployAndRemoveWaitForNoOtherOperation(t *testing.T) {
 		t.Error("deploy kept the lock")
 	}
 }
+
+func TestPushBarFillsWithThePush(t *testing.T) {
+	for _, c := range []struct {
+		complete, total int64
+		want            string
+	}{
+		{0, 0, "[--------------------] 0/0 MB"},
+		{0, 218_400_000, "[--------------------] 0/218 MB"},
+		{98_000_000, 218_400_000, "[########------------] 98/218 MB"},
+		{218_399_999, 218_400_000, "[###################-] 218/218 MB"},
+		{218_400_000, 218_400_000, "[####################] 218/218 MB"},
+		{300_000_000, 218_400_000, "[####################] 218/218 MB"},
+		{-5, 218_400_000, "[--------------------] 0/218 MB"},
+	} {
+		if got := pushBar(c.complete, c.total); got != c.want {
+			t.Errorf("pushBar(%d, %d) = %q, not %q", c.complete, c.total, got, c.want)
+		}
+	}
+}

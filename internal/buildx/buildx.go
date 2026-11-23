@@ -1,7 +1,7 @@
 // Package buildx builds an app's image on the operator's machine with
-// the docker buildx CLI, into an OCI image layout archive that a node
-// imports. It checks that Docker is there and can write such an
-// archive, and says what to install or switch if not.
+// the docker buildx CLI, into an OCI image layout. It checks that Docker
+// is there and can write such a layout, and says what to install or
+// switch if not.
 package buildx
 
 import (
@@ -88,7 +88,7 @@ func (d Docker) Check(ctx context.Context) (Daemon, error) {
 	case err != nil || n < minEngine:
 		return Daemon{}, fmt.Errorf("Docker is %s, whose builds aren't reproducible; update it to Docker Engine %d or later, or Docker Desktop 4.29 or later", version, minEngine)
 	case store != imageStore:
-		return Daemon{}, errors.New(`Docker keeps its images in its classic image store, from which buildx can't write an image's archive; switch it to the containerd image store: set "features": {"containerd-snapshotter": true} in Docker Engine's daemon.json and restart Docker, or turn on "Use containerd for pulling and storing images" in Docker Desktop's settings`)
+		return Daemon{}, errors.New(`Docker keeps its images in its classic image store, from which buildx can't write an image's layout; switch it to the containerd image store: set "features": {"containerd-snapshotter": true} in Docker Engine's daemon.json and restart Docker, or turn on "Use containerd for pulling and storing images" in Docker Desktop's settings`)
 	}
 	if _, err := d.ask(ctx, path, "buildx", "version"); err != nil {
 		var failed *failedError
@@ -166,8 +166,8 @@ func (e *failedError) Error() string { return e.err.Error() }
 
 // Build builds the image of the build context at dir, from the
 // Dockerfile at its root, for linux on arch, such as amd64, tagged tag,
-// into an OCI image layout archive at dest. The archive holds the image
-// alone, without attestations. The build is reproducible: its
+// into an OCI image layout, the directory dest. The layout holds the
+// image alone, without attestations. The build is reproducible: its
 // times are the epoch's, so that the same source builds the same image,
 // of the same digest, on any machine and with any cache. buildx's
 // progress and errors go to Output, as plain text. A build that fails,
@@ -202,7 +202,7 @@ func (d Docker) BuildFile(ctx context.Context, dir, file string, buildArgs map[s
 		"--progress=plain",
 		"--build-arg", "SOURCE_DATE_EPOCH=0",
 		"--tag", tag,
-		"--output", csvLine("type=oci", "dest="+dest, "rewrite-timestamp=true"),
+		"--output", csvLine("type=oci", "dest="+dest, "tar=false", "rewrite-timestamp=true"),
 		"--", dir)...)
 	out := d.Output
 	if out == nil {

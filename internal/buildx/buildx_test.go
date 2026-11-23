@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -49,9 +50,9 @@ func static(t *testing.T) string {
 	return buildContext(t, "FROM scratch\nCOPY hello /hello\n", map[string][]byte{"hello": []byte("hello\n")})
 }
 
-// archive is what the OCI image layout archive at path holds: its
+// imageLayout is what the OCI image layout at path holds: its
 // index's manifests, and the platform of the config of its first.
-type archive struct {
+type imageLayout struct {
 	manifests []struct {
 		MediaType   string            `json:"mediaType"`
 		Digest      string            `json:"digest"`
@@ -60,41 +61,40 @@ type archive struct {
 	architecture, os string
 }
 
-func readArchive(t *testing.T, path string) archive {
+// layoutFiles are the files of the OCI image layout at path, by their
+// path in it.
+func layoutFiles(t *testing.T, path string) map[string][]byte {
 	t.Helper()
-	blobs := map[string][]byte{}
-	f, err := os.Open(path)
+	files := map[string][]byte{}
+	err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(path, p)
+		files[filepath.ToSlash(rel)], err = os.ReadFile(p)
+		return err
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	r := tar.NewReader(f)
-	for {
-		h, err := r.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := io.ReadAll(r)
-		if err != nil {
-			t.Fatal(err)
-		}
-		blobs[h.Name] = data
-	}
-	var a archive
+	return files
+}
+
+func readLayout(t *testing.T, path string) imageLayout {
+	t.Helper()
+	blobs := layoutFiles(t, path)
+	var a imageLayout
 	var index struct{ Manifests json.RawMessage }
 	if err := json.Unmarshal(blobs["index.json"], &index); err != nil {
-		t.Fatalf("the archive's index.json: %v", err)
+		t.Fatalf("the layout's index.json: %v", err)
 	}
 	if err := json.Unmarshal(index.Manifests, &a.manifests); err != nil || len(a.manifests) == 0 {
-		t.Fatalf("the archive's index lists %s: %v", index.Manifests, err)
+		t.Fatalf("the layout's index lists %s: %v", index.Manifests, err)
 	}
 	blob := func(digest string) []byte {
 		data, ok := blobs["blobs/"+strings.Replace(digest, ":", "/", 1)]
 		if !ok {
-			t.Fatalf("the archive has no blob %s", digest)
+			t.Fatalf("the layout has no blob %s", digest)
 		}
 		return data
 	}
@@ -111,12 +111,12 @@ func readArchive(t *testing.T, path string) archive {
 }
 
 // build builds the context at dir for arch, tagged tag, with docker,
-// and returns the archive's path and what buildx printed.
+// and returns the layout's path and what buildx printed.
 func build(t *testing.T, docker buildx.Docker, dir, tag, arch string) (string, string, error) {
 	t.Helper()
 	var out bytes.Buffer
 	docker.Output = &out
-	dest := filepath.Join(t.TempDir(), "image.tar")
+	dest := filepath.Join(t.TempDir(), "image")
 	err := docker.Build(t.Context(), dir, tag, arch, dest)
 	return dest, out.String(), err
 }
@@ -132,12 +132,12 @@ func TestABuildIsOneImageForTheArchitectureTaggedWithoutAttestations(t *testing.
 	if err != nil {
 		t.Fatalf("Build: %v\n%s", err, out)
 	}
-	a := readArchive(t, dest)
+	a := readLayout(t, dest)
 	if len(a.manifests) != 1 || a.manifests[0].MediaType != "application/vnd.oci.image.manifest.v1+json" {
-		t.Fatalf("the archive's index lists %+v, want one image manifest and no attestation", a.manifests)
+		t.Fatalf("the layout's index lists %+v, want one image manifest and no attestation", a.manifests)
 	}
 	if name := a.manifests[0].Annotations["io.containerd.image.name"]; name != "moostack.local/web:20261026T120000Z" {
-		t.Errorf("the archive names its image %q, want the tag", name)
+		t.Errorf("the layout names its image %q, want the tag", name)
 	}
 	if a.architecture != "amd64" || a.os != "linux" {
 		t.Errorf("the image is for %s/%s, want linux/amd64", a.os, a.architecture)
@@ -157,7 +157,7 @@ func TestBuildingAgainUnchangedMakesTheSameImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, b := readArchive(t, first).manifests[0].Digest, readArchive(t, second).manifests[0].Digest; a != b {
+	if a, b := readLayout(t, first).manifests[0].Digest, readLayout(t, second).manifests[0].Digest; a != b {
 		t.Errorf("an unchanged context built as %s, then as %s", a, b)
 	}
 }
@@ -177,8 +177,8 @@ func TestABuildContextIsTakenRelativeToTheWorkingDirectoryAndOutsideIt(t *testin
 	if err != nil {
 		t.Fatalf("Build of %s: %v\n%s", rel, err, out)
 	}
-	if a := readArchive(t, dest); len(a.manifests) != 1 {
-		t.Errorf("the archive's index lists %+v", a.manifests)
+	if a := readLayout(t, dest); len(a.manifests) != 1 {
+		t.Errorf("the layout's index lists %+v", a.manifests)
 	}
 }
 
@@ -242,8 +242,8 @@ func TestAnArm64BuildRunsItsStepsUnderQEMU(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build for arm64: %v\n%s", err, out)
 	}
-	if a := readArchive(t, dest); len(a.manifests) != 1 || a.architecture != "arm64" || a.os != "linux" {
-		t.Errorf("the archive lists %+v, for %s/%s, want one image for linux/arm64", a.manifests, a.os, a.architecture)
+	if a := readLayout(t, dest); len(a.manifests) != 1 || a.architecture != "arm64" || a.os != "linux" {
+		t.Errorf("the layout lists %+v, for %s/%s, want one image for linux/arm64", a.manifests, a.os, a.architecture)
 	}
 }
 
@@ -252,7 +252,7 @@ func TestABuildStoppedEndsBuildx(t *testing.T) {
 	errStopped := errors.New("stopped")
 	ctx, cancel := context.WithCancelCause(t.Context())
 	cancel(errStopped)
-	err := buildx.Docker{}.Build(ctx, dir, "moostack.local/web:1", "amd64", filepath.Join(t.TempDir(), "image.tar"))
+	err := buildx.Docker{}.Build(ctx, dir, "moostack.local/web:1", "amd64", filepath.Join(t.TempDir(), "image"))
 	var e *buildx.BuildError
 	if !errors.As(err, &e) || !errors.Is(err, errStopped) {
 		t.Errorf("a stopped Build = %v, want a *BuildError for the stop", err)
@@ -355,7 +355,7 @@ func TestABuildStoppedEndsWithWhatItStarted(t *testing.T) {
 	out := &signalWriter{Buffer: &bytes.Buffer{}, wrote: make(chan struct{}, 1)}
 	done := make(chan error, 1)
 	go func() {
-		done <- buildx.Docker{Path: docker, Output: out}.Build(ctx, static(t), "moostack.local/web:1", "amd64", filepath.Join(dir, "image.tar"))
+		done <- buildx.Docker{Path: docker, Output: out}.Build(ctx, static(t), "moostack.local/web:1", "amd64", filepath.Join(dir, "image"))
 	}()
 	<-out.wrote
 	cancel()
@@ -467,19 +467,19 @@ func TestABuildxThatFailsSilentlySaysToInstallIt(t *testing.T) {
 	}
 }
 
-// The archive's path may hold a comma or a quote, as $TMPDIR may.
-func TestAnArchivePathWithACommaOrAQuoteIsWritten(t *testing.T) {
+// The layout's path may hold a comma or a quote, as $TMPDIR may.
+func TestALayoutPathWithACommaOrAQuoteIsWritten(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), `a,b"c`)
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	dest := filepath.Join(dir, "image.tar")
+	dest := filepath.Join(dir, "image")
 	var out bytes.Buffer
 	if err := (buildx.Docker{Output: &out}).Build(t.Context(), static(t), "moostack.local/web:1", "amd64", dest); err != nil {
 		t.Fatalf("Build to %s: %v\n%s", dest, err, out.String())
 	}
-	if a := readArchive(t, dest); len(a.manifests) != 1 {
-		t.Errorf("the archive lists %+v", a.manifests)
+	if a := readLayout(t, dest); len(a.manifests) != 1 {
+		t.Errorf("the layout lists %+v", a.manifests)
 	}
 }
 
@@ -534,31 +534,11 @@ func TestBuildxShowsItsProgressWhateverBUILDKIT_PROGRESSSays(t *testing.T) {
 	}
 }
 
-// imageTimes are the created time of the image in the archive at path,
+// imageTimes are the created time of the image in the layout at path,
 // and the times of the files of its layers, by name.
 func imageTimes(t *testing.T, path string) (string, map[string]time.Time) {
 	t.Helper()
-	blobs := map[string][]byte{}
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	r := tar.NewReader(f)
-	for {
-		h, err := r.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := io.ReadAll(r)
-		if err != nil {
-			t.Fatal(err)
-		}
-		blobs[h.Name] = data
-	}
+	blobs := layoutFiles(t, path)
 	blob := func(digest string) []byte { return blobs["blobs/"+strings.Replace(digest, ":", "/", 1)] }
 	var index struct{ Manifests []struct{ Digest string } }
 	var manifest struct {
@@ -653,7 +633,7 @@ func TestTheBuildRunsOnTheCheckedDockersBuilderWhateverIsSelected(t *testing.T) 
 	defer cancel()
 	var out bytes.Buffer
 	docker.Output = &out
-	if err := docker.Build(ctx, static(t), "moostack.local/web:1", "amd64", filepath.Join(t.TempDir(), "image.tar")); err != nil {
+	if err := docker.Build(ctx, static(t), "moostack.local/web:1", "amd64", filepath.Join(t.TempDir(), "image")); err != nil {
 		t.Errorf("Build with another builder selected: %v\n%s", err, out.String())
 	}
 }
@@ -691,7 +671,7 @@ func TestABuildStoppedKillsWhatIgnoresTheStop(t *testing.T) {
 	out := &signalWriter{Buffer: &bytes.Buffer{}, wrote: make(chan struct{}, 1)}
 	done := make(chan error, 1)
 	go func() {
-		done <- buildx.Docker{Path: docker, Output: out}.Build(ctx, static(t), "moostack.local/web:1", "amd64", filepath.Join(dir, "image.tar"))
+		done <- buildx.Docker{Path: docker, Output: out}.Build(ctx, static(t), "moostack.local/web:1", "amd64", filepath.Join(dir, "image"))
 	}()
 	<-out.wrote
 	cancel()

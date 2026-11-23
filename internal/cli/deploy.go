@@ -19,6 +19,7 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 
 	"github.com/urfave/cli/v3"
@@ -531,21 +532,64 @@ func buildAndPush(ctx context.Context, env Env, repo, label string, build deploy
 		}
 	}
 	tag := k3s.Registry + "/" + repo + ":build"
-	archives := map[string]string{}
+	layouts := map[string]string{}
 	for _, arch := range arches {
 		say(env, "Building %s for linux/%s...", label, arch)
-		dest := filepath.Join(tmp, arch+".tar")
+		dest := filepath.Join(tmp, arch)
 		if err := docker.BuildFile(ctx, buildDir, file, args, tag, arch, dest); err != nil {
 			return "", buildError(label, arch, daemon.Arch, err)
 		}
-		archives[arch] = dest
+		layouts[arch] = dest
 	}
-	say(env, "Pushing %s...", label)
-	digest, err := registry.Push(ctx, archives, registryAddr(cp), repo, cpClient.DialTCP)
+	progress, pushed := pushing(env, label)
+	digest, err := registry.Push(ctx, layouts, registryAddr(cp), repo, cpClient.DialTCP, progress)
+	pushed()
 	if err != nil {
 		return "", err
 	}
 	return k3s.Registry + "/" + repo + "@sha256:" + digest, nil
+}
+
+// pushing says that the image called label is being pushed. Where
+// env.Stderr is a terminal, the progress it returns redraws that line
+// with a bar of the push so far, once the push is a megabyte or more,
+// and pushed ends the line; elsewhere progress is nil.
+func pushing(env Env, label string) (progress func(complete, total int64), pushed func()) {
+	f, ok := env.Stderr.(*os.File)
+	if !ok || !term.IsTerminal(int(f.Fd())) {
+		say(env, "Pushing %s...", label)
+		return nil, func() {}
+	}
+	line := "Pushing " + label + "..."
+	fmt.Fprint(f, line)
+	return func(complete, total int64) {
+		// A push of less than a megabyte has no bar.
+		if total < megabyte {
+			return
+		}
+		next := "Pushing " + label + "... " + pushBar(complete, total)
+		if next == line {
+			return
+		}
+		// Spaces cover what is left of a longer line.
+		fmt.Fprintf(f, "\r%-*s", len(line), next)
+		line = next
+	}, func() { fmt.Fprintln(f) }
+}
+
+// megabyte is the unit a push's progress is told in.
+const megabyte = 1000 * 1000
+
+// pushBar is a bar of complete out of total bytes, 20 wide, with both
+// in megabytes.
+func pushBar(complete, total int64) string {
+	const width = 20
+	complete = max(0, min(complete, total))
+	filled := 0
+	if total > 0 {
+		filled = int(complete * width / total)
+	}
+	return fmt.Sprintf("[%s%s] %d/%d MB", strings.Repeat("#", filled), strings.Repeat("-", width-filled), (complete+megabyte/2)/megabyte, (total+megabyte/2)/megabyte)
 }
 
 // keepRunning marks the images built for a deploy that is ready, image

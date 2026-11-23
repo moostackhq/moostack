@@ -81,7 +81,7 @@ func TestAPushThatStallsMidUploadEnds(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := registry.Push(context.Background(), map[string]string{"amd64": amd}, server.Listener.Addr().String(), "web", dial)
+		_, err := registry.Push(context.Background(), map[string]string{"amd64": amd}, server.Listener.Addr().String(), "web", dial, nil)
 		done <- err
 	}()
 	select {

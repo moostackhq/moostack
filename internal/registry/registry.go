@@ -1,6 +1,5 @@
-// Package registry pushes an app's built images, as OCI image layout
-// archives, one per architecture, to the cluster's registry as one image
-// index.
+// Package registry pushes an app's built images, as OCI image layouts,
+// one per architecture, to the cluster's registry as one image index.
 package registry
 
 import (
@@ -29,18 +28,20 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
-// Push pushes the images in archives, by architecture, as one index
-// named for app, to the registry at host, which dial connects to. It
-// returns the index's tag: its digest's hex.
-func Push(ctx context.Context, archives map[string]string, host, app string, dial Dial) (string, error) {
+// Push pushes the images in layouts, by architecture, each an OCI image
+// layout's directory or an archive of one, as one index named for app, to the registry at host, which dial connects to. It
+// returns the index's tag: its digest's hex. progress, if not nil, is
+// called as the push goes on, with the bytes pushed or found there
+// already, and the bytes of the whole push.
+func Push(ctx context.Context, layouts map[string]string, host, app string, dial Dial, progress func(complete, total int64)) (string, error) {
 	idx := mutate.IndexMediaType(empty.Index, types.OCIImageIndex)
-	arches := make([]string, 0, len(archives))
-	for arch := range archives {
+	arches := make([]string, 0, len(layouts))
+	for arch := range layouts {
 		arches = append(arches, arch)
 	}
 	slices.Sort(arches)
 	for _, arch := range arches {
-		img, err := readArchive(archives[arch], arch)
+		img, err := readLayout(layouts[arch], arch)
 		if err != nil {
 			return "", fmt.Errorf("the linux/%s image: %w", arch, err)
 		}
@@ -58,10 +59,65 @@ func Push(ctx context.Context, archives map[string]string, host, app string, dia
 	if err != nil {
 		return "", err
 	}
-	if err := remote.WriteIndex(ref, idx, remote.WithContext(ctx), remote.WithTransport(httpTransport(dial))); err != nil {
+	opts := []remote.Option{remote.WithContext(ctx), remote.WithTransport(httpTransport(dial))}
+	reported := make(chan struct{})
+	var total int64
+	if progress == nil {
+		close(reported)
+	} else {
+		if total, err = pushSize(idx); err != nil {
+			return "", err
+		}
+		// WriteIndex closes updates when it returns.
+		updates := make(chan v1.Update, 64)
+		opts = append(opts, remote.WithProgress(updates))
+		go func() {
+			defer close(reported)
+			for u := range updates {
+				if u.Error == nil {
+					progress(u.Complete, total)
+				}
+			}
+		}()
+	}
+	err = remote.WriteIndex(ref, idx, opts...)
+	<-reported
+	if err != nil {
 		return "", fmt.Errorf("pushing to the cluster's registry at %s: %w", host, err)
 	}
+	if progress != nil {
+		// An image the registry had already was never counted.
+		progress(total, total)
+	}
 	return tag, nil
+}
+
+// pushSize is the size of idx with its images: its manifests, configs
+// and layers, as stored.
+func pushSize(idx v1.ImageIndex) (int64, error) {
+	total, err := idx.Size()
+	if err != nil {
+		return 0, err
+	}
+	m, err := idx.IndexManifest()
+	if err != nil {
+		return 0, err
+	}
+	for _, d := range m.Manifests {
+		img, err := idx.Image(d.Digest)
+		if err != nil {
+			return 0, err
+		}
+		im, err := img.Manifest()
+		if err != nil {
+			return 0, err
+		}
+		total += d.Size + im.Config.Size
+		for _, l := range im.Layers {
+			total += l.Size
+		}
+	}
+	return total, nil
 }
 
 // Tag gives the image of digest, in the repository repo of the registry
@@ -159,15 +215,21 @@ func removeRepo(repo name.Repository, opts []remote.Option) error {
 	return nil
 }
 
-// readArchive is the image for arch in the OCI image layout archive at
-// path.
-func readArchive(path, arch string) (v1.Image, error) {
-	dir, err := os.MkdirTemp(filepath.Dir(path), "layout-")
+// readLayout is the image for arch in the OCI image layout at path, a
+// directory, or an archive, which it extracts beside itself.
+func readLayout(path, arch string) (v1.Image, error) {
+	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
-	if err := untar(path, dir); err != nil {
-		return nil, err
+	dir := path
+	if !info.IsDir() {
+		if dir, err = os.MkdirTemp(filepath.Dir(path), "layout-"); err != nil {
+			return nil, err
+		}
+		if err := untar(path, dir); err != nil {
+			return nil, err
+		}
 	}
 	idx, err := layout.ImageIndexFromPath(dir)
 	if err != nil {
@@ -206,7 +268,7 @@ func findImage(idx v1.ImageIndex, arch string) (v1.Image, error) {
 	if len(images) == 1 {
 		return idx.Image(images[0])
 	}
-	return nil, errors.New("the archive has no image for it")
+	return nil, errors.New("the layout has no image for it")
 }
 
 // untar extracts the tar at path into dir.

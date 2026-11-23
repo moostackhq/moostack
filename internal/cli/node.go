@@ -337,7 +337,7 @@ func install(ctx context.Context, env Env, d *clusterdir.Dir, cp clusterdir.Node
 // the registry on node, the control plane, at host, and runs it.
 func installConsole(ctx context.Context, env Env, host remote, node clusterdir.Node, console string) error {
 	say(env, "Installing the console...")
-	digest, err := registry.Push(ctx, map[string]string{node.Architecture: console}, registryAddr(node), k3s.ConsoleRepository, host.DialTCP)
+	digest, err := registry.Push(ctx, map[string]string{node.Architecture: console}, registryAddr(node), k3s.ConsoleRepository, host.DialTCP, nil)
 	if err != nil {
 		return fmt.Errorf("the console's image: %w", err)
 	}
