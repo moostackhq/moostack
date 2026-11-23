@@ -27,9 +27,10 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/moostackhq/moostack/internal/console"
+	"github.com/moostackhq/moostack/internal/model"
+	"github.com/moostackhq/moostack/internal/objects"
 	"github.com/moostackhq/moostack/internal/orchestrator"
 	"github.com/moostackhq/moostack/internal/orchestrator/k3s"
-	"github.com/moostackhq/moostack/internal/orchestrator/orchestratortest"
 )
 
 // These tests read a real Kubernetes API: a k3s server with no agent, in
@@ -153,16 +154,31 @@ func backend(t *testing.T) *k3s.Backend {
 	return b
 }
 
-func status(containers []orchestratortest.PodContainer) []corev1.ContainerStatus {
+// container is a container of a pod the tests make, and the state they
+// give it.
+type container struct {
+	name, image string
+	state       state
+}
+
+type state int
+
+const (
+	waiting state = iota
+	running
+	terminated
+)
+
+func status(containers []container) []corev1.ContainerStatus {
 	var out []corev1.ContainerStatus
 	for _, c := range containers {
-		s := corev1.ContainerStatus{Name: c.Name, Image: "resolved.test/" + c.Name, ImageID: "resolved.test/" + c.Name + "@sha256:0000"}
-		switch c.Status {
-		case orchestratortest.Running:
+		s := corev1.ContainerStatus{Name: c.name, Image: "resolved.test/" + c.name, ImageID: "resolved.test/" + c.name + "@sha256:0000"}
+		switch c.state {
+		case running:
 			s.State.Running = &corev1.ContainerStateRunning{StartedAt: metav1.Now()}
-		case orchestratortest.Waiting:
+		case waiting:
 			s.State.Waiting = &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}
-		case orchestratortest.Terminated:
+		case terminated:
 			s.State.Terminated = &corev1.ContainerStateTerminated{ExitCode: 0, Reason: "Completed"}
 		}
 		out = append(out, s)
@@ -207,21 +223,145 @@ func createNamespace(t *testing.T, name string) {
 	}
 }
 
-func setup(t *testing.T, pods []orchestratortest.Pod) orchestrator.Orchestrator {
+// pod creates the pod name in namespace, which it creates too, with
+// containers in their states. app, if not empty, is the app the pod is
+// labelled as of.
+func pod(t *testing.T, namespace, name, app string, containers ...container) {
 	t.Helper()
-	for _, p := range pods {
-		createNamespace(t, p.Namespace)
-		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: p.Name, Namespace: p.Namespace}}
-		for _, c := range p.Containers {
-			pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{Name: c.Name, Image: c.Image})
-		}
-		createPod(t, pod, corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: status(p.Containers)})
+	createNamespace(t, namespace)
+	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
+	if app != "" {
+		p.Labels = map[string]string{objects.AppLabel: app}
 	}
-	return backend(t)
+	for _, c := range containers {
+		p.Spec.Containers = append(p.Spec.Containers, corev1.Container{Name: c.name, Image: c.image})
+	}
+	createPod(t, p, corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: status(containers)})
 }
 
-func TestTheBackendKeepsThePortsPromises(t *testing.T) {
-	orchestratortest.Contract(t, setup)
+// runningOf is what the backend lists as running, cut to the replicas
+// whose names start with prefix.
+func runningOf(t *testing.T, prefix string) []model.Running {
+	t.Helper()
+	all, err := backend(t).Running(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var own []model.Running
+	for _, r := range all {
+		if strings.HasPrefix(r.Replica, prefix) {
+			own = append(own, r)
+		}
+	}
+	return own
+}
+
+func TestARunningContainerIsListedWithItsAppReplicaNameAndImage(t *testing.T) {
+	app := unique("shop")
+	pod(t, app, app+"-web-1", app, container{name: "web", image: "example.test/web:1", state: running})
+	want := []model.Running{{App: app, Replica: app + "-web-1", Container: "web", Image: "example.test/web:1"}}
+	if got := runningOf(t, app); !slices.Equal(got, want) {
+		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestAContainerOfAPodWithoutAnAppsLabelIsTheClustersOwn(t *testing.T) {
+	id := unique("own")
+	pod(t, id, id+"-dns", "", container{name: "dns", image: "example.test/dns:1", state: running})
+	// A namespace's label doesn't make its pods an app's.
+	labelled := unique("labelled")
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: labelled, Labels: map[string]string{objects.AppLabel: labelled}}}
+	if _, err := admin.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	pod(t, labelled, id+"-job", "", container{name: "job", image: "example.test/job:1", state: running})
+	want := []model.Running{
+		{Replica: id + "-dns", Container: "dns", Image: "example.test/dns:1"},
+		{Replica: id + "-job", Container: "job", Image: "example.test/job:1"},
+	}
+	if got := runningOf(t, id); !slices.Equal(got, want) {
+		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestAPodLabelledWithNoAppsNameIsTheClustersOwn(t *testing.T) {
+	id := unique("empty")
+	createNamespace(t, id)
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: id, Namespace: id, Labels: map[string]string{objects.AppLabel: ""}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "example.test/web:1"}}},
+	}
+	createPod(t, p, corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: status([]container{{name: "web", state: running}})})
+	want := []model.Running{{Replica: id, Container: "web", Image: "example.test/web:1"}}
+	if got := runningOf(t, id); !slices.Equal(got, want) {
+		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestARunningContainerThePodDoesntAskForIsListedWithoutAnImage(t *testing.T) {
+	id := unique("stray")
+	createNamespace(t, id)
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: id, Namespace: id},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "example.test/web:1"}}},
+	}
+	createPod(t, p, corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: status([]container{
+		{name: "web", state: running},
+		{name: "other", state: running},
+	})})
+	want := []model.Running{
+		{Replica: id, Container: "other"},
+		{Replica: id, Container: "web", Image: "example.test/web:1"},
+	}
+	if got := runningOf(t, id); !slices.Equal(got, want) {
+		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestTheBackendTakesAnAppsOwnManifestsOrChart(t *testing.T) {
+	if got := backend(t).Can(); got != (orchestrator.Capabilities{KubernetesObjects: true}) {
+		t.Errorf("Can: %+v, want an app's own manifests or chart", got)
+	}
+}
+
+func TestWaitingAndTerminatedContainersAreLeftOut(t *testing.T) {
+	id := unique("states")
+	pod(t, id, id+"-mixed", id,
+		container{name: "up", image: "example.test/up:1", state: running},
+		container{name: "pulling", image: "example.test/pulling:1", state: waiting},
+		container{name: "done", image: "example.test/done:1", state: terminated},
+	)
+	pod(t, id, id+"-pending", id, container{name: "pulling", image: "example.test/pulling:1", state: waiting})
+	pod(t, id+"-idle", id+"-finished", "", container{name: "job", image: "example.test/job:1", state: terminated})
+	want := []model.Running{{App: id, Replica: id + "-mixed", Container: "up", Image: "example.test/up:1"}}
+	if got := runningOf(t, id); !slices.Equal(got, want) {
+		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestContainersAreOrderedByAppThenReplicaThenContainer(t *testing.T) {
+	id := unique("order")
+	one := container{name: "c", image: "example.test/c:1", state: running}
+	// The namespaces sort the other way round than the apps.
+	pod(t, id+"-ns-a", id+"-a", id+"-z", one)
+	pod(t, id+"-ns-b", id+"-b", id+"-m",
+		container{name: "z", image: "example.test/z:1", state: running},
+		container{name: "a", image: "example.test/a:1", state: running},
+	)
+	pod(t, id+"-ns-b", id+"-a2", id+"-m", one)
+	pod(t, id+"-ns-z", id+"-z", "", one)
+	pod(t, id+"-ns-c", id+"-c", id+"-a", one)
+	want := []model.Running{
+		{App: "", Replica: id + "-z", Container: "c", Image: "example.test/c:1"},
+		{App: id + "-a", Replica: id + "-c", Container: "c", Image: "example.test/c:1"},
+		{App: id + "-m", Replica: id + "-a2", Container: "c", Image: "example.test/c:1"},
+		{App: id + "-m", Replica: id + "-b", Container: "a", Image: "example.test/a:1"},
+		{App: id + "-m", Replica: id + "-b", Container: "z", Image: "example.test/z:1"},
+		{App: id + "-z", Replica: id + "-a", Container: "c", Image: "example.test/c:1"},
+	}
+	if got := runningOf(t, id); !slices.Equal(got, want) {
+		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
+	}
 }
 
 func TestRunningInitAndEphemeralContainersAreListed(t *testing.T) {
@@ -230,7 +370,7 @@ func TestRunningInitAndEphemeralContainersAreListed(t *testing.T) {
 	createNamespace(t, ns)
 	always := corev1.ContainerRestartPolicyAlways
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: ns},
+		ObjectMeta: metav1.ObjectMeta{Name: ns, Namespace: ns, Labels: map[string]string{objects.AppLabel: ns}},
 		Spec: corev1.PodSpec{
 			InitContainers: []corev1.Container{
 				{Name: "migrate", Image: "example.test/migrate:1"},
@@ -241,45 +381,35 @@ func TestRunningInitAndEphemeralContainersAreListed(t *testing.T) {
 	}
 	createPod(t, pod, corev1.PodStatus{
 		Phase: corev1.PodRunning,
-		InitContainerStatuses: status([]orchestratortest.PodContainer{
-			{Name: "migrate", Status: orchestratortest.Terminated},
-			{Name: "proxy", Status: orchestratortest.Running},
+		InitContainerStatuses: status([]container{
+			{name: "migrate", state: terminated},
+			{name: "proxy", state: running},
 		}),
-		ContainerStatuses: status([]orchestratortest.PodContainer{{Name: "app", Status: orchestratortest.Running}}),
+		ContainerStatuses: status([]container{{name: "app", state: running}}),
 	})
 	pods := admin.CoreV1().Pods(ns)
-	created, err := pods.Get(ctx, "web", metav1.GetOptions{})
+	created, err := pods.Get(ctx, ns, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	created.Spec.EphemeralContainers = []corev1.EphemeralContainer{{
 		EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug", Image: "example.test/debug:1"},
 	}}
-	created, err = pods.UpdateEphemeralContainers(ctx, "web", created, metav1.UpdateOptions{})
+	created, err = pods.UpdateEphemeralContainers(ctx, ns, created, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	created.Status.EphemeralContainerStatuses = status([]orchestratortest.PodContainer{{Name: "debug", Status: orchestratortest.Running}})
+	created.Status.EphemeralContainerStatuses = status([]container{{name: "debug", state: running}})
 	if _, err := pods.UpdateStatus(ctx, created, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
-	all, err := backend(t).Running(ctx)
-	if err != nil {
-		t.Fatal(err)
+	want := []model.Running{
+		{App: ns, Replica: ns, Container: "app", Image: "example.test/app:1"},
+		{App: ns, Replica: ns, Container: "debug", Image: "example.test/debug:1"},
+		{App: ns, Replica: ns, Container: "proxy", Image: "example.test/proxy:1"},
 	}
-	var got []orchestrator.Container
-	for _, c := range all {
-		if c.Namespace == ns {
-			got = append(got, c)
-		}
-	}
-	want := []orchestrator.Container{
-		{Namespace: ns, Pod: "web", Name: "app", Image: "example.test/app:1"},
-		{Namespace: ns, Pod: "web", Name: "debug", Image: "example.test/debug:1"},
-		{Namespace: ns, Pod: "web", Name: "proxy", Image: "example.test/proxy:1"},
-	}
-	if !slices.Equal(got, want) {
+	if got := runningOf(t, ns); !slices.Equal(got, want) {
 		t.Errorf("Running in %s:\n got %+v\nwant %+v", ns, got, want)
 	}
 }
@@ -292,12 +422,12 @@ func TestPodsBeyondOnePageAreListed(t *testing.T) {
 	ns := unique("pages")
 	createNamespace(t, ns)
 	const count = 501
-	want := make([]orchestrator.Container, count)
+	want := make([]model.Running, count)
 	var wg sync.WaitGroup
 	slots := make(chan struct{}, 16)
 	for i := range count {
-		name := fmt.Sprintf("pod-%03d", i)
-		want[i] = orchestrator.Container{Namespace: ns, Pod: name, Name: "app", Image: "example.test/app:1"}
+		name := fmt.Sprintf("%s-%03d", ns, i)
+		want[i] = model.Running{Replica: name, Container: "app", Image: "example.test/app:1"}
 		wg.Go(func() {
 			slots <- struct{}{}
 			defer func() { <-slots }()
@@ -305,9 +435,7 @@ func TestPodsBeyondOnePageAreListed(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "example.test/app:1"}}},
 			}
-			st := corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: status([]orchestratortest.PodContainer{
-				{Name: "app", Status: orchestratortest.Running},
-			})}
+			st := corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: status([]container{{name: "app", state: running}})}
 			if err := addPod(pod, st); err != nil {
 				t.Error(err)
 			}
@@ -339,14 +467,42 @@ func TestPodsBeyondOnePageAreListed(t *testing.T) {
 	if len(limits) < 2 || slices.ContainsFunc(limits, func(limit string) bool { return limit != "500" }) {
 		t.Errorf("the API was asked with the limits %q, want 2 calls or more, each for 500 pods", limits)
 	}
-	var got []orchestrator.Container
-	for _, c := range all {
-		if c.Namespace == ns {
-			got = append(got, c)
+	var got []model.Running
+	for _, r := range all {
+		if strings.HasPrefix(r.Replica, ns) {
+			got = append(got, r)
 		}
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("Running listed %d of the %d containers in %s", len(got), count, ns)
+	}
+}
+
+func TestAMethodTheBackendDoesntHaveYetSaysSo(t *testing.T) {
+	ctx := context.Background()
+	b := backend(t)
+	_, apps := b.Apps(ctx)
+	_, nodes := b.Nodes(ctx)
+	_, preflight := b.Preflight(ctx, nil, orchestrator.NodeRequest{})
+	_, token := b.ConsoleToken(ctx)
+	for method, err := range map[string]error{
+		"Check":        b.Check(model.App{Name: "shop"}),
+		"Deploy":       b.Deploy(ctx, model.App{Name: "shop"}, func(orchestrator.Step) {}),
+		"Certificate":  b.Certificate(ctx, "shop", "web"),
+		"Remove":       b.Remove(ctx, "shop"),
+		"Logs":         b.Logs(ctx, "shop", orchestrator.LogOptions{}, io.Discard),
+		"Apps":         apps,
+		"Preflight":    preflight,
+		"AddNode":      b.AddNode(ctx, nil, model.Node{}),
+		"RemoveNode":   b.RemoveNode(ctx, "node-1", nil, orchestrator.RemoveOptions{}),
+		"Uninstall":    b.Uninstall(ctx, nil, model.Node{}),
+		"Nodes":        nodes,
+		"RunConsole":   b.RunConsole(ctx, "example.test/console:1", nil),
+		"ConsoleToken": token,
+	} {
+		if want := method + ": the k3s backend can't do this yet"; err == nil || err.Error() != want {
+			t.Errorf("%s: %v, want %q", method, err, want)
+		}
 	}
 }
 
@@ -385,10 +541,10 @@ func TestAnAccountWithoutTheRightToListPodsIsAnError(t *testing.T) {
 }
 
 func TestTheConsolesPageShowsTheCluster(t *testing.T) {
-	ns := unique("page")
-	o := setup(t, []orchestratortest.Pod{{Namespace: ns, Name: "web-1", Containers: []orchestratortest.PodContainer{
-		{Name: "web", Image: "example.test/web:1", Status: orchestratortest.Running},
-	}}})
+	app := unique("page")
+	pod(t, app, app+"-web-1", app, container{name: "web", image: "example.test/web:1", state: running})
+	pod(t, app+"-system", app+"-dns-1", "", container{name: "dns", image: "example.test/dns:1", state: running})
+	o := backend(t)
 	dir, err := os.MkdirTemp("", "console")
 	if err != nil {
 		t.Fatal(err)
@@ -442,7 +598,10 @@ func TestTheConsolesPageShowsTheCluster(t *testing.T) {
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("status %d, want 200:\n%s", res.StatusCode, body)
 	}
-	for _, want := range []string{"<h2>" + ns + "</h2>", "<tr><td>web-1</td><td>web</td><td>example.test/web:1</td></tr>"} {
+	for _, want := range []string{
+		"<h2>" + app + "</h2>", "<tr><td>" + app + "-web-1</td><td>web</td><td>example.test/web:1</td></tr>",
+		"<h2>The cluster's own</h2>", "<tr><td>" + app + "-dns-1</td><td>dns</td><td>example.test/dns:1</td></tr>",
+	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("the page lacks %s:\n%s", want, body)
 		}

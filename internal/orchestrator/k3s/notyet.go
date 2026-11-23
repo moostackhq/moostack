@@ -1,0 +1,57 @@
+package k3s
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/netip"
+
+	"github.com/moostackhq/moostack/internal/model"
+	"github.com/moostackhq/moostack/internal/orchestrator"
+)
+
+// errNotYet is the error of the methods in this file.
+var errNotYet = errors.New("the k3s backend can't do this yet")
+
+func notYet(method string) error { return fmt.Errorf("%s: %w", method, errNotYet) }
+
+func (b *Backend) Check(model.App) error { return notYet("Check") }
+
+func (b *Backend) Deploy(context.Context, model.App, func(orchestrator.Step)) error {
+	return notYet("Deploy")
+}
+
+func (b *Backend) Certificate(context.Context, string, string) error { return notYet("Certificate") }
+
+func (b *Backend) Remove(context.Context, string) error { return notYet("Remove") }
+
+func (b *Backend) Logs(context.Context, string, orchestrator.LogOptions, io.Writer) error {
+	return notYet("Logs")
+}
+
+func (b *Backend) Apps(context.Context) ([]model.AppState, error) { return nil, notYet("Apps") }
+
+func (b *Backend) Preflight(context.Context, orchestrator.Host, orchestrator.NodeRequest) (model.Node, error) {
+	return model.Node{}, notYet("Preflight")
+}
+
+func (b *Backend) AddNode(context.Context, orchestrator.Host, model.Node) error {
+	return notYet("AddNode")
+}
+
+func (b *Backend) RemoveNode(context.Context, string, orchestrator.Host, orchestrator.RemoveOptions) error {
+	return notYet("RemoveNode")
+}
+
+func (b *Backend) Uninstall(context.Context, orchestrator.Host, model.Node) error {
+	return notYet("Uninstall")
+}
+
+func (b *Backend) Nodes(context.Context) ([]model.NodeState, error) { return nil, notYet("Nodes") }
+
+func (b *Backend) RunConsole(context.Context, string, []netip.Addr) error {
+	return notYet("RunConsole")
+}
+
+func (b *Backend) ConsoleToken(context.Context) (string, error) { return "", notYet("ConsoleToken") }

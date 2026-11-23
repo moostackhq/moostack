@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/moostackhq/moostack/internal/console"
+	"github.com/moostackhq/moostack/internal/model"
 	"github.com/moostackhq/moostack/internal/orchestrator"
 )
 
@@ -103,7 +104,7 @@ type gated struct {
 	release chan struct{}
 }
 
-func (g gated) Running(ctx context.Context) ([]orchestrator.Container, error) {
+func (g gated) Running(ctx context.Context) ([]model.Running, error) {
 	select {
 	case <-g.release:
 		return g.Orchestrator.Running(ctx)

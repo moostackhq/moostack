@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/moostackhq/moostack/internal/console"
+	"github.com/moostackhq/moostack/internal/model"
 	"github.com/moostackhq/moostack/internal/orchestrator"
 	"github.com/moostackhq/moostack/internal/orchestrator/orchestratortest"
 )
@@ -23,7 +24,7 @@ func page(t *testing.T, o orchestrator.Orchestrator) (*http.Response, string) {
 	return send(t, c, http.MethodGet, "/console/", newSession(t, c), nil)
 }
 
-func TestThePageListsRunningContainersByNamespace(t *testing.T) {
+func TestThePageListsRunningContainersByAppAndTheClustersOwnLast(t *testing.T) {
 	res, body := page(t, cluster)
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("status %d, want 200", res.StatusCode)
@@ -47,32 +48,59 @@ func TestAClusterWithNothingRunningSaysSo(t *testing.T) {
 	}
 }
 
-func TestEachNamespaceHasOneSection(t *testing.T) {
+func TestEachAppHasOneSectionAndTheClustersOwnContainersOne(t *testing.T) {
 	_, body := page(t, cluster)
-	if got := strings.Count(body, "<section>"); got != 2 {
-		t.Errorf("%d sections for 2 namespaces:\n%s", got, body)
+	if got := strings.Count(body, "<section>"); got != 3 {
+		t.Errorf("%d sections for 2 apps and the cluster's own containers:\n%s", got, body)
 	}
-	if got := strings.Count(body, "<h2>shop</h2>"); got != 1 {
-		t.Errorf("%d headings for shop, want 1:\n%s", got, body)
+	for _, heading := range []string{"<h2>blog</h2>", "<h2>shop</h2>", "<h2>The cluster's own</h2>"} {
+		if got := strings.Count(body, heading); got != 1 {
+			t.Errorf("%d headings %s, want 1:\n%s", got, heading, body)
+		}
+	}
+}
+
+func TestAClusterWithoutAppsHasOnlyItsOwnSection(t *testing.T) {
+	_, body := page(t, &orchestratortest.Fake{Own: []model.Running{{Replica: "dns-1", Container: "dns", Image: "example.test/dns:1"}}})
+	if strings.Count(body, "<section>") != 1 || !strings.Contains(body, "<h2>The cluster's own</h2>") {
+		t.Errorf("the page of a cluster without apps:\n%s", body)
+	}
+}
+
+func TestAClusterWithoutContainersOfItsOwnHasNoSectionForThem(t *testing.T) {
+	f := &orchestratortest.Fake{}
+	if err := f.Deploy(context.Background(), model.App{Name: "shop", Containers: []model.Container{{Name: "web", Image: "example.test/web:1"}}}, func(orchestrator.Step) {}); err != nil {
+		t.Fatal(err)
+	}
+	_, body := page(t, f)
+	if strings.Count(body, "<section>") != 1 || strings.Contains(body, "The cluster") {
+		t.Errorf("the page of a cluster with nothing of its own running:\n%s", body)
 	}
 }
 
 func TestNamesFromTheClusterAreEscaped(t *testing.T) {
-	_, body := page(t, &orchestratortest.Fake{Containers: []orchestrator.Container{
-		{Namespace: "<b>ns</b>", Pod: `"><script>p()</script>`, Name: "<i>c</i>", Image: "<script>alert(1)</script>"},
-	}})
-	for _, raw := range []string{"<b>ns</b>", "<script>", "<i>c</i>"} {
+	f := &orchestratortest.Fake{Own: []model.Running{{Replica: `"><script>p()</script>`, Container: "<i>c</i>", Image: "<script>alert(1)</script>"}}}
+	app := model.App{Name: "<b>app</b>", Containers: []model.Container{{Name: "<u>web</u>", Image: "<script>alert(2)</script>"}}}
+	if err := f.Deploy(context.Background(), app, func(orchestrator.Step) {}); err != nil {
+		t.Fatal(err)
+	}
+	_, body := page(t, f)
+	for _, raw := range []string{"<b>app</b>", "<script>", "<i>c</i>", "<u>web</u>"} {
 		if strings.Contains(body, raw) {
 			t.Errorf("the page holds %s unescaped:\n%s", raw, body)
 		}
 	}
-	if !strings.Contains(body, "&lt;script&gt;alert(1)&lt;/script&gt;") {
-		t.Errorf("the page doesn't show the image's name:\n%s", body)
+	for _, shown := range []string{"&lt;script&gt;alert(1)&lt;/script&gt;", "&lt;script&gt;alert(2)&lt;/script&gt;", "<h2>&lt;b&gt;app&lt;/b&gt;</h2>"} {
+		if !strings.Contains(body, shown) {
+			t.Errorf("the page doesn't show %s:\n%s", shown, body)
+		}
 	}
 }
 
 func TestAClusterThatCantBeReadIsAnErrorPage(t *testing.T) {
-	res, body := page(t, &orchestratortest.Fake{Err: errors.New("dial tcp 10.43.0.1:443: connection refused")})
+	f := &orchestratortest.Fake{}
+	f.Fail("Running", errors.New("dial tcp 10.43.0.1:443: connection refused"))
+	res, body := page(t, f)
 	if res.StatusCode != http.StatusBadGateway {
 		t.Errorf("status %d, want 502", res.StatusCode)
 	}
@@ -88,9 +116,9 @@ func TestAClusterThatCantBeReadIsAnErrorPage(t *testing.T) {
 }
 
 // stalled is a cluster that never answers.
-type stalled struct{}
+type stalled struct{ orchestrator.Orchestrator }
 
-func (stalled) Running(ctx context.Context) ([]orchestrator.Container, error) {
+func (stalled) Running(ctx context.Context) ([]model.Running, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
@@ -155,7 +183,7 @@ type counting struct {
 	reads atomic.Int32
 }
 
-func (c *counting) Running(ctx context.Context) ([]orchestrator.Container, error) {
+func (c *counting) Running(ctx context.Context) ([]model.Running, error) {
 	c.reads.Add(1)
 	return c.Orchestrator.Running(ctx)
 }

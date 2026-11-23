@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/moostackhq/moostack/internal/orchestrator"
+	"github.com/moostackhq/moostack/internal/model"
 )
 
 // readTimeout is how long reading the cluster for a page may take.
@@ -17,9 +17,11 @@ type containersPage struct {
 	Problem string
 }
 
+// containerGroup is the running containers of App, or the cluster's
+// own if App is empty.
 type containerGroup struct {
-	Namespace  string
-	Containers []orchestrator.Container
+	App        string
+	Containers []model.Running
 }
 
 func (c *Console) handleContainers(w http.ResponseWriter, r *http.Request) {
@@ -38,19 +40,22 @@ func (c *Console) handleContainers(w http.ResponseWriter, r *http.Request) {
 		render(w, http.StatusBadGateway, "containers.html", containersPage{Problem: "The cluster can't be read."})
 		return
 	}
-	render(w, http.StatusOK, "containers.html", containersPage{Groups: groupByNamespace(containers)})
+	render(w, http.StatusOK, "containers.html", containersPage{Groups: groupByApp(containers)})
 }
 
-// groupByNamespace splits containers, which are ordered by namespace,
-// into one group per namespace.
-func groupByNamespace(containers []orchestrator.Container) []containerGroup {
+// groupByApp splits containers, which are ordered by app, into one
+// group per app, and one of the cluster's own after them.
+func groupByApp(containers []model.Running) []containerGroup {
 	var groups []containerGroup
 	for _, c := range containers {
-		if len(groups) == 0 || groups[len(groups)-1].Namespace != c.Namespace {
-			groups = append(groups, containerGroup{Namespace: c.Namespace})
+		if len(groups) == 0 || groups[len(groups)-1].App != c.App {
+			groups = append(groups, containerGroup{App: c.App})
 		}
 		last := &groups[len(groups)-1]
 		last.Containers = append(last.Containers, c)
+	}
+	if len(groups) > 0 && groups[0].App == "" {
+		groups = append(groups[1:], groups[0])
 	}
 	return groups
 }

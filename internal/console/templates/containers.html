@@ -16,14 +16,14 @@
 {{- end}}
 {{- range .Groups}}
 <section>
-<h2>{{.Namespace}}</h2>
+<h2>{{if .App}}{{.App}}{{else}}The cluster's own{{end}}</h2>
 <table>
 <thead>
-<tr><th>Pod</th><th>Container</th><th>Image</th></tr>
+<tr><th>Replica</th><th>Container</th><th>Image</th></tr>
 </thead>
 <tbody>
 {{- range .Containers}}
-<tr><td>{{.Pod}}</td><td>{{.Name}}</td><td>{{.Image}}</td></tr>
+<tr><td>{{.Replica}}</td><td>{{.Container}}</td><td>{{.Image}}</td></tr>
 {{- end}}
 </tbody>
 </table>

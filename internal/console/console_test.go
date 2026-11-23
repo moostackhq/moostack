@@ -2,6 +2,7 @@ package console_test
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -16,18 +17,31 @@ import (
 	"testing"
 
 	"github.com/moostackhq/moostack/internal/console"
+	"github.com/moostackhq/moostack/internal/model"
 	"github.com/moostackhq/moostack/internal/orchestrator"
 	"github.com/moostackhq/moostack/internal/orchestrator/orchestratortest"
 )
 
 var update = flag.Bool("update", false, "rewrite the golden files")
 
-var cluster = &orchestratortest.Fake{Containers: []orchestrator.Container{
-	{Namespace: "kube-system", Pod: "coredns-7b98449c4-x2x9v", Name: "coredns", Image: "rancher/mirrored-coredns-coredns:1.12.0"},
-	{Namespace: "shop", Pod: "web-f6dfb8fb4-f9fsd", Name: "web", Image: "registry.moostack.internal:5000/shop/web@sha256:0a1b"},
-	{Namespace: "shop", Pod: "web-f6dfb8fb4-f9fsd", Name: "worker", Image: "registry.moostack.internal:5000/shop/worker@sha256:2c3d"},
-	{Namespace: "shop", Pod: "web-f6dfb8fb4-k2lmn", Name: "web", Image: "registry.moostack.internal:5000/shop/web@sha256:0a1b"},
-}}
+// cluster runs the apps blog and shop, and a container of its own.
+var cluster = func() *orchestratortest.Fake {
+	f := &orchestratortest.Fake{Own: []model.Running{
+		{Replica: "coredns-7b98449c4-x2x9v", Container: "coredns", Image: "rancher/mirrored-coredns-coredns:1.12.0"},
+	}}
+	for _, app := range []model.App{
+		{Name: "shop", Containers: []model.Container{
+			{Name: "web", Image: "registry.moostack.internal:5000/shop/web@sha256:0a1b", Replicas: 2},
+			{Name: "worker", Image: "registry.moostack.internal:5000/shop/worker@sha256:2c3d", Replicas: 1},
+		}},
+		{Name: "blog", Containers: []model.Container{{Name: "web", Image: "registry.moostack.internal:5000/blog/web@sha256:4e5f", Replicas: 1}}},
+	} {
+		if err := f.Deploy(context.Background(), app, func(orchestrator.Step) {}); err != nil {
+			panic(err)
+		}
+	}
+	return f
+}()
 
 // golden compares body with the golden file name in testdata, which
 // -update rewrites.
