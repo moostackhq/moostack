@@ -16,7 +16,6 @@ import (
 	"testing"
 
 	"github.com/moostackhq/moostack/internal/clusterdir"
-	"github.com/moostackhq/moostack/internal/deployfile"
 	"github.com/moostackhq/moostack/internal/k3s"
 	"github.com/moostackhq/moostack/internal/registry"
 )
@@ -564,12 +563,18 @@ func TestAConsoleThatDoesntGetReadyUndoesTheControlPlane(t *testing.T) {
 	}
 }
 
-func TestNoAppCanHaveTheConsolesNamespaceOrItsRepositorysPrefix(t *testing.T) {
+func TestRemovingAnAppNamedAsTheConsolesNamespaceOrItsRepositorysPrefixRemovesNothing(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	before, _ := consoleImage(t, c, "amd64")
 	prefix, _, _ := strings.Cut(k3s.ConsoleRepository, "/")
 	for _, name := range []string{k3s.ConsoleNamespace, prefix} {
-		if err := deployfile.CheckName(name); err == nil {
-			t.Errorf("an app may be named %s, and removing it would remove the console's objects or images", name)
+		if out, err := onFake(t, c, home, "deploy", "--remove", name); err == nil || !strings.Contains(err.Error(), "there is no app "+name) {
+			t.Errorf("deploy --remove %s: %v\n%s", name, err, out)
 		}
+	}
+	if after, _ := consoleImage(t, c, "amd64"); !slices.Equal(after, before) {
+		t.Errorf("the console's images are tagged %q after the removals, and %q before", after, before)
 	}
 }
 

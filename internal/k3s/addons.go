@@ -44,41 +44,6 @@ const certManagerVersion = "v1.21.3"
 // from.
 const Issuer = "moostack"
 
-// servicesCheck defines ready, which succeeds once the cluster's
-// services are ready for apps: the issuer, cert-manager's webhook,
-// Traefik and its ports. Otherwise missing names those that aren't, each
-// followed by a comma.
-const servicesCheck = `available() {
-	n=$(k3s kubectl get "$1" "$3" -n "$2" --request-timeout=20s -o jsonpath="{.status.$4}" 2>/dev/null)
-	[ "${n:-0}" -gt 0 ] 2>/dev/null
-}
-ready() {
-	missing=
-	[ "$(k3s kubectl get clusterissuer ` + Issuer + ` --request-timeout=20s -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ] || missing="$missing the issuer ` + Issuer + `,"
-	available deployment cert-manager cert-manager-webhook availableReplicas || missing="$missing cert-manager's webhook,"
-	available daemonset kube-system traefik numberAvailable || missing="$missing Traefik,"
-	[ -n "$(k3s kubectl get pods -n kube-system -l svccontroller.k3s.cattle.io/svcname=traefik --field-selector=status.phase=Running --request-timeout=20s -o name 2>/dev/null)" ] || missing="$missing Traefik's ports,"
-	[ -z "$missing" ]
-}
-`
-
-// ServicesReadyScript succeeds if the cluster's services are ready for
-// apps, and fails, printing nothing, if not.
-const ServicesReadyScript = servicesCheck + "ready"
-
-// WaitServicesScript waits up to 5 minutes for the cluster's services to
-// be ready for apps, and fails naming those that aren't.
-const WaitServicesScript = servicesCheck + `i=0
-until ready; do
-	i=$((i + 1))
-	if [ "$i" -ge 150 ]; then
-		missing=${missing%,}
-		echo "not ready after 5 minutes:$missing" >&2
-		exit 1
-	fi
-	sleep 2
-done`
-
 // CertManager is the HelmChart that installs cert-manager.
 func CertManager() string {
 	return fmt.Sprintf(`apiVersion: helm.cattle.io/v1

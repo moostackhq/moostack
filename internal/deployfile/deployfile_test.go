@@ -103,8 +103,6 @@ func TestReadRefuses(t *testing.T) {
 	for name, tc := range map[string]struct{ content, want string }{
 		"no name":               {"chart: chart\n", "name:"},
 		"bad name":              {"name: Web\nchart: chart\n", "name:"},
-		"kube- name":            {"name: kube-web\nchart: chart\n", "name:"},
-		"cert-manager":          {"name: cert-manager\nchart: chart\n", "name:"},
 		"bad cluster":           {"cluster: a/b/c\nname: web\nchart: chart\n", "cluster:"},
 		"two builds":            {"name: web\nbuild: {dockerfile: ., railpack: .}\nchart: chart\n", "build: give one of dockerfile and railpack"},
 		"empty build":           {"name: web\nbuild: {}\nchart: chart\n", "build: give one of dockerfile and railpack"},
@@ -132,7 +130,6 @@ func TestReadRefuses(t *testing.T) {
 		"a host without a port": {"name: shop\ncontainers: {web: {image: nginx, host: a.example.com}}\n", "containers: web: host: give the port"},
 		"one host twice":        {"name: shop\ncontainers: {api: {image: a, port: 80, host: a.example.com}, web: {image: b, port: 80, host: a.example.com}}\n", "containers: web: host: a.example.com is api's already"},
 		"negative replicas":     {web + ", replicas: -1}}\n", "containers: web: replicas:"},
-		"the secret's name":     {"name: web-tls\ncontainers: {web: {image: nginx, port: 80, host: a.example.com}}\nsecrets: [A]\n", "containers: web: host:"},
 		"no Chart.yaml":         {"name: web\nchart: deploy\n", "has no Chart.yaml"},
 		"missing manifests":     {"name: web\nmanifests: nowhere\n", "manifests:"},
 		"secret name":           {"name: web\nchart: chart\nsecrets: [db-url]\n", "secrets:"},
@@ -149,6 +146,34 @@ func TestReadRefuses(t *testing.T) {
 				t.Errorf("%v, which doesn't say %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestANameIsCheckedOnlyAsADNSLabelThatStartsWithALetter(t *testing.T) {
+	long := strings.Repeat("a", 63)
+	for _, name := range []string{"a", "web", "web-2", long, "default", "kube-system", "kube-web", "cert-manager", "web-tls"} {
+		if err := deployfile.CheckName(name); err != nil {
+			t.Errorf("CheckName(%q): %v", name, err)
+		}
+		for file, content := range map[string]string{
+			"a chart":               "name: " + name + "\nchart: chart\n",
+			"a host and secrets":    "name: " + name + "\ncontainers: {web: {image: nginx, port: 80, host: a.example.com}}\nsecrets: [A]\n",
+			"a container so named":  "name: shop\ncontainers: {" + name + ": {image: nginx}}\n",
+			"manifests, in ReadRef": "name: " + name + "\nmanifests: deploy\n",
+		} {
+			dir := appDir(t, content)
+			if _, err := deployfile.Read(dir); err != nil {
+				t.Errorf("%s, named %q: %v", file, name, err)
+			}
+			if _, got, err := deployfile.ReadRef(dir); err != nil || file != "a container so named" && got != name {
+				t.Errorf("ReadRef of %s, named %q: %q, %v", file, name, got, err)
+			}
+		}
+	}
+	for _, name := range []string{"", "1web", "-web", "web-", "Web", "we_b", "we.b", "web/api", long + "a"} {
+		if err := deployfile.CheckName(name); err == nil {
+			t.Errorf("CheckName took %q", name)
+		}
 	}
 }
 
@@ -171,10 +196,9 @@ func TestReadTakes(t *testing.T) {
 	}
 }
 
-func TestNamesKubernetesAccepts(t *testing.T) {
+func TestNamesAndAHostsLabelsAreDNSLabels(t *testing.T) {
 	for name, content := range map[string]string{
 		"leading digit":           "name: 1web\nchart: chart\n",
-		"chart name of 47":        "name: " + strings.Repeat("a", 47) + "\nchart: chart\n",
 		"host label of 64":        "name: web\ncontainers: {web: {image: nginx, port: 80, host: " + strings.Repeat("a", 64) + ".example.com}}\n",
 		"container name of 64":    "name: web\ncontainers: {" + strings.Repeat("a", 64) + ": {image: nginx}}\n",
 		"container name's hyphen": "name: web\ncontainers: {web-: {image: nginx}}\n",
@@ -186,7 +210,6 @@ func TestNamesKubernetesAccepts(t *testing.T) {
 		})
 	}
 	for name, content := range map[string]string{
-		"chart name of 46":     "name: " + strings.Repeat("a", 46) + "\nchart: chart\n",
 		"app name of 63":       "name: " + strings.Repeat("a", 63) + "\ncontainers: {web: {image: nginx, port: 80}}\n",
 		"container name of 63": "name: web\ncontainers: {" + strings.Repeat("a", 63) + ": {image: nginx}}\n",
 		"host label of 63":     "name: web\ncontainers: {web: {image: nginx, port: 80, host: " + strings.Repeat("a", 63) + ".example.com}}\n",

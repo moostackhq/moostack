@@ -15,7 +15,6 @@ import (
 	"github.com/moostackhq/moostack/internal/clusterdir"
 	"github.com/moostackhq/moostack/internal/gitrepo"
 	"github.com/moostackhq/moostack/internal/k3s"
-	"github.com/moostackhq/moostack/internal/objects"
 )
 
 // kubeNode is what status reads of a Kubernetes node.
@@ -118,7 +117,7 @@ func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
 			Name string `json:"name"`
 		} `json:"metadata"`
 	}]
-	if err := kubectlJSON(ctx, cpClient, "get namespaces -l "+objects.AppLabel, &namespaces); err != nil {
+	if err := kubectlJSON(ctx, cpClient, "get namespaces -l "+appLabel, &namespaces); err != nil {
 		return err
 	}
 	var objs kubeList[kubeObject]

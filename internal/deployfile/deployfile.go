@@ -25,7 +25,6 @@ const FileName = "deploy.yaml"
 // App is what a deploy file says. Its paths are absolute. One of
 // Containers, Manifests and Chart is set.
 type App struct {
-	// Name is the app's name, and its namespace's.
 	Name string
 	// Cluster is the ref of the cluster the app is deployed to, empty if
 	// the file names none.
@@ -44,14 +43,11 @@ type App struct {
 	Build *Build
 	// Secrets are the names of the secret store's secrets the app gets.
 	Secrets []string
-	// Dir is the app's directory.
-	Dir string
+	Dir     string
 }
 
 // Container is a container an app runs. One of Build and Image is set.
 type Container struct {
-	// Name is the container's name, and that of its Deployment, Service
-	// and Ingress.
 	Name string
 	// Build is how the container's image is built.
 	Build *Build
@@ -62,8 +58,7 @@ type Container struct {
 	Command []string
 	// Port is the port the container listens on, 0 if none.
 	Port int
-	// Host is the host name the ingress serves the container at; none if
-	// empty.
+	// Host is the host name the container is served at; none if empty.
 	Host string
 	// Replicas is how many replicas of the container run.
 	Replicas int
@@ -100,10 +95,6 @@ type file struct {
 	Secrets   []string `yaml:"secrets"`
 }
 
-// reserved are names an app can't have, being namespaces of the
-// cluster's own.
-var reserved = []string{"default", "cert-manager"}
-
 // secretName is what a secret's name may be: an environment variable's
 // name.
 var secretName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -111,22 +102,14 @@ var secretName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // hostName is a DNS name of labels of 1 to 63 characters.
 var hostName = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
-// maxChartName is the longest name of an app with a chart, whose Helm
-// install job is named helm-install-app-<name>, at most 63 characters.
-const maxChartName = 63 - len("helm-install-app-")
-
-// CheckName refuses a name an app can't have: one that isn't a DNS label
-// starting with a letter, or that is a
-// namespace of the cluster's own.
+// CheckName refuses a name an app or a container can't have: one that
+// isn't a DNS label starting with a letter.
 func CheckName(name string) error {
 	if err := clusterdir.CheckName(name); err != nil {
 		return err
 	}
 	if name[0] < 'a' || name[0] > 'z' {
 		return fmt.Errorf("%q must start with a letter", name)
-	}
-	if strings.HasPrefix(name, "kube-") || slices.Contains(reserved, name) {
-		return fmt.Errorf("%q is a namespace of the cluster's own", name)
 	}
 	return nil
 }
@@ -218,7 +201,7 @@ func parse(dir string, data []byte) (*App, error) {
 			if c == nil {
 				return nil, fmt.Errorf("containers: %s: give one of build and image", name)
 			}
-			if err := checkContainerName(name); err != nil {
+			if err := CheckName(name); err != nil {
 				return nil, fmt.Errorf("containers: %w", err)
 			}
 			out := Container{Name: name, Image: c.Image, Command: c.Command, Host: c.Host, Replicas: c.Replicas}
@@ -253,9 +236,6 @@ func parse(dir string, data []byte) (*App, error) {
 					return nil, fmt.Errorf("containers: %s: host: %s is %s's already", name, c.Host, other)
 				}
 				hosts[c.Host] = name
-				if name+"-tls" == f.Name && len(f.Secrets) > 0 {
-					return nil, fmt.Errorf("containers: %s: host: its certificate's Secret would be named as the app's, %s; rename one", name, f.Name)
-				}
 			}
 			if c.Replicas < 0 {
 				return nil, fmt.Errorf("containers: %s: replicas: can't be negative", name)
@@ -278,9 +258,6 @@ func parse(dir string, data []byte) (*App, error) {
 		}
 		if _, err := os.Stat(filepath.Join(d, "Chart.yaml")); err != nil {
 			return nil, fmt.Errorf("chart: %s has no Chart.yaml", d)
-		}
-		if len(f.Name) > maxChartName {
-			return nil, fmt.Errorf("name: %q is longer than %d characters, the most an app with a chart can have", f.Name, maxChartName)
 		}
 		app.Chart = d
 	}
@@ -319,18 +296,6 @@ func readBuild(dir string, b *build) (*Build, error) {
 		}
 		return &Build{Railpack: src}, nil
 	}
-}
-
-// checkContainerName refuses a name a container can't have: one that
-// isn't a DNS label starting with a letter.
-func checkContainerName(name string) error {
-	if err := clusterdir.CheckName(name); err != nil {
-		return err
-	}
-	if name[0] < 'a' || name[0] > 'z' {
-		return fmt.Errorf("%q must start with a letter", name)
-	}
-	return nil
 }
 
 // directory is p, relative to dir, which must be a directory.

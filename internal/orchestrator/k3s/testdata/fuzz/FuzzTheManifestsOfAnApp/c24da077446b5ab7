@@ -1,0 +1,2 @@
+go test fuzz v1
+string("apiVersion: v1\nkind: CoiagnMfp\nmetadata: {name: 0} ")

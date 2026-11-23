@@ -2,14 +2,13 @@ package cli
 
 import (
 	"archive/tar"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
-
-	"gopkg.in/yaml.v3"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -105,6 +104,8 @@ func TestDeployRunsTheBuildByDigestOnEveryArchitecture(t *testing.T) {
 	c, home := deployingProd(t)
 	// A node Kubernetes has that the cluster directory doesn't yet.
 	c.nodes["node9"] = fakeKubeNode{ip: "10.0.0.9", arch: "arm64"}
+	// A node that reports no architecture yet.
+	c.nodes["node10"] = fakeKubeNode{ip: "10.0.0.10"}
 	docker, dir := fakeDocker(t)
 	app := t.TempDir()
 	os.WriteFile(filepath.Join(app, "Dockerfile"), []byte("FROM scratch\n"), 0o644)
@@ -132,33 +133,23 @@ func TestDeployRunsTheBuildByDigestOnEveryArchitecture(t *testing.T) {
 	if !strings.Contains(out.String(), "Image: "+want) {
 		t.Errorf("output:\n%s", out.String())
 	}
-	if !slices.ContainsFunc(c.manifests, func(m string) bool { return strings.Contains(m, "image: "+want) }) {
-		t.Errorf("no object runs %s:\n%s", want, strings.Join(c.manifests, "---\n"))
+	if got := imageOf(t, c, "web"); got != want {
+		t.Errorf("web runs %s, not %s", got, want)
 	}
 }
 
-// imageOf is the image that the Deployment called name runs in the
-// manifests applied to c.
+// imageOf is the image of the container called name of the apps
+// deployed to c.
 func imageOf(t *testing.T, c *fakeCluster, name string) string {
 	t.Helper()
-	for _, m := range c.manifests {
-		for _, doc := range strings.Split(m, "---\n") {
-			var d struct {
-				Kind     string
-				Metadata struct{ Name string }
-				Spec     struct {
-					Template struct {
-						Spec struct{ Containers []struct{ Image string } }
-					}
-				}
+	for _, app := range c.orch.deployed {
+		for _, container := range app.Containers {
+			if container.Name == name {
+				return container.Image
 			}
-			if err := yaml.Unmarshal([]byte(doc), &d); err != nil || d.Kind != "Deployment" || d.Metadata.Name != name {
-				continue
-			}
-			return d.Spec.Template.Spec.Containers[0].Image
 		}
 	}
-	t.Fatalf("no Deployment %s was applied", name)
+	t.Fatalf("no container %s was deployed", name)
 	return ""
 }
 
@@ -208,7 +199,7 @@ containers:
 	}
 	for _, line := range []string{
 		"Building api for linux/amd64...\n", "Pushing api...\n", "Building jobs for linux/amd64...\n", "Pushing jobs...\n",
-		"Deployed shop to prod\nImage: " + api + "\nImage: " + jobs + "\nWarning: api.example.com has no certificate yet: exit 1: the challenge is pending\nURL: https://api.example.com\nURL: https://shop.example.com\n",
+		"Deployed shop to prod\nImage: " + api + "\nImage: " + jobs + "\nWarning: api.example.com has no certificate yet: the challenge is pending\nURL: https://api.example.com\nURL: https://shop.example.com\n",
 	} {
 		if !strings.Contains(out, line) {
 			t.Errorf("no %q in:\n%s", line, out)
@@ -217,13 +208,8 @@ containers:
 	if strings.Contains(out, "Building web") || strings.Contains(out, "Building cache") {
 		t.Errorf("built web or cache:\n%s", out)
 	}
-	for _, cert := range []string{"certificate/api-tls", "certificate/web-tls"} {
-		if !c.ran("root@h1", cert) {
-			t.Errorf("didn't wait for %s", cert)
-		}
-	}
-	if c.ran("root@h1", "certificate/jobs-tls") || c.ran("root@h1", "certificate/cache-tls") || c.ran("root@h1", "certificate/shop-tls") {
-		t.Error("waited for the certificate of a container without a host")
+	if got, want := c.orch.made("Certificate"), []string{"Certificate shop api", "Certificate shop web"}; !slices.Equal(got, want) {
+		t.Errorf("the certificates waited for were %q, want those of the containers with a host, %q", got, want)
 	}
 }
 
@@ -244,7 +230,7 @@ func TestDeployOfImagesOnlyBuildsNothing(t *testing.T) {
 	if strings.Contains(out.String(), "Image:") || strings.Contains(out.String(), "URL:") {
 		t.Errorf("output:\n%s", out.String())
 	}
-	if c.ran("root@h1", "nodeInfo.architecture") {
+	if len(c.orch.made("Nodes")) != 0 {
 		t.Error("asked for the nodes' architectures with nothing to build")
 	}
 }
@@ -340,7 +326,7 @@ func TestTheRegistryKeepsTheImageThatRuns(t *testing.T) {
 	// A deploy whose app doesn't become ready pushes its image and leaves
 	// the mark where it was.
 	ociArchive(t, filepath.Join(dir, "amd64.tar"))
-	c.rolloutFails = true
+	c.orch.Fail("Deploy", errors.New("web isn't ready"))
 	var out strings.Builder
 	env := fakeEnvFor(c, home, nil)
 	env.Stdout, env.Stderr, env.Docker = &out, &out, docker

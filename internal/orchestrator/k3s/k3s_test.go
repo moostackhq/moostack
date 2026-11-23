@@ -22,13 +22,13 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/moostackhq/moostack/internal/console"
 	"github.com/moostackhq/moostack/internal/model"
-	"github.com/moostackhq/moostack/internal/objects"
 	"github.com/moostackhq/moostack/internal/orchestrator"
 	"github.com/moostackhq/moostack/internal/orchestrator/k3s"
 )
@@ -39,10 +39,19 @@ import (
 
 const image = "rancher/k3s:v1.37.2-k3s1"
 
+// appLabel is the label that marks what is an app's.
+const appLabel = "moostack.dev/app"
+
 var (
 	// admin is the cluster's administrator, which sets up what the tests
-	// read.
-	admin *kubernetes.Clientset
+	// read, and adminConfig how it connects.
+	admin       *kubernetes.Clientset
+	adminConfig *rest.Config
+	// kubeconfig is the administrator's kubeconfig, as the control plane
+	// holds it.
+	kubeconfig []byte
+	// objects reads and writes objects of any kind as the administrator.
+	objects dynamic.Interface
 	// reader is how the backend connects: as an account that may only
 	// list pods.
 	reader *rest.Config
@@ -58,6 +67,10 @@ func TestMain(m *testing.M) {
 }
 
 func run(m *testing.M) (int, error) {
+	// A fuzz worker runs a fuzz target alone, which needs no cluster.
+	if slices.Contains(os.Args, "-test.fuzzworker") {
+		return m.Run(), nil
+	}
 	name := fmt.Sprintf("moostack-orchestrator-test-%d", os.Getpid())
 	if out, err := exec.Command("docker", "run", "-d", "--rm", "--name", name, "--memory", "1g", "-p", "127.0.0.1::6443", image,
 		"server", "--disable-agent", "--disable=traefik,servicelb,metrics-server,local-storage,coredns").CombinedOutput(); err != nil {
@@ -71,6 +84,14 @@ func run(m *testing.M) (int, error) {
 		logs, _ := exec.Command("docker", "logs", "--tail", "30", name).CombinedOutput()
 		return 0, fmt.Errorf("%v\n%s", err, logs)
 	}
+	// The pods of the cluster's own services stay ready, replaced or
+	// not, as under a kubelet.
+	go func() {
+		for {
+			servicesRun(context.Background())
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
 	return m.Run(), nil
 }
 
@@ -85,7 +106,8 @@ func connect(ctx context.Context, name string) error {
 
 	var config *rest.Config
 	err = retry(ctx, func() error {
-		kubeconfig, err := exec.Command("docker", "exec", name, "cat", "/etc/rancher/k3s/k3s.yaml").Output()
+		var err error
+		kubeconfig, err = exec.Command("docker", "exec", name, "cat", "/etc/rancher/k3s/k3s.yaml").Output()
 		if err != nil {
 			return fmt.Errorf("reading the kubeconfig: %w", err)
 		}
@@ -94,7 +116,11 @@ func connect(ctx context.Context, name string) error {
 		}
 		config.Host = host
 		config.QPS, config.Burst = 500, 500
+		adminConfig = config
 		if admin, err = kubernetes.NewForConfig(config); err != nil {
+			return err
+		}
+		if objects, err = dynamic.NewForConfig(config); err != nil {
 			return err
 		}
 		_, err = admin.CoreV1().ServiceAccounts("kube-system").Get(ctx, "default", metav1.GetOptions{})
@@ -128,7 +154,7 @@ func connect(ctx context.Context, name string) error {
 		return err
 	}
 	reader = &rest.Config{Host: host, BearerToken: token.Status.Token, TLSClientConfig: rest.TLSClientConfig{CAData: config.CAData}}
-	return nil
+	return readyForApps(ctx)
 }
 
 func retry(ctx context.Context, f func() error) error {
@@ -205,9 +231,16 @@ func addPod(pod *corev1.Pod, st corev1.PodStatus) error {
 	if err != nil {
 		return err
 	}
-	created.Status = st
-	_, err = admin.CoreV1().Pods(pod.Namespace).UpdateStatus(ctx, created, metav1.UpdateOptions{})
-	return err
+	return retry(ctx, func() error {
+		created.Status = st
+		_, err := admin.CoreV1().Pods(pod.Namespace).UpdateStatus(ctx, created, metav1.UpdateOptions{})
+		if apierrors.IsConflict(err) {
+			if latest, err := admin.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
+				created = latest
+			}
+		}
+		return err
+	})
 }
 
 // unique is name with a random suffix.
@@ -231,7 +264,7 @@ func pod(t *testing.T, namespace, name, app string, containers ...container) {
 	createNamespace(t, namespace)
 	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
 	if app != "" {
-		p.Labels = map[string]string{objects.AppLabel: app}
+		p.Labels = map[string]string{appLabel: app}
 	}
 	for _, c := range containers {
 		p.Spec.Containers = append(p.Spec.Containers, corev1.Container{Name: c.name, Image: c.image})
@@ -270,7 +303,7 @@ func TestAContainerOfAPodWithoutAnAppsLabelIsTheClustersOwn(t *testing.T) {
 	pod(t, id, id+"-dns", "", container{name: "dns", image: "example.test/dns:1", state: running})
 	// A namespace's label doesn't make its pods an app's.
 	labelled := unique("labelled")
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: labelled, Labels: map[string]string{objects.AppLabel: labelled}}}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: labelled, Labels: map[string]string{appLabel: labelled}}}
 	if _, err := admin.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +321,7 @@ func TestAPodLabelledWithNoAppsNameIsTheClustersOwn(t *testing.T) {
 	id := unique("empty")
 	createNamespace(t, id)
 	p := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: id, Namespace: id, Labels: map[string]string{objects.AppLabel: ""}},
+		ObjectMeta: metav1.ObjectMeta{Name: id, Namespace: id, Labels: map[string]string{appLabel: ""}},
 		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "example.test/web:1"}}},
 	}
 	createPod(t, p, corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: status([]container{{name: "web", state: running}})})
@@ -370,7 +403,7 @@ func TestRunningInitAndEphemeralContainersAreListed(t *testing.T) {
 	createNamespace(t, ns)
 	always := corev1.ContainerRestartPolicyAlways
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: ns, Namespace: ns, Labels: map[string]string{objects.AppLabel: ns}},
+		ObjectMeta: metav1.ObjectMeta{Name: ns, Namespace: ns, Labels: map[string]string{appLabel: ns}},
 		Spec: corev1.PodSpec{
 			InitContainers: []corev1.Container{
 				{Name: "migrate", Image: "example.test/migrate:1"},
@@ -388,19 +421,25 @@ func TestRunningInitAndEphemeralContainersAreListed(t *testing.T) {
 		ContainerStatuses: status([]container{{name: "app", state: running}}),
 	})
 	pods := admin.CoreV1().Pods(ns)
-	created, err := pods.Get(ctx, ns, metav1.GetOptions{})
+	deadline, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	err := retry(deadline, func() error {
+		created, err := pods.Get(ctx, ns, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		created.Spec.EphemeralContainers = []corev1.EphemeralContainer{{
+			EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug", Image: "example.test/debug:1"},
+		}}
+		created, err = pods.UpdateEphemeralContainers(ctx, ns, created, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+		created.Status.EphemeralContainerStatuses = status([]container{{name: "debug", state: running}})
+		_, err = pods.UpdateStatus(ctx, created, metav1.UpdateOptions{})
+		return err
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	created.Spec.EphemeralContainers = []corev1.EphemeralContainer{{
-		EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug", Image: "example.test/debug:1"},
-	}}
-	created, err = pods.UpdateEphemeralContainers(ctx, ns, created, metav1.UpdateOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	created.Status.EphemeralContainerStatuses = status([]container{{name: "debug", state: running}})
-	if _, err := pods.UpdateStatus(ctx, created, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -482,13 +521,9 @@ func TestAMethodTheBackendDoesntHaveYetSaysSo(t *testing.T) {
 	ctx := context.Background()
 	b := backend(t)
 	_, apps := b.Apps(ctx)
-	_, nodes := b.Nodes(ctx)
 	_, preflight := b.Preflight(ctx, nil, orchestrator.NodeRequest{})
 	_, token := b.ConsoleToken(ctx)
 	for method, err := range map[string]error{
-		"Check":        b.Check(model.App{Name: "shop"}),
-		"Deploy":       b.Deploy(ctx, model.App{Name: "shop"}, func(orchestrator.Step) {}),
-		"Certificate":  b.Certificate(ctx, "shop", "web"),
 		"Remove":       b.Remove(ctx, "shop"),
 		"Logs":         b.Logs(ctx, "shop", orchestrator.LogOptions{}, io.Discard),
 		"Apps":         apps,
@@ -496,7 +531,6 @@ func TestAMethodTheBackendDoesntHaveYetSaysSo(t *testing.T) {
 		"AddNode":      b.AddNode(ctx, nil, model.Node{}),
 		"RemoveNode":   b.RemoveNode(ctx, "node-1", nil, orchestrator.RemoveOptions{}),
 		"Uninstall":    b.Uninstall(ctx, nil, model.Node{}),
-		"Nodes":        nodes,
 		"RunConsole":   b.RunConsole(ctx, "example.test/console:1", nil),
 		"ConsoleToken": token,
 	} {

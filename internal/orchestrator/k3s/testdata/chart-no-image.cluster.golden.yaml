@@ -1,0 +1,18 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+    labels:
+        moostack.dev/app: web
+    name: web
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+    labels:
+        moostack.dev/app: web
+    name: app-web
+    namespace: kube-system
+spec:
+    chartContent: H4sIAAAAAAAA/+yUMU/DMBSEPftXeEbCPSdNhqydWdlfm0drETtRYlpViP+OomJasTBQoqrx3fAuL5Lt5bsDrx83O+rDQu+4cXbr257FdQUA5XIpcNLPCaC4yBAweYZSKMQD/lNvQ6Be4M93fT/+a8b9jetBu1rGj6TZ6cz/amwBfSTXxH+T8V9c5LEXTA6YxP8U/FNnn7kfbOsrtc+kJ8eVOvBa7uMW2mjIxP+98x/YdQ0FHhY1d017vF4V/Mp/mZ/ziJApsrxM/E/Ov5Gv1teVWrX+xW6fqJOOA9UUqFLvp2rYfKQquNMqSE5Onpk/BwD8jbG1ABAAAA==
+    targetNamespace: web

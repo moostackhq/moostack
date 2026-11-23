@@ -1,0 +1,28 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    labels:
+        moostack.dev/app: plain
+        moostack.dev/container: worker
+    name: worker
+    namespace: plain
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            moostack.dev/app: plain
+            moostack.dev/container: worker
+    strategy:
+        rollingUpdate:
+            maxSurge: 1
+            maxUnavailable: 0
+    template:
+        metadata:
+            labels:
+                moostack.dev/app: plain
+                moostack.dev/container: worker
+        spec:
+            containers:
+                - image: example.test/worker:1
+                  name: worker

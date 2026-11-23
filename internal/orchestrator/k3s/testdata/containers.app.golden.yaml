@@ -1,0 +1,187 @@
+---
+apiVersion: v1
+data:
+    API_KEY: czNjcjN0OiAieCIK
+    GREETING: aGk=
+kind: Secret
+metadata:
+    labels:
+        moostack.dev/app: shop
+    name: shop
+    namespace: shop
+type: Opaque
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    labels:
+        moostack.dev/app: shop
+        moostack.dev/container: cache
+    name: cache
+    namespace: shop
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            moostack.dev/app: shop
+            moostack.dev/container: cache
+    strategy:
+        rollingUpdate:
+            maxSurge: 1
+            maxUnavailable: 0
+    template:
+        metadata:
+            annotations:
+                moostack.dev/secrets: 3440f03b2523f4d57f833c5ad8710495b1f8ebcfbc7c3f6e856be1f2d87afb59
+            labels:
+                moostack.dev/app: shop
+                moostack.dev/container: cache
+        spec:
+            containers:
+                - envFrom:
+                    - secretRef:
+                        name: shop
+                  image: valkey/valkey:8
+                  name: cache
+                  ports:
+                    - containerPort: 6379
+                  readinessProbe:
+                    periodSeconds: 2
+                    tcpSocket:
+                        port: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+    labels:
+        moostack.dev/app: shop
+        moostack.dev/container: cache
+    name: cache
+    namespace: shop
+spec:
+    ports:
+        - port: 6379
+          targetPort: 6379
+    selector:
+        moostack.dev/app: shop
+        moostack.dev/container: cache
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    labels:
+        moostack.dev/app: shop
+        moostack.dev/container: jobs
+    name: jobs
+    namespace: shop
+spec:
+    replicas: 3
+    selector:
+        matchLabels:
+            moostack.dev/app: shop
+            moostack.dev/container: jobs
+    strategy:
+        rollingUpdate:
+            maxSurge: 1
+            maxUnavailable: 0
+    template:
+        metadata:
+            annotations:
+                moostack.dev/secrets: 3440f03b2523f4d57f833c5ad8710495b1f8ebcfbc7c3f6e856be1f2d87afb59
+            labels:
+                moostack.dev/app: shop
+                moostack.dev/container: jobs
+        spec:
+            containers:
+                - command:
+                    - bin/jobs
+                    - --queue
+                    - mail
+                  envFrom:
+                    - secretRef:
+                        name: shop
+                  image: moostack.local/shop/jobs@sha256:1111
+                  name: jobs
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    labels:
+        moostack.dev/app: shop
+        moostack.dev/container: web
+    name: web
+    namespace: shop
+spec:
+    replicas: 2
+    selector:
+        matchLabels:
+            moostack.dev/app: shop
+            moostack.dev/container: web
+    strategy:
+        rollingUpdate:
+            maxSurge: 1
+            maxUnavailable: 0
+    template:
+        metadata:
+            annotations:
+                moostack.dev/secrets: 3440f03b2523f4d57f833c5ad8710495b1f8ebcfbc7c3f6e856be1f2d87afb59
+            labels:
+                moostack.dev/app: shop
+                moostack.dev/container: web
+        spec:
+            containers:
+                - envFrom:
+                    - secretRef:
+                        name: shop
+                  image: moostack.local/shop/jobs@sha256:1111
+                  name: web
+                  ports:
+                    - containerPort: 8080
+                  readinessProbe:
+                    periodSeconds: 2
+                    tcpSocket:
+                        port: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+    labels:
+        moostack.dev/app: shop
+        moostack.dev/container: web
+    name: web
+    namespace: shop
+spec:
+    ports:
+        - port: 8080
+          targetPort: 8080
+    selector:
+        moostack.dev/app: shop
+        moostack.dev/container: web
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+    annotations:
+        cert-manager.io/cluster-issuer: moostack
+    labels:
+        moostack.dev/app: shop
+        moostack.dev/container: web
+    name: web
+    namespace: shop
+spec:
+    ingressClassName: traefik
+    rules:
+        - host: shop.example.com
+          http:
+            paths:
+                - backend:
+                    service:
+                        name: web
+                        port:
+                            number: 8080
+                  path: /
+                  pathType: Prefix
+    tls:
+        - hosts:
+            - shop.example.com
+          secretName: web-tls

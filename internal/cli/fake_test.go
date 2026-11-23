@@ -42,6 +42,9 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/random"
 
 	"github.com/moostackhq/moostack/internal/k3s"
+	"github.com/moostackhq/moostack/internal/model"
+	"github.com/moostackhq/moostack/internal/orchestrator"
+	"github.com/moostackhq/moostack/internal/orchestrator/orchestratortest"
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
@@ -72,13 +75,14 @@ type fakeCluster struct {
 	hosts map[string]*fakeNode
 	// nodes are the Kubernetes nodes by name.
 	nodes map[string]fakeKubeNode
-	// apps are the app namespaces, with the objects applied in each.
+	// apps are the app namespaces.
 	apps map[string]map[string]bool
-	// deleted are the objects deleted from app namespaces, as
-	// namespace/object.
-	deleted []string
+	// orch is the cluster's orchestrator.
+	orch *fakeOrchestrator
 	// locked says the operation lock is held.
 	locked bool
+	// lock is the operation lock as last taken.
+	lock *fakeLock
 	// runs are the scripts run, as "target: first line".
 	runs []string
 	// registry is what DialTCP connects to.
@@ -105,17 +109,118 @@ type fakeCluster struct {
 	ingressDials []string
 	// consoleFails makes the console never get ready.
 	consoleFails bool
-	// manifests are what was applied, in order.
-	manifests []string
 	// noPods makes every app have no pods.
 	noPods bool
-	// rolloutFails makes every app's rollout fail.
-	rolloutFails bool
 	// cordoned are the Kubernetes nodes marked unschedulable.
 	cordoned map[string]bool
 	// servicesDown makes the cluster's services not ready, until a wait
 	// for them if servicesComeUp.
 	servicesDown, servicesComeUp bool
+}
+
+// fakeOrchestrator is the cluster's orchestrator: a fake one that notes
+// the calls made to it, with what the fake cluster adds to them.
+type fakeOrchestrator struct {
+	*orchestratortest.Fake
+	c *fakeCluster
+	// calls are the calls made, as "Deploy shop".
+	calls []string
+	// deployed are the apps as last deployed, by name.
+	deployed map[string]model.App
+	// hosts counts the orchestrators built to act through a host.
+	hosts int
+	// onCertificate, if set, runs at each call of Certificate.
+	onCertificate func()
+	// onDeploy, if set, runs at each call of Deploy, whose result is its
+	// error if it returns one.
+	onDeploy func(ctx context.Context) error
+}
+
+func (o *fakeOrchestrator) called(format string, args ...any) {
+	o.c.mu.Lock()
+	defer o.c.mu.Unlock()
+	o.calls = append(o.calls, fmt.Sprintf(format, args...))
+}
+
+func (o *fakeOrchestrator) Check(app model.App) error {
+	o.called("Check %s", app.Name)
+	return o.Fake.Check(app)
+}
+
+// Deploy tells WaitingForCluster and waits while the cluster's services
+// are down, and fails if they don't come up. A deployed app is one the
+// fake cluster's namespaces have.
+func (o *fakeOrchestrator) Deploy(ctx context.Context, app model.App, step func(orchestrator.Step)) error {
+	o.called("Deploy %s", app.Name)
+	if o.onDeploy != nil {
+		if err := o.onDeploy(ctx); err != nil {
+			return err
+		}
+	}
+	o.c.mu.Lock()
+	down, comeUp := o.c.servicesDown, o.c.servicesComeUp
+	o.c.mu.Unlock()
+	if down {
+		step(orchestrator.WaitingForCluster)
+		if !comeUp {
+			return errors.New("the cluster isn't ready for apps: still waiting for the issuer moostack, Traefik")
+		}
+		o.c.mu.Lock()
+		o.c.servicesDown = false
+		o.c.mu.Unlock()
+	}
+	if err := o.Fake.Deploy(ctx, app, step); err != nil {
+		return err
+	}
+	o.c.mu.Lock()
+	defer o.c.mu.Unlock()
+	o.deployed[app.Name] = app
+	if o.c.apps[app.Name] == nil {
+		o.c.apps[app.Name] = map[string]bool{}
+	}
+	return nil
+}
+
+// Certificate fails for the certificate the fake cluster never issues.
+func (o *fakeOrchestrator) Certificate(ctx context.Context, app, container string) error {
+	o.called("Certificate %s %s", app, container)
+	if o.onCertificate != nil {
+		o.onCertificate()
+	}
+	if o.c.unissued == container+"-tls" {
+		return errors.New("the challenge is pending")
+	}
+	return o.Fake.Certificate(ctx, app, container)
+}
+
+// Nodes are the fake cluster's Kubernetes nodes.
+func (o *fakeOrchestrator) Nodes(ctx context.Context) ([]model.NodeState, error) {
+	o.called("Nodes")
+	if _, err := o.Fake.Nodes(ctx); err != nil {
+		return nil, err
+	}
+	o.c.mu.Lock()
+	defer o.c.mu.Unlock()
+	var nodes []model.NodeState
+	for name, n := range o.c.nodes {
+		nodes = append(nodes, model.NodeState{Name: name, Address: n.ip, Architecture: n.arch, Ready: "yes"})
+	}
+	slices.SortFunc(nodes, func(a, b model.NodeState) int { return cmp.Compare(a.Name, b.Name) })
+	return nodes, nil
+}
+
+// made are the calls made to the orchestrator whose names start with
+// prefix.
+func (o *fakeOrchestrator) made(prefix string) []string {
+	o.c.mu.Lock()
+	defer o.c.mu.Unlock()
+	var out []string
+	for _, call := range o.calls {
+		if strings.HasPrefix(call, prefix) {
+			out = append(out, call)
+		}
+	}
+	return out
 }
 
 type fakeKubeNode struct {
@@ -175,6 +280,7 @@ func imageArchive(t *testing.T) ([]byte, string) {
 // that holds the console's image for amd64 and arm64.
 func newFakeCluster(t *testing.T) *fakeCluster {
 	c := &fakeCluster{t: t, hosts: map[string]*fakeNode{}, nodes: map[string]fakeKubeNode{}, apps: map[string]map[string]bool{}}
+	c.orch = &fakeOrchestrator{Fake: &orchestratortest.Fake{}, c: c, deployed: map[string]model.App{}}
 	registry := httptest.NewServer(ggcrregistry.New(ggcrregistry.Logger(log.New(io.Discard, "", 0))))
 	t.Cleanup(registry.Close)
 	c.registry = registry.Listener.Addr().String()
@@ -224,6 +330,16 @@ func (c *fakeCluster) connect(_ context.Context, target string, hostKey ssh.Publ
 		return nil, nil, fmt.Errorf("connecting to %s: host key mismatch", target)
 	}
 	return &fakeConn{c: c, n: n}, n.key, nil
+}
+
+// orchestrator is Env.Orchestrator.
+func (c *fakeCluster) orchestrator(host orchestrator.Host) orchestrator.Orchestrator {
+	if host != nil {
+		c.mu.Lock()
+		c.orch.hosts++
+		c.mu.Unlock()
+	}
+	return c.orch
 }
 
 // ran reports whether a script whose first line contains s ran on
@@ -316,7 +432,8 @@ func (f *fakeConn) Lock(context.Context) (held, error) {
 		return nil, errors.New("another mooctl operation is running on this cluster; wait for it to finish")
 	}
 	f.c.locked = true
-	return &fakeLock{c: f.c, done: make(chan struct{})}, nil
+	f.c.lock = &fakeLock{c: f.c, done: make(chan struct{})}
+	return f.c.lock, nil
 }
 
 type fakeLock struct {
@@ -341,8 +458,6 @@ var (
 	readyAtInScript  = regexp.MustCompile(`= "([0-9.]+) True"`)
 	quotedName       = regexp.MustCompile(`(?:delete node|drain|uncordon) '([^']+)'`)
 	labelInScript    = regexp.MustCompile(`moostack\.dev/app=([a-z0-9-]+)`)
-	namespaceFlag    = regexp.MustCompile(`-n '([^']+)'`)
-	quotedObject     = regexp.MustCompile(`--request-timeout=120s '([^']+)'`)
 	deletedNamespace = regexp.MustCompile(`(?m)^k3s kubectl delete namespace '([^']+)'`)
 )
 
@@ -363,12 +478,7 @@ func fail(code int, stderr string) (sshclient.Result, error) {
 }
 
 // Run answers the scripts mooctl runs, and fails any other.
-func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclient.Result, error) {
-	var in string
-	if stdin != nil {
-		data, _ := io.ReadAll(stdin)
-		in = string(data)
-	}
+func (f *fakeConn) Run(_ context.Context, cmd string, _ io.Reader) (sshclient.Result, error) {
 	c, n := f.c, f.n
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -417,17 +527,6 @@ func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclien
 		return okJSON(items)
 	case strings.HasPrefix(cmd, "k3s kubectl get deployments,statefulsets,daemonsets,ingresses -A -o json"):
 		return okJSON(c.workloads)
-	case cmd == k3s.ServicesReadyScript:
-		if c.servicesDown {
-			return fail(1, "")
-		}
-		return ok("")
-	case cmd == k3s.WaitServicesScript:
-		if c.servicesDown && !c.servicesComeUp {
-			return fail(1, "not ready after 5 minutes: the issuer moostack, Traefik")
-		}
-		c.servicesDown = false
-		return ok("")
 	case strings.HasPrefix(cmd, "k3s kubectl get pods -n "):
 		if c.noPods {
 			return ok("")
@@ -527,46 +626,6 @@ func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclien
 			out = append(out, "namespace/"+a)
 		}
 		return ok(strings.Join(out, "\n"))
-	case strings.Contains(first, "k3s kubectl get nodes") && strings.Contains(first, "architecture"):
-		var arches []string
-		for _, kn := range c.nodes {
-			arches = append(arches, kn.arch)
-		}
-		return ok(strings.Join(arches, " "))
-	case strings.HasPrefix(first, "k3s kubectl api-resources --namespaced=false"):
-		return ok("namespaces                ns    v1                          false   Namespace\nnodes                     no    v1                          false   Node\nclusterroles                    rbac.authorization.k8s.io/v1   false   ClusterRole\n")
-	case strings.HasPrefix(first, "k3s kubectl apply --server-side"):
-		return f.apply(first, in)
-	case strings.HasPrefix(first, "k3s kubectl delete helmchart"):
-		return ok("")
-	case strings.Contains(first, "get configmap "+objectsConfigMap):
-		ns := namespaceFlag.FindStringSubmatch(first)[1]
-		var objs []string
-		for o := range c.apps[ns] {
-			objs = append(objs, o)
-		}
-		sort.Strings(objs)
-		if len(objs) == 0 {
-			return ok("")
-		}
-		return ok(strings.Join(objs, "\n"))
-	case strings.HasPrefix(first, "out=$(k3s kubectl delete -n"):
-		ns := namespaceFlag.FindStringSubmatch(first)[1]
-		o := quotedObject.FindStringSubmatch(first)[1]
-		c.deleted = append(c.deleted, ns+"/"+o)
-		delete(c.apps[ns], o)
-		return ok("")
-	case strings.HasPrefix(first, "k3s kubectl delete -n"):
-		ns := namespaceFlag.FindStringSubmatch(first)[1]
-		for _, o := range strings.Fields(first)[5:] {
-			if strings.HasPrefix(o, "-") {
-				continue
-			}
-			o = strings.Trim(o, "'")
-			c.deleted = append(c.deleted, ns+"/"+o)
-			delete(c.apps[ns], o)
-		}
-		return ok("")
 	case cmd == k3s.ConsoleImageScript:
 		// k3s applies the objects it is given a moment after they are
 		// written: the first answer after a change is the image before.
@@ -594,18 +653,6 @@ func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclien
 			return fail(1, "error: timed out waiting for the condition")
 		}
 		return ok("")
-	case strings.HasPrefix(first, "set -e") && strings.Contains(cmd, "rollout status"):
-		if c.rolloutFails {
-			return fail(1, "the rollout timed out")
-		}
-		return ok("")
-	case strings.Contains(cmd, "kubectl wait --for=condition=Ready 'certificate/"):
-		if c.unissued != "" && strings.Contains(cmd, "'certificate/"+c.unissued+"'") {
-			return fail(1, "the challenge is pending")
-		}
-		return ok("")
-	case strings.HasPrefix(first, `g=$(k3s kubectl get helmchart`):
-		return ok("|\n")
 	case strings.HasPrefix(first, "set -e") && strings.Contains(cmd, "delete namespace"):
 		if m := deletedNamespace.FindStringSubmatch(cmd); m != nil {
 			delete(c.apps, m[1])
@@ -614,54 +661,6 @@ func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) (sshclien
 	}
 	c.t.Errorf("the fake cluster has no answer to a script on %s:\n%s", n.target, cmd)
 	return fail(127, "fake: unknown script")
-}
-
-// apply applies, server side, the objects in manifest: an app's
-// namespace is kept, its moostack-objects ConfigMap becomes its applied
-// objects, and, with -n, the names of the objects are printed.
-func (f *fakeConn) apply(cmd, manifest string) (sshclient.Result, error) {
-	f.c.manifests = append(f.c.manifests, manifest)
-	ns := ""
-	if m := namespaceFlag.FindStringSubmatch(cmd); m != nil {
-		ns = m[1]
-	}
-	dec := yaml.NewDecoder(strings.NewReader(manifest))
-	var names []string
-	for {
-		var doc struct {
-			Kind     string
-			Metadata struct {
-				Name      string
-				Namespace string
-			}
-			Data map[string]string
-		}
-		err := dec.Decode(&doc)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return fail(1, err.Error())
-		}
-		switch {
-		case doc.Kind == "Bad":
-			return fail(1, `error: resource mapping not found for name: "bad"`)
-		case doc.Kind == "Namespace":
-			if f.c.apps[doc.Metadata.Name] == nil {
-				f.c.apps[doc.Metadata.Name] = map[string]bool{}
-			}
-		case doc.Kind == "ConfigMap" && doc.Metadata.Name == objectsConfigMap:
-			objs := map[string]bool{}
-			for _, o := range strings.Fields(doc.Data["objects"]) {
-				objs[o] = true
-			}
-			f.c.apps[doc.Metadata.Namespace] = objs
-		case ns != "":
-			name := strings.ToLower(doc.Kind) + "/" + doc.Metadata.Name
-			names = append(names, name)
-		}
-	}
-	return ok(strings.Join(names, "\n"))
 }
 
 // goArchOf is the Go architecture of what uname prints.
@@ -674,7 +673,7 @@ func goArchOf(uname string) string {
 
 // fakeEnvFor is an Env that reaches the hosts of c, in home.
 func fakeEnvFor(c *fakeCluster, home string, out *bytes.Buffer) Env {
-	return Env{Home: home, LocalUser: "op", Stdout: out, Stderr: out, Root: home + "/clusters", Connect: c.connect, Exit: func(int) {}, Release: c.release}
+	return Env{Home: home, LocalUser: "op", Stdout: out, Stderr: out, Root: home + "/clusters", Connect: c.connect, Exit: func(int) {}, Release: c.release, Orchestrator: c.orchestrator}
 }
 
 // ingress is a connection to the cluster's ingress at addr, which

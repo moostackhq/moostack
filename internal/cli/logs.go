@@ -12,11 +12,9 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"github.com/moostackhq/moostack/internal/deployfile"
-	"github.com/moostackhq/moostack/internal/objects"
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
-// logsCommand is mooctl logs.
 func logsCommand(env Env) *cli.Command {
 	return &cli.Command{
 		Name:      "logs",
@@ -30,7 +28,6 @@ func logsCommand(env Env) *cli.Command {
 	}
 }
 
-// logs is mooctl logs.
 func logs(ctx context.Context, env Env, cmd *cli.Command) error {
 	if cmd.NArg() > 1 {
 		return wantArgs(cmd, 1)
@@ -68,7 +65,7 @@ func logs(ctx context.Context, env Env, cmd *cli.Command) error {
 	}
 	defer c.Close()
 	ns := sshclient.ShellQuote(app)
-	out, err := run(ctx, c, "k3s kubectl get namespaces -l "+sshclient.ShellQuote(objects.AppLabel+"="+app)+" -o name --request-timeout=30s", "")
+	out, err := run(ctx, c, "k3s kubectl get namespaces -l "+sshclient.ShellQuote(appLabel+"="+app)+" -o name --request-timeout=30s", "")
 	if err != nil {
 		return fmt.Errorf("looking for %s: %w", app, err)
 	}
@@ -82,7 +79,7 @@ func logs(ctx context.Context, env Env, cmd *cli.Command) error {
 	if strings.TrimSpace(pods) == "" {
 		return fmt.Errorf("%s has no pods", app)
 	}
-	// Every pod of the namespace: no pod has the label moostack.dev/none.
+	// Every pod of the namespace.
 	script := "k3s kubectl logs -n " + ns + " -l '!moostack.dev/none' --all-containers --prefix --ignore-errors --max-log-requests=50 --tail=" + strconv.Itoa(cmd.Int("tail"))
 	if cmd.Bool("follow") {
 		script += " --follow"

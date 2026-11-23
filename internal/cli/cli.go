@@ -18,6 +18,7 @@ import (
 	"github.com/moostackhq/moostack/internal/clusterdir"
 	"github.com/moostackhq/moostack/internal/deployfile"
 	"github.com/moostackhq/moostack/internal/gitrepo"
+	"github.com/moostackhq/moostack/internal/orchestrator"
 	"github.com/moostackhq/moostack/internal/secretstore"
 	"github.com/moostackhq/moostack/internal/terminal"
 )
@@ -60,6 +61,10 @@ type Env struct {
 	// returns. Nil means over SSH, with the operator's SSH config and
 	// ssh-agent.
 	Connect func(ctx context.Context, target string, hostKey ssh.PublicKey) (remote, ssh.PublicKey, error)
+	// Orchestrator builds the cluster's orchestrator, which acts through
+	// host, the cluster's control plane, or has none if host is nil. Nil
+	// means the one orchestratorThrough builds.
+	Orchestrator func(host orchestrator.Host) orchestrator.Orchestrator
 }
 
 // OSEnv is the Env of the running process.

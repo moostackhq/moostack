@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"io"
 	"maps"
 
 	"bytes"
@@ -20,7 +19,6 @@ import (
 	"syscall"
 
 	"golang.org/x/term"
-	"gopkg.in/yaml.v3"
 
 	"github.com/urfave/cli/v3"
 
@@ -28,25 +26,12 @@ import (
 	"github.com/moostackhq/moostack/internal/clusterdir"
 	"github.com/moostackhq/moostack/internal/deployfile"
 	"github.com/moostackhq/moostack/internal/interrupt"
-	"github.com/moostackhq/moostack/internal/k3s"
-	"github.com/moostackhq/moostack/internal/objects"
+	"github.com/moostackhq/moostack/internal/model"
+	"github.com/moostackhq/moostack/internal/orchestrator"
 	"github.com/moostackhq/moostack/internal/registry"
 	"github.com/moostackhq/moostack/internal/secretstore"
-	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
-// rolloutTimeout bounds waiting for an app's replicas, its chart's
-// install and its removal.
-const rolloutTimeout = "300s"
-
-// certificateTimeout bounds waiting for a container's certificate.
-const certificateTimeout = "120s"
-
-// objectsConfigMap is the ConfigMap in an app's namespace that lists the
-// objects its last deploy applied there.
-const objectsConfigMap = "moostack-objects"
-
-// deployCommand is mooctl deploy.
 func deployCommand(env Env) *cli.Command {
 	return &cli.Command{
 		Name:      "deploy",
@@ -59,7 +44,6 @@ func deployCommand(env Env) *cli.Command {
 	}
 }
 
-// deploy is mooctl deploy.
 func deploy(ctx context.Context, env Env, cmd *cli.Command) error {
 	if cmd.Bool("remove") {
 		return removeApp(ctx, env, cmd)
@@ -74,7 +58,7 @@ func deploy(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	if err := objects.Check(app); err != nil {
+	if err := orchestratorThrough(env, nil).Check(unbuilt(app)); err != nil {
 		return err
 	}
 	ctx, stop := interrupt.Context(ctx, env.Exit)
@@ -111,29 +95,24 @@ func deploy(ctx context.Context, env Env, cmd *cli.Command) error {
 		return err
 	}
 	defer release()
+	orch := orchestratorThrough(env, cpClient)
 
-	image, images, err := buildAll(ctx, env, cmd, d, app, cp, cpClient)
+	image, images, err := buildAll(ctx, env, d, app, cp, cpClient, orch)
 	if err != nil {
 		return err
 	}
-	objs, err := objects.Make(objects.App{App: app, Image: image, Images: images, Secrets: secrets, Issuer: k3s.Issuer})
+	err = orch.Deploy(ctx, toRun(app, image, images, secrets), func(step orchestrator.Step) {
+		switch step {
+		case orchestrator.WaitingForCluster:
+			say(env, "Waiting for cert-manager and Traefik...")
+		case orchestrator.Applying:
+			say(env, "Applying %s...", app.Name)
+		case orchestrator.WaitingForReady:
+			say(env, "Waiting for %s to be ready...", app.Name)
+		}
+	})
 	if err != nil {
 		return err
-	}
-	if err := waitServices(ctx, env, cpClient); err != nil {
-		return err
-	}
-	before, err := readChartState(ctx, cpClient, app.Name)
-	if err != nil {
-		return err
-	}
-	say(env, "Applying %s...", app.Name)
-	if err := apply(ctx, cpClient, app, objs); err != nil {
-		return err
-	}
-	say(env, "Waiting for %s to be ready...", app.Name)
-	if err := waitReady(ctx, cpClient, app, before); err != nil {
-		return fmt.Errorf("%s isn't ready: %w", app.Name, err)
 	}
 	if err := keepRunning(ctx, cp, cpClient, image, images); err != nil {
 		return err
@@ -153,7 +132,10 @@ func deploy(ctx context.Context, env Env, cmd *cli.Command) error {
 		if c.Host == "" {
 			continue
 		}
-		if err := waitCertificate(ctx, cpClient, app.Name, objects.TLSSecret(c.Name)); err != nil {
+		if err := orch.Certificate(ctx, app.Name, c.Name); err != nil {
+			if ctx.Err() != nil {
+				return context.Cause(ctx)
+			}
 			fmt.Fprintf(env.Stderr, "Warning: %s has no certificate yet: %v\n", c.Host, err)
 		}
 		fmt.Fprintf(env.Stdout, "URL: https://%s\n", c.Host)
@@ -161,10 +143,50 @@ func deploy(ctx context.Context, env Env, cmd *cli.Command) error {
 	return nil
 }
 
+// toRun is app as an orchestrator runs it: with image, the one built for
+// its manifests or chart, images, those built for its containers, by
+// container name, and secrets, the values of its secrets by name.
+func toRun(app *deployfile.App, image string, images, secrets map[string]string) model.App {
+	out := model.App{Name: app.Name, Manifests: app.Manifests, Chart: app.Chart, Image: image}
+	for _, c := range app.Containers {
+		out.Containers = append(out.Containers, model.Container{
+			Name:     c.Name,
+			Image:    cmp.Or(c.Image, images[c.Name]),
+			Command:  c.Command,
+			Port:     c.Port,
+			Host:     c.Host,
+			Replicas: c.Replicas,
+		})
+	}
+	if len(app.Secrets) > 0 {
+		out.Secrets = map[string]string{}
+		for _, name := range app.Secrets {
+			out.Secrets[name] = secrets[name]
+		}
+	}
+	return out
+}
+
+// unbuilt is app as an orchestrator runs it, before anything is built
+// or read: each image to build is its repository in the cluster's
+// registry, and each secret is empty.
+func unbuilt(app *deployfile.App) model.App {
+	image, images := "", map[string]string{}
+	if app.Build != nil {
+		image = registry.Name + "/" + app.Name
+	}
+	for _, c := range app.Containers {
+		if c.Build != nil {
+			images[c.Name] = registry.Name + "/" + app.Name + "/" + c.Name
+		}
+	}
+	return toRun(app, image, images, nil)
+}
+
 // buildAll builds and pushes app's images: the one of its manifests or
 // chart, which it returns, and those of its containers, which it returns
 // by container name. Containers with the same build share one image.
-func buildAll(ctx context.Context, env Env, cmd *cli.Command, d *clusterdir.Dir, app *deployfile.App, cp clusterdir.Node, cpClient remote) (string, map[string]string, error) {
+func buildAll(ctx context.Context, env Env, d *clusterdir.Dir, app *deployfile.App, cp clusterdir.Node, cpClient remote, orch orchestrator.Orchestrator) (string, map[string]string, error) {
 	type job struct {
 		repo, label string
 		build       deployfile.Build
@@ -181,7 +203,7 @@ func buildAll(ctx context.Context, env Env, cmd *cli.Command, d *clusterdir.Dir,
 	if len(jobs) == 0 {
 		return "", nil, nil
 	}
-	arches, err := architectures(ctx, d, cpClient)
+	arches, err := architectures(ctx, d, orch)
 	if err != nil {
 		return "", nil, err
 	}
@@ -205,14 +227,19 @@ func buildAll(ctx context.Context, env Env, cmd *cli.Command, d *clusterdir.Dir,
 	return image, images, nil
 }
 
-// architectures are the architectures of the cluster's nodes: those the
-// control plane cp lists, and those of d's nodes.
-func architectures(ctx context.Context, d *clusterdir.Dir, cp remote) ([]string, error) {
-	out, err := run(ctx, cp, `k3s kubectl get nodes --request-timeout=30s -o jsonpath='{.items[*].status.nodeInfo.architecture}'`, "")
+// architectures are the architectures of the cluster's nodes: those
+// orch lists, but for a node that reports none, and those of d's nodes.
+func architectures(ctx context.Context, d *clusterdir.Dir, orch orchestrator.Orchestrator) ([]string, error) {
+	onCluster, err := orch.Nodes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing the nodes' architectures: %w", err)
 	}
-	arches := strings.Fields(out)
+	var arches []string
+	for _, n := range onCluster {
+		if n.Architecture != "" {
+			arches = append(arches, n.Architecture)
+		}
+	}
 	nodes, err := d.Nodes()
 	if err != nil {
 		return nil, err
@@ -222,260 +249,6 @@ func architectures(ctx context.Context, d *clusterdir.Dir, cp remote) ([]string,
 	}
 	slices.Sort(arches)
 	return slices.Compact(arches), nil
-}
-
-// apply applies objs of app on the control plane cp, server side: the
-// cluster-wide objects, then the namespaced ones, and deletes the
-// namespaced objects the app's last deploy applied that this one
-// doesn't, and its HelmChart if it has no chart now.
-func apply(ctx context.Context, cp remote, app *deployfile.App, objs objects.Objects) error {
-	const ssa = "k3s kubectl apply --server-side --force-conflicts --field-manager=mooctl --request-timeout=120s"
-	ns := sshclient.ShellQuote(app.Name)
-	planned, err := objectNames(objs.Namespaced)
-	if err != nil {
-		return err
-	}
-	unscoped, err := unscopedKinds(ctx, cp)
-	if err != nil {
-		return err
-	}
-	for _, o := range planned {
-		if unscoped[kindOf(o)] {
-			return fmt.Errorf("%s isn't in a namespace; an app's manifests hold only objects of its namespace", o)
-		}
-	}
-	if _, err := run(ctx, cp, ssa+" -f -", objs.Cluster); err != nil {
-		return fmt.Errorf("applying %s's objects: %w", app.Name, err)
-	}
-	if app.Chart == "" {
-		if _, err := run(ctx, cp, "k3s kubectl delete helmchart -n "+objects.ChartNamespace+" -l "+sshclient.ShellQuote(objects.AppLabel+"="+app.Name)+" --ignore-not-found --timeout="+rolloutTimeout, ""); err != nil {
-			return fmt.Errorf("removing %s's chart: %w", app.Name, err)
-		}
-	}
-	before, err := run(ctx, cp, "k3s kubectl get configmap "+objectsConfigMap+" -n "+ns+" --ignore-not-found --request-timeout=30s -o jsonpath='{.data.objects}'", "")
-	if err != nil {
-		return fmt.Errorf("reading what %s's last deploy applied: %w", app.Name, err)
-	}
-	var recorded []string
-	for _, o := range strings.Fields(before) {
-		// Recorded objects without a name, and those outside namespaces,
-		// are left out.
-		if _, name, _ := strings.Cut(o, "/"); name != "" && !unscoped[kindOf(plainName(o))] {
-			recorded = append(recorded, plainName(o))
-		}
-	}
-	// The record holds every object before it is applied.
-	if err := record(ctx, cp, app.Name, union(recorded, planned)); err != nil {
-		return err
-	}
-	if objs.Namespaced != "" {
-		if _, err := run(ctx, cp, ssa+" -n "+ns+" -f -", objs.Namespaced); err != nil {
-			return fmt.Errorf("applying %s's objects: %w", app.Name, err)
-		}
-	}
-	for _, o := range recorded {
-		if slices.Contains(planned, o) {
-			continue
-		}
-		// A delete that fails on a kind the cluster doesn't have counts
-		// as done.
-		script := "out=$(k3s kubectl delete -n " + ns + " --ignore-not-found --request-timeout=120s " + sshclient.ShellQuote(o) + ` 2>&1) || { echo "$out" | grep -q "doesn't have a resource type" || { echo "$out" >&2; exit 1; }; }`
-		if _, err := run(ctx, cp, script, ""); err != nil {
-			return fmt.Errorf("deleting %s's %s, which it no longer has: %w", app.Name, o, err)
-		}
-	}
-	return record(ctx, cp, app.Name, planned)
-}
-
-// unscopedKinds are the kinds of object the cluster of the control plane
-// cp keeps outside namespaces, such as Namespace, in lower case.
-func unscopedKinds(ctx context.Context, cp remote) (map[string]bool, error) {
-	out, err := run(ctx, cp, "k3s kubectl api-resources --namespaced=false --no-headers --request-timeout=30s", "")
-	if err != nil {
-		return nil, fmt.Errorf("listing the kinds that aren't in a namespace: %w", err)
-	}
-	kinds := map[string]bool{}
-	for _, line := range strings.Split(out, "\n") {
-		if fields := strings.Fields(line); len(fields) > 0 {
-			kinds[strings.ToLower(fields[len(fields)-1])] = true
-		}
-	}
-	return kinds, nil
-}
-
-// kindOf is the kind of the object called name, as kind/name.
-func kindOf(name string) string {
-	kind, _, _ := strings.Cut(name, "/")
-	return kind
-}
-
-// record writes the names of the objects app's deploys applied.
-func record(ctx context.Context, cp remote, app string, names []string) error {
-	const ssa = "k3s kubectl apply --server-side --force-conflicts --field-manager=mooctl --request-timeout=120s"
-	list := fmt.Sprintf("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\n  namespace: %s\n  labels: {%s: %s}\ndata:\n  objects: %q\n",
-		objectsConfigMap, app, objects.AppLabel, app, strings.Join(names, "\n"))
-	if _, err := run(ctx, cp, ssa+" -f -", list); err != nil {
-		return fmt.Errorf("recording %s's objects: %w", app, err)
-	}
-	return nil
-}
-
-// objectNames are the names of the objects in manifests, as kind/name,
-// the kind in lower case.
-func objectNames(manifests string) ([]string, error) {
-	var names []string
-	dec := yaml.NewDecoder(strings.NewReader(manifests))
-	for {
-		var doc struct {
-			Kind     string `yaml:"kind"`
-			Metadata struct {
-				Name string `yaml:"name"`
-			} `yaml:"metadata"`
-		}
-		err := dec.Decode(&doc)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		if doc.Kind == "" {
-			continue
-		}
-		names = append(names, strings.ToLower(doc.Kind)+"/"+doc.Metadata.Name)
-	}
-	return names, nil
-}
-
-// plainName is kubectl's name of an object, as deployment.apps/web,
-// without its API group: deployment/web.
-func plainName(name string) string {
-	kind, n, ok := strings.Cut(name, "/")
-	if !ok {
-		return name
-	}
-	kind, _, _ = strings.Cut(kind, ".")
-	return strings.ToLower(kind) + "/" + n
-}
-
-// union is a and the names of b it lacks, in order.
-func union(a, b []string) []string {
-	out := slices.Clone(a)
-	for _, n := range b {
-		if !slices.Contains(out, n) {
-			out = append(out, n)
-		}
-	}
-	return out
-}
-
-// chartState is what deploy reads of an app's chart before applying it:
-// its HelmChart's generation and its install job's UID, each empty if
-// there is none.
-type chartState struct {
-	generation, job string
-}
-
-// readChartState reads the chart state of the app called name on the
-// control plane cp.
-func readChartState(ctx context.Context, cp remote, name string) (chartState, error) {
-	out, err := run(ctx, cp, chartStateScript(name), "")
-	if err != nil {
-		return chartState{}, fmt.Errorf("reading %s's chart: %w", name, err)
-	}
-	g, j, _ := strings.Cut(strings.TrimSpace(out), "|")
-	return chartState{generation: g, job: j}, nil
-}
-
-// chartStateScript prints the HelmChart generation and install job UID
-// of the app called name, separated by |, each empty if there is none.
-func chartStateScript(name string) string {
-	return `g=$(k3s kubectl get helmchart ` + sshclient.ShellQuote(objects.ChartName(name)) + ` -n ` + objects.ChartNamespace + ` --ignore-not-found --request-timeout=30s -o jsonpath='{.metadata.generation}') || exit 1
-j=$(k3s kubectl get job ` + sshclient.ShellQuote("helm-install-"+objects.ChartName(name)) + ` -n ` + objects.ChartNamespace + ` --ignore-not-found --request-timeout=30s -o jsonpath='{.metadata.uid}') || exit 1
-echo "$g|$j"`
-}
-
-// waitReady waits on the control plane cp until app's chart, if it has
-// one, is installed as it is now, and its Deployments, StatefulSets and
-// DaemonSets are rolled out. before is the chart's state before the
-// apply.
-func waitReady(ctx context.Context, cp remote, app *deployfile.App, before chartState) error {
-	if app.Chart != "" {
-		if err := waitChart(ctx, cp, app.Name, before); err != nil {
-			return err
-		}
-	}
-	ns := sshclient.ShellQuote(app.Name)
-	_, err := run(ctx, cp, `set -e
-objs=$(k3s kubectl get deployments,statefulsets,daemonsets -n `+ns+` -o name --request-timeout=60s)
-for o in $objs; do
-	k3s kubectl rollout status "$o" -n `+ns+` --timeout=`+rolloutTimeout+` >/dev/null || {
-		k3s kubectl get pods -n `+ns+` -o wide >&2
-		k3s kubectl get events -n `+ns+` --sort-by=.lastTimestamp | tail -15 >&2
-		exit 1
-	}
-done`, "")
-	return err
-}
-
-// waitChart waits on the control plane cp until the Helm controller has
-// installed the HelmChart of the app called name as it is now: until its
-// install job, the one there before if the HelmChart's generation is
-// unchanged, or else a new one, has succeeded. Three failed pods of that
-// job fail it.
-func waitChart(ctx context.Context, cp remote, name string, before chartState) error {
-	_, err := run(ctx, cp, waitChartScript(name, before, chartWaitSeconds), "")
-	return err
-}
-
-// chartWaitSeconds is how long waitChart waits.
-var chartWaitSeconds = 300
-
-// waitChartScript waits seconds for the chart of the app called name to
-// be installed, as waitChart does.
-func waitChartScript(name string, before chartState, seconds int) string {
-	job := "helm-install-" + objects.ChartName(name)
-	chart := sshclient.ShellQuote(objects.ChartName(name))
-	return `old=` + sshclient.ShellQuote(before.job) + `
-gen=$(k3s kubectl get helmchart ` + chart + ` -n ` + objects.ChartNamespace + ` --request-timeout=30s -o jsonpath='{.metadata.generation}')
-[ "$gen" = ` + sshclient.ShellQuote(before.generation) + ` ] && changed= || changed=1
-for i in $(seq ` + strconv.Itoa(seconds) + `); do
-	IFS='|' read -r uid succeeded failed <<EOF
-$(k3s kubectl get job ` + job + ` -n ` + objects.ChartNamespace + ` --ignore-not-found --request-timeout=10s -o jsonpath='{.metadata.uid}|{.status.succeeded}|{.status.failed}')
-EOF
-	if [ -n "$uid" ] && { [ -z "$changed" ] || [ "$uid" != "$old" ]; }; then
-		[ "${succeeded:-0}" -ge 1 ] && exit 0
-		if [ "${failed:-0}" -ge 3 ]; then
-			k3s kubectl logs job/` + job + ` -n ` + objects.ChartNamespace + ` --tail=20 >&2
-			exit 1
-		fi
-	fi
-	sleep 1
-done
-echo "the chart isn't installed after ` + strconv.Itoa(seconds) + ` seconds" >&2
-exit 1`
-}
-
-// waitServices waits until the cluster's services on the control plane
-// cp are ready for apps, saying so if it has to.
-func waitServices(ctx context.Context, env Env, cp remote) error {
-	if _, err := run(ctx, cp, k3s.ServicesReadyScript, ""); err == nil {
-		return nil
-	}
-	say(env, "Waiting for cert-manager and Traefik...")
-	if _, err := run(ctx, cp, k3s.WaitServicesScript, ""); err != nil {
-		return fmt.Errorf("the cluster isn't ready for apps: %w", err)
-	}
-	return nil
-}
-
-// waitCertificate waits on the control plane cp until the certificate
-// called name of the app called app is issued.
-func waitCertificate(ctx context.Context, cp remote, app, name string) error {
-	ns := sshclient.ShellQuote(app)
-	cert := sshclient.ShellQuote("certificate/" + name)
-	_, err := run(ctx, cp, "for i in $(seq 30); do k3s kubectl get "+cert+" -n "+ns+" >/dev/null 2>&1 && break; sleep 1; done\nk3s kubectl wait --for=condition=Ready "+cert+" -n "+ns+" --timeout="+certificateTimeout+" >/dev/null 2>&1 || { k3s kubectl get "+cert+" -n "+ns+" -o jsonpath='{.status.conditions[*].message}' >&2; exit 1; }", "")
-	return err
 }
 
 // readSecrets reads the secrets called names from d's secret store.
@@ -564,7 +337,6 @@ func pushing(env Env, label string) (progress func(complete, total int64), pushe
 	line := "Pushing " + label + "..."
 	fmt.Fprint(f, line)
 	return func(complete, total int64) {
-		// A push of less than a megabyte has no bar.
 		if total < megabyte {
 			return
 		}
@@ -715,72 +487,4 @@ func railpackPlan(ctx context.Context, env Env, dir, tmp string) (string, map[st
 		return "", nil, fmt.Errorf("railpack prepare: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	return plan, map[string]string{"BUILDKIT_SYNTAX": frontend}, nil
-}
-
-// removeApp is mooctl deploy --remove: it removes the app named, or the
-// current directory's, from the cluster: its HelmChart, which uninstalls
-// its chart, its namespace, with everything in it, and its images.
-func removeApp(ctx context.Context, env Env, cmd *cli.Command) error {
-	var name string
-	switch cmd.NArg() {
-	case 0:
-		_, n, err := deployfile.ReadRef(".")
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("which app? name it, or run mooctl deploy --remove in its directory")
-		}
-		if err != nil {
-			return err
-		}
-		name = n
-	case 1:
-		name = cmd.Args().First()
-		if err := deployfile.CheckName(name); err != nil {
-			return err
-		}
-	default:
-		return wantArgs(cmd, 1)
-	}
-	ctx, stop := interrupt.Context(ctx, env.Exit)
-	defer stop()
-	d, err := openCluster(env, cmd)
-	if err != nil {
-		return err
-	}
-	cp, ok, err := d.ControlPlane()
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("cluster %s has no nodes", d.Cluster.Ref)
-	}
-	cpClient, err := dialNode(ctx, env, cp)
-	if err != nil {
-		return err
-	}
-	defer cpClient.Close()
-	ctx, release, err := hold(ctx, cpClient)
-	if err != nil {
-		return err
-	}
-	defer release()
-	label := sshclient.ShellQuote(objects.AppLabel + "=" + name)
-	out, err := run(ctx, cpClient, "k3s kubectl get namespaces -l "+label+" -o name --request-timeout=30s", "")
-	if err != nil {
-		return fmt.Errorf("looking for %s: %w", name, err)
-	}
-	if strings.TrimSpace(out) == "" {
-		return fmt.Errorf("there is no app %s on %s", name, d.Cluster.Ref)
-	}
-	say(env, "Removing %s from %s...", name, d.Cluster.Ref)
-	if err := registry.Remove(ctx, registryAddr(cp), name, cpClient.DialTCP); err != nil {
-		return err
-	}
-	script := "set -e\n" +
-		"k3s kubectl delete helmchart -n " + objects.ChartNamespace + " -l " + label + " --ignore-not-found --timeout=" + rolloutTimeout + " >/dev/null\n" +
-		"k3s kubectl delete namespace " + sshclient.ShellQuote(name) + " --ignore-not-found --timeout=" + rolloutTimeout + " >/dev/null"
-	if _, err := run(ctx, cpClient, script, ""); err != nil {
-		return fmt.Errorf("removing %s: %w", name, err)
-	}
-	fmt.Fprintf(env.Stdout, "Removed %s from %s\n", name, d.Cluster.Ref)
-	return nil
 }

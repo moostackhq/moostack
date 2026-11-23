@@ -1,0 +1,30 @@
+---
+apiVersion: v1
+data:
+    TOKEN: dA==
+kind: Secret
+metadata:
+    labels:
+        moostack.dev/app: web
+    name: web
+    namespace: web
+type: Opaque
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: config, labels: {tier: web, moostack.dev/app: "web"}}
+data:
+    date: 2024-01-02
+    octal: 0755
+    word: on
+---
+{"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "s", "labels": {moostack.dev/app: "web"}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, labels: {moostack.dev/app: "web"}}
+spec:
+    selector: {matchLabels: {app: web}}
+    template:
+        metadata: {labels: {app: web}}
+        spec: {containers: [{name: web, image: "moostack.local/web@sha256:2222"}]}

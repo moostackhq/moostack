@@ -16,14 +16,6 @@ var errNotYet = errors.New("the k3s backend can't do this yet")
 
 func notYet(method string) error { return fmt.Errorf("%s: %w", method, errNotYet) }
 
-func (b *Backend) Check(model.App) error { return notYet("Check") }
-
-func (b *Backend) Deploy(context.Context, model.App, func(orchestrator.Step)) error {
-	return notYet("Deploy")
-}
-
-func (b *Backend) Certificate(context.Context, string, string) error { return notYet("Certificate") }
-
 func (b *Backend) Remove(context.Context, string) error { return notYet("Remove") }
 
 func (b *Backend) Logs(context.Context, string, orchestrator.LogOptions, io.Writer) error {
@@ -47,8 +39,6 @@ func (b *Backend) RemoveNode(context.Context, string, orchestrator.Host, orchest
 func (b *Backend) Uninstall(context.Context, orchestrator.Host, model.Node) error {
 	return notYet("Uninstall")
 }
-
-func (b *Backend) Nodes(context.Context) ([]model.NodeState, error) { return nil, notYet("Nodes") }
 
 func (b *Backend) RunConsole(context.Context, string, []netip.Addr) error {
 	return notYet("RunConsole")

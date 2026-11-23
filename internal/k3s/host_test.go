@@ -4,16 +4,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"maps"
 	"net/netip"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
-
-	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -261,8 +257,6 @@ func TestNodeScriptsParse(t *testing.T) {
 		"uninstall cp":   k3s.UninstallScript(k3s.ControlPlane),
 		"uninstall node": k3s.UninstallScript(k3s.Agent),
 		"downloaded":     k3s.DownloadedScript,
-		"services ready": k3s.ServicesReadyScript,
-		"wait services":  k3s.WaitServicesScript,
 		"reach":          k3s.ReachScript(netip.MustParseAddr("10.0.0.2")),
 	}
 	for _, sh := range []string{"sh", "bash", "dash"} {
@@ -289,77 +283,6 @@ func TestUninstallRemovesOnlyWhatMooctlWrote(t *testing.T) {
 		if !strings.Contains(cp, want) {
 			t.Errorf("the control plane's uninstall lacks %s:\n%s", want, cp)
 		}
-	}
-}
-
-// fakeK3s is a k3s whose kubectl answers what ServicesReadyScript asks
-// from the files in its directory: issuer, webhook, traefik and pods.
-// It returns the PATH to run the script with.
-func fakeK3s(t *testing.T, state map[string]string) (string, string) {
-	t.Helper()
-	dir := t.TempDir()
-	for name, v := range state {
-		os.WriteFile(filepath.Join(dir, name), []byte(v), 0o644)
-	}
-	script := `#!/bin/sh
-d=$(dirname "$0")
-echo >> "$d/calls"
-answer() { [ -f "$d/$1" ] && cat "$d/$1"; }
-case "$*" in
-*"get clusterissuer"*) answer issuer ;;
-*"deployment cert-manager-webhook"*) answer webhook ;;
-*"daemonset traefik"*) answer traefik ;;
-*"get pods"*) answer pods ;;
-*) echo "fake k3s: $*" >&2; exit 1 ;;
-esac
-`
-	os.WriteFile(filepath.Join(dir, "k3s"), []byte(script), 0o755)
-	return "PATH=" + dir + ":/usr/bin:/bin", dir
-}
-
-func TestServicesReadyScriptNamesWhatIsntReady(t *testing.T) {
-	ready := map[string]string{"issuer": "True", "webhook": "1", "traefik": "1", "pods": "pod/svclb-traefik-x"}
-	for name, c := range map[string]struct {
-		unset   string
-		missing string
-	}{
-		"all ready":       {"", ""},
-		"no issuer":       {"issuer", " the issuer moostack,"},
-		"no webhook":      {"webhook", " cert-manager's webhook,"},
-		"no Traefik":      {"traefik", " Traefik,"},
-		"no Traefik pods": {"pods", " Traefik's ports,"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			state := maps.Clone(ready)
-			delete(state, c.unset)
-			path, _ := fakeK3s(t, state)
-			cmd := exec.Command("sh", "-c", k3s.ServicesReadyScript+`
-s=$?
-echo "[$missing]"
-exit $s`)
-			cmd.Env = []string{path}
-			out, err := cmd.Output()
-			if got := strings.TrimSpace(string(out)); got != "["+c.missing+"]" || (err == nil) != (c.missing == "") {
-				t.Errorf("printed %q, %v; want [%s]", got, err, c.missing)
-			}
-		})
-	}
-}
-
-func TestWaitServicesScriptEndsOnceReady(t *testing.T) {
-	path, dir := fakeK3s(t, map[string]string{"webhook": "1", "traefik": "1", "pods": "pod/svclb-traefik-x"})
-	cmd := exec.Command("sh", "-c", k3s.WaitServicesScript)
-	cmd.Env = []string{path}
-	go func() {
-		time.Sleep(3 * time.Second)
-		os.WriteFile(filepath.Join(dir, "issuer"), []byte("True"), 0o644)
-	}()
-	start := time.Now()
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("%v: %s", err, out)
-	}
-	if took := time.Since(start); took < 3*time.Second || took > 10*time.Second {
-		t.Errorf("the wait took %v", took)
 	}
 }
 

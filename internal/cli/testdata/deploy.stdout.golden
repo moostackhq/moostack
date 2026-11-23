@@ -1,0 +1,5 @@
+Deployed shop to prod
+Image: moostack.local/shop/api@sha256:<digest>
+Image: moostack.local/shop/jobs@sha256:<digest>
+URL: https://api.example.com
+URL: https://shop.example.com
