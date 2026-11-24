@@ -26,8 +26,10 @@ type Orchestrator interface {
 	Certificate(ctx context.Context, app, container string) error
 	// Remove removes the app. ErrNoApp if there is none.
 	Remove(ctx context.Context, app string) error
-	// Logs writes the logs of the app's containers to w. ErrNoApp if
-	// there is no such app.
+	// Logs writes the last lines of each container of the app's
+	// replicas to w, each line after its replica and container.
+	// ErrNoApp if there is no such app, ErrNoReplicas if it has no
+	// replicas.
 	Logs(ctx context.Context, app string, o LogOptions, w io.Writer) error
 	// Apps are the cluster's apps, ordered by name.
 	Apps(ctx context.Context) ([]model.AppState, error)
@@ -62,6 +64,9 @@ type Orchestrator interface {
 // have.
 var ErrNoApp = errors.New("no such app")
 
+// ErrNoReplicas is the error of Logs for an app that has no replicas.
+var ErrNoReplicas = errors.New("the app has no replicas")
+
 // Step is a step of a deploy that a command tells the operator of.
 type Step int
 
@@ -76,7 +81,8 @@ type LogOptions struct {
 	// Tail is how many of each container's last lines to start with, or
 	// -1 for all.
 	Tail int
-	// Follow keeps writing new lines until ctx ends or the replicas do.
+	// Follow keeps writing new lines until ctx ends or each log there
+	// at the call does.
 	Follow bool
 }
 

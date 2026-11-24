@@ -109,8 +109,6 @@ type fakeCluster struct {
 	ingressDials []string
 	// consoleFails makes the console never get ready.
 	consoleFails bool
-	// noPods makes every app have no pods.
-	noPods bool
 	// cordoned are the Kubernetes nodes marked unschedulable.
 	cordoned map[string]bool
 	// servicesDown makes the cluster's services not ready, until a wait
@@ -134,6 +132,9 @@ type fakeOrchestrator struct {
 	// onDeploy, if set, runs at each call of Deploy, whose result is its
 	// error if it returns one.
 	onDeploy func(ctx context.Context) error
+	// onApps, onRemove and onLogs, if set, run at each call of Apps, of
+	// Remove and of Logs.
+	onApps, onRemove, onLogs func()
 }
 
 func (o *fakeOrchestrator) called(format string, args ...any) {
@@ -191,6 +192,38 @@ func (o *fakeOrchestrator) Certificate(ctx context.Context, app, container strin
 		return errors.New("the challenge is pending")
 	}
 	return o.Fake.Certificate(ctx, app, container)
+}
+
+func (o *fakeOrchestrator) Apps(ctx context.Context) ([]model.AppState, error) {
+	o.called("Apps")
+	if o.onApps != nil {
+		o.onApps()
+	}
+	return o.Fake.Apps(ctx)
+}
+
+// Remove removes the app from the fake cluster's namespaces as well.
+func (o *fakeOrchestrator) Remove(ctx context.Context, app string) error {
+	o.called("Remove %s", app)
+	if o.onRemove != nil {
+		o.onRemove()
+	}
+	if err := o.Fake.Remove(ctx, app); err != nil {
+		return err
+	}
+	o.c.mu.Lock()
+	defer o.c.mu.Unlock()
+	delete(o.c.apps, app)
+	delete(o.deployed, app)
+	return nil
+}
+
+func (o *fakeOrchestrator) Logs(ctx context.Context, app string, opts orchestrator.LogOptions, w io.Writer) error {
+	o.called("Logs %s, tail %d, follow %t", app, opts.Tail, opts.Follow)
+	if o.onLogs != nil {
+		o.onLogs()
+	}
+	return o.Fake.Logs(ctx, app, opts, w)
 }
 
 // Nodes are the fake cluster's Kubernetes nodes.
@@ -417,14 +450,6 @@ func (f *fakeConn) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
 	return (&net.Dialer{}).DialContext(ctx, "tcp", f.c.registry)
 }
 
-func (f *fakeConn) Stream(_ context.Context, cmd string, _ io.Reader, stdout, _ io.Writer) (int, error) {
-	f.c.mu.Lock()
-	f.c.runs = append(f.c.runs, f.n.target+": "+cmd)
-	f.c.mu.Unlock()
-	fmt.Fprintln(stdout, "[pod/web-1/web] a log line")
-	return 0, nil
-}
-
 func (f *fakeConn) Lock(context.Context) (held, error) {
 	f.c.mu.Lock()
 	defer f.c.mu.Unlock()
@@ -457,8 +482,6 @@ var (
 	nodeNameInScript = regexp.MustCompile(`get node '([^']+)'`)
 	readyAtInScript  = regexp.MustCompile(`= "([0-9.]+) True"`)
 	quotedName       = regexp.MustCompile(`(?:delete node|drain|uncordon) '([^']+)'`)
-	labelInScript    = regexp.MustCompile(`moostack\.dev/app=([a-z0-9-]+)`)
-	deletedNamespace = regexp.MustCompile(`(?m)^k3s kubectl delete namespace '([^']+)'`)
 )
 
 func ok(stdout string) (sshclient.Result, error) {
@@ -527,11 +550,6 @@ func (f *fakeConn) Run(_ context.Context, cmd string, _ io.Reader) (sshclient.Re
 		return okJSON(items)
 	case strings.HasPrefix(cmd, "k3s kubectl get deployments,statefulsets,daemonsets,ingresses -A -o json"):
 		return okJSON(c.workloads)
-	case strings.HasPrefix(cmd, "k3s kubectl get pods -n "):
-		if c.noPods {
-			return ok("")
-		}
-		return ok("pod/web-1\n")
 	case strings.HasPrefix(cmd, "mkdir -p "):
 		return ok("")
 	case cmd == AppliedCommitScript:
@@ -615,12 +633,6 @@ func (f *fakeConn) Run(_ context.Context, cmd string, _ io.Reader) (sshclient.Re
 		delete(c.nodes, name)
 		return ok("")
 	case strings.Contains(first, "k3s kubectl get namespaces -l"):
-		if m := labelInScript.FindStringSubmatch(first); m != nil {
-			if _, found := c.apps[m[1]]; found {
-				return ok("namespace/" + m[1] + "\n")
-			}
-			return ok("")
-		}
 		var out []string
 		for a := range c.apps {
 			out = append(out, "namespace/"+a)
@@ -651,11 +663,6 @@ func (f *fakeConn) Run(_ context.Context, cmd string, _ io.Reader) (sshclient.Re
 	case cmd == k3s.ConsoleReadyScript:
 		if c.consoleFails {
 			return fail(1, "error: timed out waiting for the condition")
-		}
-		return ok("")
-	case strings.HasPrefix(first, "set -e") && strings.Contains(cmd, "delete namespace"):
-		if m := deletedNamespace.FindStringSubmatch(cmd); m != nil {
-			delete(c.apps, m[1])
 		}
 		return ok("")
 	}

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -661,25 +662,25 @@ func TestADeployLeavesARecordedKindTheClusterNoLongerHasAndWhatIsntTheAppsToDele
 	}
 }
 
-// blocked fails the test if a deploy that reports to done has returned
+// blocked fails the test if a call that reports to done has returned
 // within d.
 func blocked(t *testing.T, done <-chan error, d time.Duration, why string) {
 	t.Helper()
 	select {
 	case err := <-done:
-		t.Fatalf("Deploy returned %v, %s", err, why)
+		t.Fatalf("the call returned %v, %s", err, why)
 	case <-time.After(d):
 	}
 }
 
-// returned is what a deploy reports to done, within a minute.
+// returned is what a call reports to done, within a minute.
 func returned(t *testing.T, done <-chan error) error {
 	t.Helper()
 	select {
 	case err := <-done:
 		return err
 	case <-time.After(time.Minute):
-		t.Fatal("Deploy didn't return")
+		t.Fatal("the call didn't return")
 		return nil
 	}
 }
@@ -1740,4 +1741,559 @@ func TestTheKubeconfigIsInNoErrorAndNoFile(t *testing.T) {
 	if len(written) != 0 {
 		t.Errorf("the calls wrote the files %q", written)
 	}
+}
+
+// held makes a ConfigMap in the app's namespace that stays, though
+// deleted, until the test ends or release is called.
+func held(t *testing.T, app string) (release func()) {
+	t.Helper()
+	maps := admin.CoreV1().ConfigMaps(app)
+	m := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "held", Finalizers: []string{"example.test/held"}}}
+	if _, err := maps.Create(context.Background(), m, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	release = sync.OnceFunc(func() {
+		maps.Patch(context.Background(), "held", types.MergePatchType, []byte(`{"metadata":{"finalizers":null}}`), metav1.PatchOptions{})
+	})
+	t.Cleanup(release)
+	return release
+}
+
+// charts are the names of the HelmCharts of the app called app.
+func charts(t *testing.T, app string) []string {
+	t.Helper()
+	list, err := objects.Resource(helmCharts).Namespace("kube-system").List(context.Background(), metav1.ListOptions{LabelSelector: appLabel + "=" + app})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, c := range list.Items {
+		names = append(names, c.GetName())
+	}
+	return names
+}
+
+// terminating reports whether the namespace called name is being
+// deleted.
+func terminating(t *testing.T, name string) bool {
+	t.Helper()
+	ns, err := admin.CoreV1().Namespaces().Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ns.DeletionTimestamp != nil
+}
+
+// remove starts a removal of the app that has two minutes, and returns
+// where it reports.
+func remove(t *testing.T, b *k3s.Backend, app string) <-chan error {
+	done := make(chan error, 1)
+	go func() { done <- b.Remove(within(t, 2*time.Minute), app) }()
+	return done
+}
+
+func TestARemovalOfAnAppOfContainersReturnsOnceNothingOfItIsLeft(t *testing.T) {
+	b := deployer(t)
+	name, other := unique("removed"), unique("kept")
+	deploy(t, b, shop(name))
+	deploy(t, b, shop(other))
+	release := held(t, name)
+	done := remove(t, b, name)
+	blocked(t, done, 3*time.Second, "with an object of the app still there")
+	if !terminating(t, name) {
+		t.Error("the app's namespace isn't being deleted")
+	}
+	release()
+	if err := returned(t, done); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	absent(t, name)
+	if terminating(t, other) || !slices.Equal(applied(t, other), objectsOf(shop(other))) {
+		t.Errorf("removing %s left of %s: %q", name, other, applied(t, other))
+	}
+}
+
+func TestARemovalOfAnAppOfAChartRemovesItsChartAndThenItsNamespace(t *testing.T) {
+	b := deployer(t)
+	name := unique("unchart")
+	cleared(t, name)
+	stop := helm(t, name, corev1.PodSucceeded)
+	if err := b.Deploy(within(t, 2*time.Minute), chartOf(t, name, "one"), func(orchestrator.Step) {}); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	stop()
+	done := remove(t, b, name)
+	blocked(t, done, 4*time.Second, "with the chart's uninstall not ended")
+	if terminating(t, name) {
+		t.Error("the app's namespace is being deleted with its chart still installed")
+	}
+	helm(t, name, corev1.PodSucceeded)
+	if err := returned(t, done); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	absent(t, name)
+	if left := charts(t, name); len(left) != 0 {
+		t.Errorf("the removal left the HelmCharts %q", left)
+	}
+}
+
+func TestARemovalOfAnAppOfManifestsLeavesNothing(t *testing.T) {
+	b := deployer(t)
+	name := unique("unmanifest")
+	deploy(t, b, manifestsOf(t, name, deployment, "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: settings}\n"))
+	if err := b.Remove(within(t, time.Minute), name); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	absent(t, name)
+}
+
+func TestRemoveOfAnAppTheClusterDoesntHaveIsErrNoAppAndRemovesNothing(t *testing.T) {
+	b := deployer(t)
+	if err := b.Remove(within(t, time.Minute), unique("absent")); !errors.Is(err, orchestrator.ErrNoApp) {
+		t.Errorf("Remove of an app never deployed: %v, want ErrNoApp", err)
+	}
+	// A namespace that isn't an app's, one of another app's, and the
+	// chart of an app whose namespace isn't its own.
+	plain, other := unique("plain"), unique("other")
+	cleared(t, plain)
+	cleared(t, other)
+	createNamespace(t, plain)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: other, Labels: map[string]string{appLabel: "shop"}}}
+	if _, err := admin.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	chart := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "helm.cattle.io/v1",
+		"kind":       "HelmChart",
+		"metadata":   map[string]any{"name": "app-" + plain, "namespace": "kube-system", "labels": map[string]any{appLabel: plain}},
+		"spec":       map[string]any{"chart": "none", "targetNamespace": plain},
+	}}
+	if _, err := objects.Resource(helmCharts).Namespace("kube-system").Create(context.Background(), chart, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{plain, other, "kube-system"} {
+		if err := b.Remove(within(t, time.Minute), name); !errors.Is(err, orchestrator.ErrNoApp) {
+			t.Errorf("Remove of %s, a namespace that isn't the app's: %v, want ErrNoApp", name, err)
+		}
+		if terminating(t, name) {
+			t.Errorf("the namespace %s, which isn't an app's, is being deleted", name)
+		}
+	}
+	if left := charts(t, plain); len(left) != 1 {
+		t.Errorf("the HelmCharts labelled as %s's are %q, want the one left", plain, left)
+	}
+}
+
+func TestARemovalThatFailsAtAnyRequestAndIsRunAgainEndsWithTheAppGone(t *testing.T) {
+	for kind, app := range map[string]func(t *testing.T, name string) model.App{
+		"containers": func(_ *testing.T, name string) model.App { return shop(name) },
+		"chart":      func(t *testing.T, name string) model.App { return chartOf(t, name, "one") },
+	} {
+		for how, answered := range map[string]bool{"the request never sent": false, "its answer lost": true} {
+			t.Run(kind+", "+how, func(t *testing.T) {
+				t.Parallel()
+				for n := 1; ; n++ {
+					if n > 50 {
+						t.Fatal("a removal made more than 50 requests")
+					}
+					name := unique("crash")
+					cleared(t, name)
+					kubelet(t, name)
+					helm(t, name, corev1.PodSucceeded)
+					if err := deployer(t).Deploy(within(t, 2*time.Minute), app(t, name), func(orchestrator.Step) {}); err != nil {
+						t.Fatalf("Deploy: %v", err)
+					}
+					b, requests := losing(t, n, answered)
+					err := b.Remove(within(t, 2*time.Minute), name)
+					if *requests < n {
+						if err != nil {
+							t.Fatalf("Remove with no request failed: %v", err)
+						}
+						if n < 4 {
+							t.Errorf("the removal made %d requests, too few to have removed anything", *requests)
+						}
+						absent(t, name)
+						return
+					}
+					if err == nil {
+						t.Errorf("Remove whose request %d failed succeeded", n)
+					}
+					// Only a removal that got as far as the namespace may
+					// find no app when it is run again.
+					before := len(charts(t, name))
+					err = deployer(t).Remove(within(t, 2*time.Minute), name)
+					if err != nil && !(errors.Is(err, orchestrator.ErrNoApp) && before == 0) {
+						t.Fatalf("Remove again after request %d failed: %v, with %d charts of the app left", n, err, before)
+					}
+					absent(t, name)
+					if left := charts(t, name); len(left) != 0 {
+						t.Errorf("after request %d failed and a removal again, the HelmCharts %q are left", n, left)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestARemovalInterruptedWhileItWaitsFailsWithTheCauseAndRunAgainFinishes(t *testing.T) {
+	b := deployer(t)
+	name := unique("cutremoval")
+	deploy(t, b, shop(name))
+	release := held(t, name)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cause := errors.New("interrupted")
+	done := make(chan error, 1)
+	go func() { done <- b.Remove(ctx, name) }()
+	blocked(t, done, 3*time.Second, "with an object of the app still there")
+	cancel(cause)
+	if err := returned(t, done); err == nil || err.Error() != cause.Error() {
+		t.Errorf("Remove: %v, want the context's cause alone", err)
+	}
+	// The app is still there for the removal run again, which waits too.
+	again := remove(t, b, name)
+	blocked(t, again, 3*time.Second, "with an object of the app still there")
+	release()
+	if err := returned(t, again); err != nil {
+		t.Errorf("Remove again: %v", err)
+	}
+	absent(t, name)
+}
+
+func TestARemovalThatIsntDoneInTimeSaysTheAppIsStillThere(t *testing.T) {
+	b := deployer(t)
+	name := unique("slowremoval")
+	deploy(t, b, shop(name))
+	held(t, name)
+	err := b.Remove(within(t, 4*time.Second), name)
+	if want := "removing " + name + ": it is still there"; err == nil || err.Error() != want {
+		t.Errorf("Remove: %v, want %q", err, want)
+	}
+}
+
+func TestARemovalOnAnEndedContextFailsAndRemovesNothing(t *testing.T) {
+	b := deployer(t)
+	name := unique("kept")
+	deploy(t, b, shop(name))
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cause := errors.New("the operation lock is lost")
+	cancel(cause)
+	if err := b.Remove(ctx, name); !errors.Is(err, cause) {
+		t.Errorf("Remove on an ended context: %v, want its cause", err)
+	}
+	if terminating(t, name) {
+		t.Error("a removal on an ended context deleted the app's namespace")
+	}
+}
+
+// appNamed is the app called name among the cluster's apps.
+func appNamed(t *testing.T, b *k3s.Backend, name string) (model.AppState, bool) {
+	t.Helper()
+	apps, err := b.Apps(within(t, time.Minute))
+	if err != nil {
+		t.Fatalf("Apps: %v", err)
+	}
+	if !slices.IsSortedFunc(apps, func(x, y model.AppState) int { return strings.Compare(x.Name, y.Name) }) {
+		t.Errorf("Apps isn't ordered by name: %+v", apps)
+	}
+	i := slices.IndexFunc(apps, func(a model.AppState) bool { return a.Name == name })
+	if i < 0 {
+		return model.AppState{}, false
+	}
+	return apps[i], true
+}
+
+func TestAppsAreTheClustersAppsWithTheirReplicasImagesAndHosts(t *testing.T) {
+	b := deployer(t)
+	name := unique("state")
+	cleared(t, name)
+	if _, ok := appNamed(t, b, name); ok {
+		t.Fatalf("Apps has %s before its deploy", name)
+	}
+	// With no pod ready, the deploy doesn't end.
+	app := shop(name)
+	app.Containers = append(app.Containers, model.Container{Name: "cron", Image: "example.test/worker:1", Replicas: 1})
+	if err := b.Deploy(within(t, 3*time.Second), app, func(orchestrator.Step) {}); err == nil {
+		t.Fatal("Deploy succeeded with no pod ready")
+	}
+	want := model.AppState{
+		Name: name, Ready: 0, Want: 4,
+		Images: []string{"example.test/worker:1", "example.test/web:1"},
+		Hosts:  []string{name + ".example.test"},
+	}
+	if got, _ := appNamed(t, b, name); !reflect.DeepEqual(got, want) {
+		t.Errorf("the app with no pod ready is\n%+v, want\n%+v", got, want)
+	}
+	deploy(t, b, app)
+	want.Ready = 4
+	if got, _ := appNamed(t, b, name); !reflect.DeepEqual(got, want) {
+		t.Errorf("the app deployed is\n%+v, want\n%+v", got, want)
+	}
+	// What isn't an app's is none: the cluster's own namespaces.
+	for _, own := range []string{"kube-system", "cert-manager", "default"} {
+		if _, ok := appNamed(t, b, own); ok {
+			t.Errorf("Apps has %s, a namespace of the cluster's own", own)
+		}
+	}
+	if err := b.Remove(within(t, time.Minute), name); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if _, ok := appNamed(t, b, name); ok {
+		t.Errorf("Apps has %s after its removal", name)
+	}
+}
+
+func TestAnAppOfManifestsHasTheReplicasOfItsStatefulSetsAndDaemonSetsToo(t *testing.T) {
+	b := deployer(t)
+	name := unique("sets")
+	deploy(t, b, manifestsOf(t, name, deployment, statefulSet, daemonSet))
+	got, ok := appNamed(t, b, name)
+	if !ok {
+		t.Fatalf("Apps lacks %s", name)
+	}
+	// Two replicas of the Deployment, two of the StatefulSet, and the
+	// DaemonSet's on the cluster's one node.
+	want := model.AppState{Name: name, Ready: 5, Want: 5, Images: []string{"example.test/web", "example.test/db", "example.test/agent"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("the app is\n%+v, want\n%+v", got, want)
+	}
+}
+
+func TestAppsAndRunningOnAnEndedContextFailWithItsCause(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cause := errors.New("interrupted")
+	cancel(cause)
+	if _, err := deployer(t).Apps(ctx); err == nil || err.Error() != cause.Error() {
+		t.Errorf("Apps on an ended context: %v, want its cause alone", err)
+	}
+	if _, err := deployer(t).Running(ctx); err == nil || err.Error() != cause.Error() {
+		t.Errorf("Running on an ended context: %v, want its cause alone", err)
+	}
+}
+
+func TestOnlyANamespaceNamedAsItsLabelSaysIsAnApp(t *testing.T) {
+	b := deployer(t)
+	name, other := unique("named"), unique("mislabelled")
+	deploy(t, b, shop(name))
+	cleared(t, other)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: other, Labels: map[string]string{appLabel: name}}}
+	if _, err := admin.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	apps, err := b.Apps(within(t, time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []model.AppState
+	for _, a := range apps {
+		if a.Name == name || a.Name == other {
+			got = append(got, a)
+		}
+	}
+	if len(got) != 1 || got[0].Name != name || got[0].Want != 3 {
+		t.Errorf("of %s and the namespace %s labelled as it, Apps has %+v, want the app alone, once", name, other, got)
+	}
+	// Each app Apps lists, Remove finds.
+	if err := b.Remove(within(t, time.Minute), name); err != nil {
+		t.Errorf("Remove of an app Apps lists: %v", err)
+	}
+}
+
+func TestAnAppsStateLeavesOutInitContainersRulesWithoutAHostAndCountsWhatIsntReady(t *testing.T) {
+	b := deployer(t)
+	name := unique("parts")
+	cleared(t, name)
+	app := manifestsOf(t, name, `apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web}
+spec:
+  replicas: 0
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      initContainers: [{name: migrate, image: example.test/migrate}]
+      containers: [{name: web, image: example.test/web}]`, daemonSet, `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: web}
+spec:
+  rules:
+    - host: `+name+`.example.test
+      http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: web, port: {number: 80}}}}]}
+    - http: {paths: [{path: /any, pathType: Prefix, backend: {service: {name: web, port: {number: 80}}}}]}`)
+	// With no pod ready, the deploy doesn't end.
+	if err := b.Deploy(within(t, 3*time.Second), app, func(orchestrator.Step) {}); err == nil {
+		t.Fatal("Deploy succeeded with no pod ready")
+	}
+	want := model.AppState{Name: name, Ready: 0, Want: 1, Images: []string{"example.test/web", "example.test/agent"}, Hosts: []string{name + ".example.test"}}
+	if got, _ := appNamed(t, b, name); !reflect.DeepEqual(got, want) {
+		t.Errorf("the app is\n%+v, want\n%+v", got, want)
+	}
+}
+
+// cutting is a backend whose context cancel ends with cause at its
+// request number n to the API, counted from 1.
+func cutting(t *testing.T, n int, cancel context.CancelCauseFunc, cause error) *k3s.Backend {
+	t.Helper()
+	requests := 0
+	config := rest.CopyConfig(adminConfig)
+	config.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+		return roundTripper(func(r *http.Request) (*http.Response, error) {
+			if requests++; requests == n {
+				cancel(cause)
+			}
+			return rt.RoundTrip(r)
+		})
+	})
+	b, err := k3s.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestAReadOfTheClustersStateWhoseContextEndsAtARequestFailsWithTheCause(t *testing.T) {
+	cause := errors.New("the operation lock is lost")
+	for name, read := range map[string]func(b *k3s.Backend, ctx context.Context) error{
+		"Apps":    func(b *k3s.Backend, ctx context.Context) error { _, err := b.Apps(ctx); return err },
+		"Nodes":   func(b *k3s.Backend, ctx context.Context) error { _, err := b.Nodes(ctx); return err },
+		"Running": func(b *k3s.Backend, ctx context.Context) error { _, err := b.Running(ctx); return err },
+	} {
+		for n := 1; n <= 2; n++ {
+			if name != "Apps" && n > 1 {
+				continue
+			}
+			ctx, cancel := context.WithCancelCause(context.Background())
+			if err := read(cutting(t, n, cancel, cause), ctx); err == nil || err.Error() != cause.Error() {
+				t.Errorf("%s whose context ended at its request %d: %v, want the cause alone", name, n, err)
+			}
+		}
+	}
+}
+
+func TestARemovalWhoseChartIsntGoneInTimeSaysSoAndLeavesTheNamespace(t *testing.T) {
+	b := deployer(t)
+	name := unique("heldchart")
+	cleared(t, name)
+	stop := helm(t, name, corev1.PodSucceeded)
+	if err := b.Deploy(within(t, 2*time.Minute), chartOf(t, name, "one"), func(orchestrator.Step) {}); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	stop()
+	err := b.Remove(within(t, 4*time.Second), name)
+	if want := "removing " + name + "'s chart: it is still there"; err == nil || err.Error() != want {
+		t.Errorf("Remove: %v, want %q", err, want)
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cause := errors.New("interrupted")
+	done := make(chan error, 1)
+	go func() { done <- b.Remove(ctx, name) }()
+	blocked(t, done, 3*time.Second, "with the chart's uninstall not ended")
+	cancel(cause)
+	if err := returned(t, done); err == nil || err.Error() != cause.Error() {
+		t.Errorf("Remove interrupted while it waits for the chart: %v, want the cause alone", err)
+	}
+	if terminating(t, name) {
+		t.Error("the app's namespace is being deleted with its chart still installed")
+	}
+}
+
+func TestAnOperationThatCantReadTheAppSaysItLookedForIt(t *testing.T) {
+	name := unique("unread")
+	deploy(t, deployer(t), shop(name))
+	for operation, call := range map[string]func(b *k3s.Backend, ctx context.Context) error{
+		"Remove":      func(b *k3s.Backend, ctx context.Context) error { return b.Remove(ctx, name) },
+		"Certificate": func(b *k3s.Backend, ctx context.Context) error { return b.Certificate(ctx, name, "web") },
+		"Logs": func(b *k3s.Backend, ctx context.Context) error {
+			return b.Logs(ctx, name, orchestrator.LogOptions{Tail: 1}, io.Discard)
+		},
+	} {
+		b, _ := failing(t, 1)
+		err := call(b, within(t, time.Minute))
+		if err == nil || !strings.HasPrefix(err.Error(), "looking for "+name+": ") || !strings.HasSuffix(err.Error(), "the connection is lost") {
+			t.Errorf("%s whose first request failed: %v, want it to say it looked for the app, and why", operation, err)
+		}
+	}
+	if terminating(t, name) {
+		t.Error("an operation that couldn't read the app removed it")
+	}
+}
+
+func TestADeployOfAnAppBeingRemovedIsRefusedUntilItIsGone(t *testing.T) {
+	b := deployer(t)
+	refused := func(t *testing.T, app model.App) {
+		t.Helper()
+		var steps []orchestrator.Step
+		err := b.Deploy(within(t, time.Minute), app, func(s orchestrator.Step) { steps = append(steps, s) })
+		if want := app.Name + " is being removed; remove it again, then deploy it"; err == nil || err.Error() != want {
+			t.Errorf("Deploy of an app being removed: %v, want %q", err, want)
+		}
+		if slices.Contains(steps, orchestrator.WaitingForReady) {
+			t.Errorf("the refused deploy told the steps %v", steps)
+		}
+	}
+	t.Run("containers", func(t *testing.T) {
+		name := unique("leaving")
+		deploy(t, b, shop(name))
+		release := held(t, name)
+		if err := b.Remove(within(t, 3*time.Second), name); err == nil {
+			t.Fatal("Remove succeeded with an object of the app held")
+		}
+		before := record(t, name)
+		changed := shop(name)
+		changed.Containers = changed.Containers[:1]
+		refused(t, changed)
+		if got := record(t, name); !slices.Equal(got, before) {
+			t.Errorf("the refused deploy changed the record from %q to %q", before, got)
+		}
+		release()
+		if err := b.Remove(within(t, time.Minute), name); err != nil && !errors.Is(err, orchestrator.ErrNoApp) {
+			t.Fatalf("Remove again: %v", err)
+		}
+		deploy(t, b, changed)
+		if terminating(t, name) {
+			t.Error("the app deployed after its removal is being removed")
+		}
+	})
+	t.Run("its chart alone", func(t *testing.T) {
+		name := unique("leavingchart")
+		cleared(t, name)
+		stop := helm(t, name, corev1.PodSucceeded)
+		app := chartOf(t, name, "one")
+		if err := b.Deploy(within(t, 2*time.Minute), app, func(orchestrator.Step) {}); err != nil {
+			t.Fatalf("Deploy: %v", err)
+		}
+		kept := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "kept"}}
+		if _, err := admin.CoreV1().ConfigMaps(name).Create(context.Background(), kept, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		first := installJob(t, name)
+		stop()
+		// A deploy of the app without its chart deletes the chart, and
+		// is cut off while the chart is uninstalled.
+		err := b.Deploy(within(t, 3*time.Second), shop(name), func(orchestrator.Step) {})
+		if want := "removing " + name + "'s chart: it is still there"; err == nil || err.Error() != want {
+			t.Fatalf("Deploy of the app without its chart, with the uninstall not ended: %v, want %q", err, want)
+		}
+		err = b.Deploy(within(t, 3*time.Second), app, func(orchestrator.Step) {})
+		if want := name + "'s chart of before is still being uninstalled"; err == nil || err.Error() != want {
+			t.Errorf("Deploy of the chart with the one before not uninstalled in time: %v, want %q", err, want)
+		}
+		done := make(chan error, 1)
+		go func() { done <- b.Deploy(within(t, 2*time.Minute), app, func(orchestrator.Step) {}) }()
+		blocked(t, done, 3*time.Second, "with the chart of before still being uninstalled")
+		helm(t, name, corev1.PodSucceeded)
+		if err := returned(t, done); err != nil {
+			t.Fatalf("Deploy of the chart once the one before is uninstalled: %v", err)
+		}
+		chart, err := objects.Resource(helmCharts).Namespace("kube-system").Get(context.Background(), "app-"+name, metav1.GetOptions{})
+		if err != nil || chart.GetDeletionTimestamp() != nil {
+			t.Errorf("the HelmChart after the deploy: %v, deleted at %v, want a new one", err, chart.GetDeletionTimestamp())
+		}
+		if again := installJob(t, name); again == first {
+			t.Error("the deploy returned on the install job of the chart before")
+		}
+		if _, err := admin.CoreV1().ConfigMaps(name).Get(context.Background(), "kept", metav1.GetOptions{}); err != nil || terminating(t, name) {
+			t.Errorf("what the namespace held is gone, or the namespace is being deleted: %v", err)
+		}
+	})
 }

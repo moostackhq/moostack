@@ -33,7 +33,8 @@ const (
 	// fieldManager is the name objects are applied under.
 	fieldManager = "mooctl"
 	// rolloutTimeout bounds waiting for an app's replicas, for its
-	// chart's install and for the removal of its chart.
+	// chart's install, for the removal of its chart and for the removal
+	// of its namespace.
 	rolloutTimeout = 5 * time.Minute
 	// certificateTimeout bounds waiting for a container's certificate.
 	certificateTimeout = 2 * time.Minute
@@ -49,12 +50,15 @@ const (
 // it applies them. It deletes the HelmChart of an app without a chart,
 // and the recorded objects app no longer has. It refuses, with nothing
 // applied, an object of app's manifests whose kind isn't kept in a
-// namespace or that the cluster doesn't have, and an app whose
-// namespace is there and isn't an app's. Last it waits until the
-// chart is installed and every Deployment, StatefulSet and DaemonSet of
-// the namespace runs as applied, for rolloutTimeout or until ctx's
-// deadline, and then fails with the namespace's pods and last events.
-// If ctx ends otherwise, it fails with ctx's cause.
+// namespace or that the cluster doesn't have, an app whose namespace
+// is there and isn't an app's, and one whose namespace is being
+// deleted. Before it reads or applies the chart of an app that has
+// one, it waits until no HelmChart of the app is being deleted. Last it
+// waits until the chart is installed and every
+// Deployment, StatefulSet and DaemonSet of the namespace runs as
+// applied, for rolloutTimeout or until ctx's deadline, and then fails
+// with the namespace's pods and last events. If ctx ends otherwise, it
+// fails with ctx's cause.
 func (b *Backend) Deploy(ctx context.Context, app model.App, step func(orchestrator.Step)) error {
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
@@ -100,6 +104,9 @@ func (b *Backend) deploy(ctx context.Context, app model.App, step func(orchestra
 	}
 	var before chartState
 	if app.Chart != "" {
+		if err := a.waitUninstalled(ctx, app.Name); err != nil {
+			return err
+		}
 		if before, err = a.chartState(ctx, app.Name); err != nil {
 			return fmt.Errorf("reading %s's chart: %w", app.Name, err)
 		}
@@ -174,6 +181,9 @@ func (a *api) apply(ctx context.Context, app model.App, cluster, own []*unstruct
 	if err == nil && existing.Labels[appLabel] != app.Name {
 		return fmt.Errorf("the cluster has a namespace %s that isn't an app's; name the app otherwise", ns)
 	}
+	if err == nil && existing.DeletionTimestamp != nil {
+		return fmt.Errorf("%s is being removed; remove it again, then deploy it", app.Name)
+	}
 	for _, o := range cluster {
 		if err := a.applyObject(ctx, o); err != nil {
 			return fmt.Errorf("applying %s's objects: %w", app.Name, err)
@@ -236,6 +246,26 @@ func (a *api) applyObject(ctx context.Context, o *unstructured.Unstructured) err
 	}
 	if _, err := r.Apply(ctx, o.GetName(), o, metav1.ApplyOptions{FieldManager: fieldManager, Force: true}); err != nil {
 		return fmt.Errorf("%s: %w", kindAndName(o), err)
+	}
+	return nil
+}
+
+// waitUninstalled waits until no HelmChart of the app called app is
+// being deleted, for rolloutTimeout or until ctx's deadline.
+func (a *api) waitUninstalled(ctx context.Context, app string) error {
+	charts := a.dynamic.Resource(helmCharts).Namespace(chartNamespace)
+	err := poll(ctx, rolloutTimeout, time.Second, func(ctx context.Context) (bool, error) {
+		list, err := charts.List(ctx, metav1.ListOptions{LabelSelector: appLabel + "=" + app})
+		if err != nil {
+			return false, err
+		}
+		return !slices.ContainsFunc(list.Items, func(c unstructured.Unstructured) bool { return c.GetDeletionTimestamp() != nil }), nil
+	})
+	if errors.Is(err, errNotInTime) {
+		return fmt.Errorf("%s's chart of before is still being uninstalled", app)
+	}
+	if err != nil {
+		return fmt.Errorf("reading %s's chart: %w", app, err)
 	}
 	return nil
 }
@@ -608,16 +638,13 @@ func (b *Backend) certificate(ctx context.Context, app, container string) error 
 	if err != nil {
 		return err
 	}
-	ns, err := a.client.CoreV1().Namespaces().Get(ctx, namespaceOf(app), metav1.GetOptions{})
-	if apierrors.IsNotFound(err) || err == nil && ns.Labels[appLabel] != app {
-		return orchestrator.ErrNoApp
-	}
+	ns, err := a.namespace(ctx, app)
 	if err != nil {
 		return err
 	}
 	said := "it isn't asked for yet"
 	err = poll(ctx, certificateTimeout, time.Second, func(ctx context.Context) (bool, error) {
-		cert, err := a.dynamic.Resource(certificates).Namespace(ns.Name).Get(ctx, tlsSecret(container), metav1.GetOptions{})
+		cert, err := a.dynamic.Resource(certificates).Namespace(ns).Get(ctx, tlsSecret(container), metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
@@ -648,4 +675,62 @@ func (b *Backend) certificate(ctx context.Context, app, container string) error 
 		return errors.New(said)
 	}
 	return err
+}
+
+// namespace is the namespace of the app called app: the one
+// namespaceOf names, if it carries appLabel with the app's name. It
+// fails with ErrNoApp if the cluster has none such.
+func (a *api) namespace(ctx context.Context, app string) (string, error) {
+	ns, err := a.client.CoreV1().Namespaces().Get(ctx, namespaceOf(app), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) || err == nil && ns.Labels[appLabel] != app {
+		return "", orchestrator.ErrNoApp
+	}
+	if err != nil {
+		return "", fmt.Errorf("looking for %s: %w", app, err)
+	}
+	return ns.Name, nil
+}
+
+// Remove deletes the app's HelmCharts, which uninstalls its chart, and
+// once they are gone its namespace, with everything in it. It returns
+// once the namespace is gone. Each of the two has rolloutTimeout, or
+// until ctx's deadline. If ctx ends otherwise, it fails with ctx's
+// cause.
+func (b *Backend) Remove(ctx context.Context, app string) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	return causeIfEnded(ctx, b.remove(ctx, app))
+}
+
+func (b *Backend) remove(ctx context.Context, app string) error {
+	a, err := b.connect(ctx)
+	if err != nil {
+		return err
+	}
+	ns, err := a.namespace(ctx, app)
+	if err != nil {
+		return err
+	}
+	if err := a.deleteCharts(ctx, app); err != nil {
+		return fmt.Errorf("removing %s's chart: %w", app, err)
+	}
+	namespaces := a.client.CoreV1().Namespaces()
+	if err := namespaces.Delete(ctx, ns, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("removing %s: %w", app, err)
+	}
+	err = poll(ctx, rolloutTimeout, time.Second, func(ctx context.Context) (bool, error) {
+		_, err := namespaces.Get(ctx, ns, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	})
+	if errors.Is(err, errNotInTime) {
+		return fmt.Errorf("removing %s: it is still there", app)
+	}
+	if err != nil {
+		return fmt.Errorf("removing %s: %w", app, err)
+	}
+	return nil
 }

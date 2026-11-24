@@ -30,6 +30,9 @@ const undoTimeout = 5 * time.Minute
 // uncordonTimeout bounds putting a node back after a failed drain.
 const uncordonTimeout = 30 * time.Second
 
+// appLabel is the label that marks an app's namespace with its name.
+const appLabel = "moostack.dev/app"
+
 // nodeAdd is mooctl cluster node-add.
 func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err := wantArgs(cmd, 1); err != nil {

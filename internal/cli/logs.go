@@ -6,13 +6,11 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 
 	"github.com/urfave/cli/v3"
 
 	"github.com/moostackhq/moostack/internal/deployfile"
-	"github.com/moostackhq/moostack/internal/sshclient"
+	"github.com/moostackhq/moostack/internal/orchestrator"
 )
 
 func logsCommand(env Env) *cli.Command {
@@ -46,6 +44,10 @@ func logs(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err := deployfile.CheckName(app); err != nil {
 		return err
 	}
+	tail := cmd.Int("tail")
+	if tail < -1 {
+		return fmt.Errorf("--tail %d: it is a number of lines, or -1 for all", tail)
+	}
 	d, err := openCluster(env, cmd)
 	if err != nil {
 		return err
@@ -64,35 +66,16 @@ func logs(ctx context.Context, env Env, cmd *cli.Command) error {
 		return err
 	}
 	defer c.Close()
-	ns := sshclient.ShellQuote(app)
-	out, err := run(ctx, c, "k3s kubectl get namespaces -l "+sshclient.ShellQuote(appLabel+"="+app)+" -o name --request-timeout=30s", "")
-	if err != nil {
-		return fmt.Errorf("looking for %s: %w", app, err)
-	}
-	if strings.TrimSpace(out) == "" {
-		return fmt.Errorf("there is no app %s on %s", app, d.Cluster.Ref)
-	}
-	pods, err := run(ctx, c, "k3s kubectl get pods -n "+ns+" -o name --request-timeout=30s", "")
-	if err != nil {
-		return fmt.Errorf("listing %s's pods: %w", app, err)
-	}
-	if strings.TrimSpace(pods) == "" {
-		return fmt.Errorf("%s has no pods", app)
-	}
-	// Every pod of the namespace.
-	script := "k3s kubectl logs -n " + ns + " -l '!moostack.dev/none' --all-containers --prefix --ignore-errors --max-log-requests=50 --tail=" + strconv.Itoa(cmd.Int("tail"))
-	if cmd.Bool("follow") {
-		script += " --follow"
-	}
-	code, err := c.Stream(ctx, script, nil, env.Stdout, env.Stderr)
-	if ctx.Err() != nil {
+	err = orchestratorThrough(env, c).Logs(ctx, app, orchestrator.LogOptions{Tail: tail, Follow: cmd.Bool("follow")}, env.Stdout)
+	switch {
+	case ctx.Err() != nil:
 		return nil
-	}
-	if err != nil {
+	case errors.Is(err, orchestrator.ErrNoApp):
+		return fmt.Errorf("there is no app %s on %s", app, d.Cluster.Ref)
+	case errors.Is(err, orchestrator.ErrNoReplicas):
+		return fmt.Errorf("%s has no pods", app)
+	case err != nil:
 		return err
-	}
-	if code != 0 {
-		return fmt.Errorf("k3s kubectl logs exited %d", code)
 	}
 	if cmd.Bool("follow") {
 		fmt.Fprintln(env.Stderr, "Stopped: the pods followed have ended.")

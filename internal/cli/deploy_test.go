@@ -33,6 +33,35 @@ spec:
 
 var update = flag.Bool("update", false, "write the golden files")
 
+// golden compares got with the golden file called name, or writes it
+// there under -update.
+func golden(t *testing.T, name, got string) {
+	t.Helper()
+	path := filepath.Join(goldenDir, name)
+	if *update {
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != string(want) {
+		t.Errorf("%s:\n got:\n%s\nwant:\n%s", name, got, want)
+	}
+}
+
+// goldenDir is the directory of the golden files.
+var goldenDir = func() string {
+	dir, err := filepath.Abs("testdata")
+	if err != nil {
+		panic(err)
+	}
+	return dir
+}()
+
 // manifestsApp is an app directory deploying the manifests given, to
 // prod, without a build.
 func manifestsApp(t *testing.T, manifests ...string) string {
@@ -61,36 +90,6 @@ func deployingProd(t *testing.T) (*fakeCluster, string) {
 	t.Cleanup(server.Close)
 	c.registry = server.Listener.Addr().String()
 	return c, home
-}
-
-func TestDeployRemove(t *testing.T) {
-	c, home := deployingProd(t)
-	app := manifestsApp(t, webDeployment)
-	t.Chdir(app)
-	if out := mustRun(t, c, home, "deploy"); !strings.HasPrefix(out, "Deploying web to prod\n") {
-		t.Errorf("deploy's output:\n%s", out)
-	}
-
-	t.Chdir(home)
-	if out, err := onFake(t, c, home, "deploy", "--remove", "other"); err == nil || !strings.Contains(err.Error(), "no app other") {
-		t.Errorf("an app that isn't there: %v\n%s", err, out)
-	}
-	if out, err := onFake(t, c, home, "deploy", "--remove"); err == nil || !strings.Contains(err.Error(), "which app?") {
-		t.Errorf("no app named: %v\n%s", err, out)
-	}
-	if out := mustRun(t, c, home, "deploy", "--remove", "web"); !strings.HasPrefix(out, "Removing web from prod...\n") || !strings.Contains(out, "Removed web from prod") {
-		t.Errorf("output:\n%s", out)
-	}
-	if _, found := c.apps["web"]; found {
-		t.Error("web's namespace is still there")
-	}
-
-	t.Chdir(app)
-	mustRun(t, c, home, "deploy")
-	mustRun(t, c, home, "deploy", "--remove")
-	if _, found := c.apps["web"]; found {
-		t.Error("web's namespace is still there after a remove from its directory")
-	}
 }
 
 func TestDeployRefusesWhatTheOrchestratorCantRunBeforeAnythingElse(t *testing.T) {
@@ -339,35 +338,6 @@ func TestADeployThatFailsPrintsNoResultAndWaitsForNoCertificate(t *testing.T) {
 	}
 }
 
-func TestLogsOfAnApp(t *testing.T) {
-	c, home := deployingProd(t)
-	app := manifestsApp(t, webDeployment)
-	t.Chdir(app)
-	mustRun(t, c, home, "deploy")
-
-	if out := mustRun(t, c, home, "logs", "--tail", "5"); !strings.Contains(out, "a log line") || !c.ran("root@h1", "logs -n 'web'") || !c.ran("root@h1", "--tail=5") {
-		t.Errorf("logs:\n%s", out)
-	}
-	if out := mustRun(t, c, home, "logs", "-f", "web"); !strings.Contains(out, "Stopped: the pods followed have ended.") || !c.ran("root@h1", "--follow") {
-		t.Errorf("logs -f:\n%s", out)
-	}
-	if _, err := onFake(t, c, home, "logs", "other"); err == nil || !strings.Contains(err.Error(), "no app other") {
-		t.Errorf("an app that isn't there: %v", err)
-	}
-	if _, err := onFake(t, c, home, "logs", "Web;rm"); err == nil {
-		t.Error("a name that isn't an app's was taken")
-	}
-	c.noPods = true
-	if _, err := onFake(t, c, home, "logs", "-f", "web"); err == nil || !strings.Contains(err.Error(), "web has no pods") {
-		t.Errorf("an app without pods: %v", err)
-	}
-	c.noPods = false
-	t.Chdir(home)
-	if _, err := onFake(t, c, home, "logs"); err == nil || !strings.Contains(err.Error(), "which app?") {
-		t.Errorf("no app named: %v", err)
-	}
-}
-
 func TestDeployWaitsForTheClustersServices(t *testing.T) {
 	c, home := deployingProd(t)
 	app := manifestsApp(t, webDeployment)
@@ -391,25 +361,6 @@ func TestDeployWaitsForTheClustersServices(t *testing.T) {
 	}
 	if out != "Deploying web to prod\nWaiting for cert-manager and Traefik...\n" {
 		t.Errorf("output:\n%s", out)
-	}
-}
-
-func TestARemoveThatCantReachTheRegistryRemovesNothing(t *testing.T) {
-	c, home := deployingProd(t)
-	t.Chdir(manifestsApp(t, webDeployment))
-	mustRun(t, c, home, "deploy")
-	registry := c.registry
-	c.registry = ""
-	if out, err := onFake(t, c, home, "deploy", "--remove", "web"); err == nil {
-		t.Fatalf("--remove passed without the registry:\n%s", out)
-	}
-	if _, found := c.apps["web"]; !found {
-		t.Fatal("web's namespace went though its images stayed")
-	}
-	c.registry = registry
-	mustRun(t, c, home, "deploy", "--remove", "web")
-	if _, found := c.apps["web"]; found {
-		t.Error("the rerun left web's namespace")
 	}
 }
 

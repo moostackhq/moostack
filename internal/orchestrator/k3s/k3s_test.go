@@ -520,13 +520,9 @@ func TestPodsBeyondOnePageAreListed(t *testing.T) {
 func TestAMethodTheBackendDoesntHaveYetSaysSo(t *testing.T) {
 	ctx := context.Background()
 	b := backend(t)
-	_, apps := b.Apps(ctx)
 	_, preflight := b.Preflight(ctx, nil, orchestrator.NodeRequest{})
 	_, token := b.ConsoleToken(ctx)
 	for method, err := range map[string]error{
-		"Remove":       b.Remove(ctx, "shop"),
-		"Logs":         b.Logs(ctx, "shop", orchestrator.LogOptions{}, io.Discard),
-		"Apps":         apps,
 		"Preflight":    preflight,
 		"AddNode":      b.AddNode(ctx, nil, model.Node{}),
 		"RemoveNode":   b.RemoveNode(ctx, "node-1", nil, orchestrator.RemoveOptions{}),

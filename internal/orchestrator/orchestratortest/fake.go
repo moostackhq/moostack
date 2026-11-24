@@ -137,8 +137,9 @@ func (f *Fake) Remove(ctx context.Context, app string) error {
 }
 
 // Logs writes Logged's text for the app, or else a line for each of its
-// running containers, as "web-1 web: running". It writes without
-// holding the fake.
+// running containers, as "web-1 web: running", and fails with
+// ErrNoReplicas for an app with neither. It writes without holding the
+// fake.
 func (f *Fake) Logs(ctx context.Context, app string, _ orchestrator.LogOptions, w io.Writer) error {
 	text, err := f.logs(ctx, app)
 	if err != nil {
@@ -164,6 +165,9 @@ func (f *Fake) logs(ctx context.Context, app string) (string, error) {
 		if r.App == app {
 			fmt.Fprintf(&text, "%s %s: running\n", r.Replica, r.Container)
 		}
+	}
+	if text.Len() == 0 {
+		return "", orchestrator.ErrNoReplicas
 	}
 	return text.String(), nil
 }

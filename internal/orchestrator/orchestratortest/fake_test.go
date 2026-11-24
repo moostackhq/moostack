@@ -339,6 +339,12 @@ func TestTheFakeWritesALineForEachRunningContainerOfTheApp(t *testing.T) {
 	if want := "web-1 web: running\nweb-2 web: running\nworker-1 worker: running\n"; w.String() != want {
 		t.Errorf("Logs wrote %q, want %q", w.String(), want)
 	}
+	if err := f.Deploy(ctx, model.App{Name: "charted", Chart: "chart"}, func(orchestrator.Step) {}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Logs(ctx, "charted", orchestrator.LogOptions{}, &w); !errors.Is(err, orchestrator.ErrNoReplicas) {
+		t.Errorf("Logs of an app without containers: %v, want ErrNoReplicas", err)
+	}
 }
 
 func TestTheFakeOrdersContainersOfOneReplicaByName(t *testing.T) {

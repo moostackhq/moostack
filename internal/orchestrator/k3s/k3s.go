@@ -35,7 +35,8 @@ func init() {
 	klog.SetLogger(logr.Discard())
 }
 
-// requestTimeout bounds each request to the API made through a host.
+// requestTimeout bounds each request to the API made through a host,
+// but for a container's log.
 const requestTimeout = time.Minute
 
 type Backend struct {
@@ -49,7 +50,9 @@ type Backend struct {
 
 // api is a connection to the cluster's API.
 type api struct {
-	client  kubernetes.Interface
+	client kubernetes.Interface
+	// streams is client without a bound on how long an answer takes.
+	streams kubernetes.Interface
 	dynamic dynamic.Interface
 	mapper  *restmapper.DeferredDiscoveryRESTMapper
 }
@@ -96,8 +99,15 @@ func newAPI(config *rest.Config) (*api, error) {
 	if err != nil {
 		return nil, err
 	}
+	unbounded := rest.CopyConfig(config)
+	unbounded.Timeout = 0
+	streams, err := kubernetes.NewForConfig(unbounded)
+	if err != nil {
+		return nil, err
+	}
 	return &api{
 		client:  client,
+		streams: streams,
 		dynamic: dyn,
 		mapper:  restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(client.Discovery())),
 	}, nil

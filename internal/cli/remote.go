@@ -20,7 +20,6 @@ import (
 type remote interface {
 	Run(ctx context.Context, cmd string, stdin io.Reader) (sshclient.Result, error)
 	RunStoppable(ctx context.Context, cmd string) (sshclient.Result, error)
-	Stream(ctx context.Context, cmd string, stdin io.Reader, stdout, stderr io.Writer) (int, error)
 	Upload(ctx context.Context, file string, r io.Reader, mode fs.FileMode, owner string) error
 	DialTCP(ctx context.Context, addr string) (net.Conn, error)
 	// Lock takes the cluster's operation lock on the host.

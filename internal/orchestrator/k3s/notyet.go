@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/netip"
 
 	"github.com/moostackhq/moostack/internal/model"
@@ -15,14 +14,6 @@ import (
 var errNotYet = errors.New("the k3s backend can't do this yet")
 
 func notYet(method string) error { return fmt.Errorf("%s: %w", method, errNotYet) }
-
-func (b *Backend) Remove(context.Context, string) error { return notYet("Remove") }
-
-func (b *Backend) Logs(context.Context, string, orchestrator.LogOptions, io.Writer) error {
-	return notYet("Logs")
-}
-
-func (b *Backend) Apps(context.Context) ([]model.AppState, error) { return nil, notYet("Apps") }
 
 func (b *Backend) Preflight(context.Context, orchestrator.Host, orchestrator.NodeRequest) (model.Node, error) {
 	return model.Node{}, notYet("Preflight")
