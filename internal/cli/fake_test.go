@@ -69,7 +69,7 @@ type fakeCluster struct {
 	// hosts are the hosts by SSH target.
 	hosts map[string]*fakeNode
 	// nodes are the nodes the cluster has, by name.
-	nodes map[string]fakeKubeNode
+	nodes map[string]fakeClusterNode
 	// apps holds an entry for each app the cluster has, by name.
 	apps map[string]map[string]bool
 	orch *fakeOrchestrator
@@ -105,7 +105,7 @@ type fakeCluster struct {
 	// consoleFails makes the console never get ready, and zotFails zot's
 	// install fail.
 	consoleFails, zotFails bool
-	// cordoned are the cluster's nodes that take no new pods.
+	// cordoned are the cluster's nodes that are cordoned.
 	cordoned map[string]bool
 	// servicesDown makes the cluster's services not ready, until a wait
 	// for them if servicesComeUp.
@@ -189,9 +189,10 @@ func (o *fakeOrchestrator) sync() {
 }
 
 // Preflight finds the host to be what the fake host is, and refuses one
-// that has k3s, has less than 806 MiB, is asked for an address that
-// isn't its private one, doesn't reach the control plane, or is to join
-// a control plane of another k3s version than mooctl's.
+// that is a node already, has less than 806 MiB, is asked for an
+// address that isn't its private one, doesn't reach the control plane,
+// or is to join a control plane whose version isn't mooctl's
+// K3sVersion.
 func (o *fakeOrchestrator) Preflight(ctx context.Context, host orchestrator.Host, want orchestrator.NodeRequest) (model.Node, error) {
 	o.called("Preflight %s", want.Name)
 	if _, err := o.Fake.Preflight(ctx, host, want); err != nil {
@@ -226,9 +227,9 @@ func (o *fakeOrchestrator) Preflight(ctx context.Context, host orchestrator.Host
 	return n, nil
 }
 
-// AddNode installs k3s on the fake host and makes it a node of the fake
-// cluster, unless the host fails its install or its start: then it
-// tells Uninstalling and leaves the host as it was.
+// AddNode makes the fake host a node of the fake cluster, unless the
+// host fails its install or its start: then it tells Uninstalling and
+// leaves the host as it was.
 func (o *fakeOrchestrator) AddNode(ctx context.Context, host orchestrator.Host, n model.Node, step func(orchestrator.Step)) error {
 	o.called("AddNode %s", n.Name)
 	o.sync()
@@ -270,13 +271,13 @@ func (o *fakeOrchestrator) AddNode(ctx context.Context, host orchestrator.Host, 
 	o.c.mu.Lock()
 	defer o.c.mu.Unlock()
 	h.k3s, h.server, h.version, h.nodeName = true, n.ControlPlane, K3sVersion, n.Name
-	o.c.nodes[n.Name] = fakeKubeNode{ip: n.PrivateAddress.String(), arch: n.Architecture, controlPlane: n.ControlPlane}
+	o.c.nodes[n.Name] = fakeClusterNode{ip: n.PrivateAddress.String(), arch: n.Architecture, controlPlane: n.ControlPlane}
 	o.added[n.Name] = n
 	return nil
 }
 
-// uninstalled takes k3s from the fake host, and with a control plane's
-// the cluster's nodes.
+// uninstalled makes the fake host no node, and takes the cluster's
+// nodes if the host was the control plane.
 func (o *fakeOrchestrator) uninstalled(host orchestrator.Host) error {
 	h := hostOf(host)
 	if o.onUninstall != nil {
@@ -287,15 +288,15 @@ func (o *fakeOrchestrator) uninstalled(host orchestrator.Host) error {
 	o.c.mu.Lock()
 	defer o.c.mu.Unlock()
 	if h.server {
-		o.c.nodes = map[string]fakeKubeNode{}
+		o.c.nodes = map[string]fakeClusterNode{}
 	}
 	h.k3s, h.server = false, false
 	return nil
 }
 
 // RemoveNode takes the node from the fake cluster, unless a host that
-// can be reached and wasn't uninstalled from still runs k3s as it: its
-// kubelet registers the node again.
+// can be reached and wasn't uninstalled from is still that node: the
+// host registers the node again.
 func (o *fakeOrchestrator) RemoveNode(ctx context.Context, name string, host orchestrator.Host, opts orchestrator.RemoveOptions, step func(orchestrator.Step)) error {
 	o.called("RemoveNode %s", name)
 	o.sync()
@@ -401,7 +402,7 @@ func (o *fakeOrchestrator) Check(app model.App) error {
 
 // Deploy tells WaitingForCluster and waits while the cluster's services
 // are down, and fails if they don't come up. A deployed app is one the
-// fake cluster's namespaces have.
+// fake cluster has.
 func (o *fakeOrchestrator) Deploy(ctx context.Context, app model.App, step func(orchestrator.Step)) error {
 	o.called("Deploy %s", app.Name)
 	if o.onDeploy != nil {
@@ -457,7 +458,7 @@ func (o *fakeOrchestrator) Apps(ctx context.Context) ([]model.AppState, error) {
 	return slices.Clone(o.states), nil
 }
 
-// Remove removes the app from the fake cluster's namespaces as well.
+// Remove removes the app from the fake cluster as well.
 func (o *fakeOrchestrator) Remove(ctx context.Context, app string) error {
 	o.called("Remove %s", app)
 	if o.onRemove != nil {
@@ -518,7 +519,7 @@ func (o *fakeOrchestrator) made(prefix string) []string {
 	return out
 }
 
-type fakeKubeNode struct {
+type fakeClusterNode struct {
 	ip, arch     string
 	controlPlane bool
 	// ready is the node's Ready, "yes" if empty.
@@ -546,8 +547,8 @@ type fakeNode struct {
 	// files are the files the commands wrote on the host themselves.
 	files       map[string]string
 	unreachable bool
-	// failInstall makes k3s's install fail on the host, and failStart
-	// its start.
+	// failInstall makes the orchestrator's install fail on the host, and
+	// failStart its start.
 	failInstall, failStart bool
 	// noReach makes the host fail to reach the control plane.
 	noReach bool
@@ -584,7 +585,7 @@ func imageArchive(t testing.TB) ([]byte, string) {
 // newFakeCluster is a cluster with no hosts, a registry, and a release
 // that holds the console's image for amd64 and arm64.
 func newFakeCluster(t testing.TB) *fakeCluster {
-	c := &fakeCluster{t: t, hosts: map[string]*fakeNode{}, nodes: map[string]fakeKubeNode{}, apps: map[string]map[string]bool{}}
+	c := &fakeCluster{t: t, hosts: map[string]*fakeNode{}, nodes: map[string]fakeClusterNode{}, apps: map[string]map[string]bool{}}
 	c.orch = &fakeOrchestrator{Fake: &orchestratortest.Fake{Volumes: map[string][]string{}}, c: c, deployed: map[string]model.App{}, added: map[string]model.Node{}, removals: map[string]orchestrator.RemoveOptions{}}
 	registry := httptest.NewServer(ggcrregistry.New(ggcrregistry.Logger(log.New(io.Discard, "", 0))))
 	t.Cleanup(registry.Close)

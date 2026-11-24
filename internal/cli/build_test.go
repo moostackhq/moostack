@@ -102,10 +102,10 @@ esac
 
 func TestDeployRunsTheBuildByDigestOnEveryArchitecture(t *testing.T) {
 	c, home := deployingProd(t)
-	// A node Kubernetes has that the cluster directory doesn't yet.
-	c.nodes["node9"] = fakeKubeNode{ip: "10.0.0.9", arch: "arm64"}
+	// A node the cluster has that the cluster directory doesn't yet.
+	c.nodes["node9"] = fakeClusterNode{ip: "10.0.0.9", arch: "arm64"}
 	// A node that reports no architecture yet.
-	c.nodes["node10"] = fakeKubeNode{ip: "10.0.0.10"}
+	c.nodes["node10"] = fakeClusterNode{ip: "10.0.0.10"}
 	docker, dir := fakeDocker(t)
 	app := t.TempDir()
 	os.WriteFile(filepath.Join(app, "Dockerfile"), []byte("FROM scratch\n"), 0o644)

@@ -35,7 +35,7 @@ type App struct {
 	// Manifests is a directory of manifests, in which ${IMAGE} is the
 	// built image.
 	Manifests string
-	// Chart is a Helm chart's directory; the built image is its value
+	// Chart is a chart's directory; the built image is its value
 	// image.
 	Chart string
 	// Build is how the image of the manifests or the chart is built; nil

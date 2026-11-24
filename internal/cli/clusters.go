@@ -78,7 +78,7 @@ func clusterDirs(root string) ([]*clusterdir.Dir, error) {
 	return dirs, nil
 }
 
-// clusterRemove is mooctl cluster remove: it uninstalls k3s from every
+// clusterRemove is mooctl cluster remove: it uninstalls every
 // node of a cluster, the control plane last, and deletes its cluster
 // directory, once the operator has typed the cluster's name. It holds
 // the operation lock from before it reads the nodes, which it takes from

@@ -20,15 +20,15 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// A node only Kubernetes has, whose host still runs k3s, is removed with
+// A node only the cluster has, whose host is still that node, is removed with
 // a warning that it registers again.
-func TestRemovingANodeOnlyKubernetesHasWarnsItMayComeBack(t *testing.T) {
+func TestRemovingANodeOnlyTheClusterHasWarnsItMayComeBack(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	h2 := c.hosts["root@h2"]
 	h2.k3s = true
 	h2.nodeName = "stray"
-	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.3", arch: "amd64"}
+	c.nodes["stray"] = fakeClusterNode{ip: "10.0.0.3", arch: "amd64"}
 
 	out := mustRun(t, c, home, "cluster", "node-remove", "stray")
 	if !strings.Contains(out, "Warning: if k3s still runs on stray's host, it registers again") {
@@ -94,15 +94,15 @@ func onProbe(t *testing.T, ctx context.Context, c *fakeCluster, home string, hoo
 	return out.String(), err
 }
 
-// A control plane whose k3s is gone but whose SSH answers is removed.
+// A control plane that was uninstalled but whose SSH answers is removed.
 func TestAControlPlaneWhoseUninstallWasCutOffCanBeRemoved(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	h1 := c.hosts["root@h1"]
-	// What the cut-off uninstall left: k3s gone, the applied commit gone.
+	// What the cut-off uninstall left: no node, no applied commit.
 	h1.k3s, h1.server = false, false
 	delete(h1.files, AppliedCommitFile)
-	c.nodes = map[string]fakeKubeNode{}
+	c.nodes = map[string]fakeClusterNode{}
 	c.orch.Fail("Nodes", errors.New("reading the control plane's kubeconfig: exit 1: no such file"))
 	if out, err := onFake(t, c, home, "cluster", "node-remove", "node1", "--yes"); err != nil {
 		t.Errorf("node-remove node1 --yes: %v\n%s", err, out)
@@ -195,14 +195,14 @@ func TestAnUnreachableRemovalDecidesOnTheDirectoryFromItsRemote(t *testing.T) {
 	}
 }
 
-// The control plane is refused while Kubernetes has another node.
-func TestTheControlPlaneGoesAfterNodesOnlyKubernetesHas(t *testing.T) {
+// The control plane is refused while the cluster has another node.
+func TestTheControlPlaneGoesAfterNodesOnlyTheClusterHas(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
-	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.9", arch: "amd64"}
+	c.nodes["stray"] = fakeClusterNode{ip: "10.0.0.9", arch: "amd64"}
 	out, err := onFake(t, c, home, "cluster", "node-remove", "--yes", "node1")
 	if err == nil {
-		t.Errorf("the control plane went while Kubernetes has stray:\n%s", out)
+		t.Errorf("the control plane went while the cluster has stray:\n%s", out)
 	}
 }
 

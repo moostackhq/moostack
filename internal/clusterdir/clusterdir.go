@@ -100,7 +100,7 @@ type Cluster struct {
 
 // Node is what a node file holds.
 type Node struct {
-	// Name is the node's name, in the cluster and in Kubernetes.
+	// Name is the node's name.
 	Name string `yaml:"-"`
 	// Target is the SSH target the node is reached at.
 	Target string `yaml:"target"`
@@ -117,8 +117,8 @@ type Node struct {
 	Architecture string `yaml:"architecture"`
 	// MemoryMiB is the node's memory.
 	MemoryMiB int `yaml:"memory_mib"`
-	// GOGC is k3s's GOGC, empty for Go's default, and GOMEMLIMIT its
-	// GOMEMLIMIT.
+	// GOGC is the orchestrator's GOGC, empty for Go's default, and
+	// GOMEMLIMIT its GOMEMLIMIT.
 	GOGC         string `yaml:"gogc,omitempty"`
 	GOMEMLIMIT   string `yaml:"gomemlimit"`
 	ControlPlane bool   `yaml:"control_plane,omitempty"`

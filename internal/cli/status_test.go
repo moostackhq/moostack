@@ -78,8 +78,8 @@ func TestStatusListsEachKindOfDrift(t *testing.T) {
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	mustRun(t, c, home, "cluster", "node-add", "root@h2")
 	mustRun(t, c, home, "cluster", "node-add", "root@h3")
-	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.9", arch: "amd64"}
-	c.nodes["node2"] = fakeKubeNode{ip: "10.0.0.8", arch: "arm64", controlPlane: true}
+	c.nodes["stray"] = fakeClusterNode{ip: "10.0.0.9", arch: "amd64"}
+	c.nodes["node2"] = fakeClusterNode{ip: "10.0.0.8", arch: "arm64", controlPlane: true}
 	delete(c.nodes, "node3")
 	c.hosts["root@h1"].files[AppliedCommitFile] = strings.Repeat("ab", 20) + "\n"
 	cluster := filepath.Join(prodDir(t, home).Path, "cluster.yml")
@@ -158,13 +158,13 @@ func TestStatusShowsANodeAsReadyAsTheClusterSaysAndNoMemoryItDoesntKnow(t *testi
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	mustRun(t, c, home, "cluster", "node-add", "root@h2")
-	c.nodes["node2"] = fakeKubeNode{ip: "10.0.0.3", arch: "amd64", ready: "no", noMemory: true}
+	c.nodes["node2"] = fakeClusterNode{ip: "10.0.0.3", arch: "amd64", ready: "no", noMemory: true}
 	out := mustRun(t, c, home, "cluster", "status")
 	want := "node2  node           no     " + K3sVersion + "  amd64            10.0.0.3\n"
 	if !strings.Contains(out, want) || strings.Contains(out, "Drift") {
 		t.Errorf("no %q, or drift, in:\n%s", want, out)
 	}
-	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.9", arch: "arm64", ready: "?", noMemory: true}
+	c.nodes["stray"] = fakeClusterNode{ip: "10.0.0.9", arch: "arm64", ready: "?", noMemory: true}
 	out = mustRun(t, c, home, "cluster", "status")
 	want = "stray                 ?      " + K3sVersion + "  arm64            10.0.0.9\n"
 	if !strings.Contains(out, want) {
@@ -226,7 +226,7 @@ func TestTheFakeOrchestratorListsTheFakeClustersNodesAndTheAppsItIsGiven(t *test
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	mustRun(t, c, home, "cluster", "node-add", "root@h2")
-	c.nodes["a"] = fakeKubeNode{ip: "10.0.0.9", arch: "arm64", ready: "no", noMemory: true}
+	c.nodes["a"] = fakeClusterNode{ip: "10.0.0.9", arch: "arm64", ready: "no", noMemory: true}
 	c.cordoned = map[string]bool{"node2": true}
 	ctx := context.Background()
 	nodes, err := c.orch.Nodes(ctx)

@@ -149,12 +149,12 @@ func TestNodeAddRefusesBeforeChangingAnything(t *testing.T) {
 			args: []string{"--name", "node1", "root@h2"},
 			want: "already",
 		},
-		"a name Kubernetes has": {
-			setup: func(c *fakeCluster) { c.nodes["node7"] = fakeKubeNode{ip: "10.0.0.9", arch: "amd64"} },
+		"a name the cluster has": {
+			setup: func(c *fakeCluster) { c.nodes["node7"] = fakeClusterNode{ip: "10.0.0.9", arch: "amd64"} },
 			args:  []string{"--name", "node7", "root@h2"},
 			want:  "node7",
 		},
-		"a host with k3s": {
+		"a host that is a node": {
 			setup: func(c *fakeCluster) { c.hosts["root@h2"].k3s = true },
 			args:  []string{"root@h2"},
 			want:  "k3s",
@@ -169,7 +169,7 @@ func TestNodeAddRefusesBeforeChangingAnything(t *testing.T) {
 			args:  []string{"root@h2"},
 			want:  "control plane",
 		},
-		"a control plane of another k3s": {
+		"a control plane of another version": {
 			setup: func(c *fakeCluster) { c.hosts["root@h1"].version = "v1.36.0+k3s1" },
 			args:  []string{"root@h2"},
 			want:  "v1.36.0+k3s1",
@@ -228,7 +228,7 @@ func TestAFailedJoinIsUndone(t *testing.T) {
 	}
 }
 
-func TestAJoinWhoseK3sFailsToStartIsUndone(t *testing.T) {
+func TestAJoinThatFailsToStartIsUndone(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	c.hosts["root@h2"].failStart = true
@@ -261,7 +261,7 @@ func TestNodeRemove(t *testing.T) {
 		t.Errorf("the orchestrator was asked for the removals %q, node2's with %+v", c.orch.made("RemoveNode"), got)
 	}
 	if _, found := c.nodes["node2"]; found {
-		t.Error("Kubernetes still has node2")
+		t.Error("the cluster still has node2")
 	}
 
 	// A node whose host is gone goes with --unreachable only.
@@ -271,7 +271,7 @@ func TestNodeRemove(t *testing.T) {
 	}
 	out = mustRun(t, c, home, "cluster", "node-remove", "--unreachable", "node3")
 	if _, found := c.nodes["node3"]; found {
-		t.Error("Kubernetes still has node3")
+		t.Error("the cluster still has node3")
 	}
 	if want := "Removing node3 from prod\nWarning: node3 can't be reached; if k3s still runs there, it registers again: run k3s-agent-uninstall.sh on it.\nRemoved node3 from prod\n"; out != want || !c.orch.removals["node3"].Unreachable {
 		t.Errorf("output:\n%s\nwant:\n%s\nremoved with %+v", out, want, c.orch.removals["node3"])
@@ -290,13 +290,13 @@ func TestNodeRemove(t *testing.T) {
 	}
 }
 
-func TestNodeRemoveOfANodeOnlyKubernetesHas(t *testing.T) {
+func TestNodeRemoveOfANodeOnlyTheClusterHas(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
-	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.9", arch: "amd64"}
+	c.nodes["stray"] = fakeClusterNode{ip: "10.0.0.9", arch: "amd64"}
 	mustRun(t, c, home, "cluster", "node-remove", "stray")
 	if _, found := c.nodes["stray"]; found {
-		t.Error("Kubernetes still has the node")
+		t.Error("the cluster still has the node")
 	}
 }
 
@@ -339,8 +339,8 @@ func TestStatusShowsDrift(t *testing.T) {
 	if out := mustRun(t, c, home, "cluster", "status"); strings.Contains(out, "Drift") || !strings.Contains(out, "node2") {
 		t.Errorf("a cluster as its directory says:\n%s", out)
 	}
-	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.9", arch: "amd64"}
-	c.nodes["node2"] = fakeKubeNode{ip: "10.0.0.8", arch: "arm64"}
+	c.nodes["stray"] = fakeClusterNode{ip: "10.0.0.9", arch: "amd64"}
+	c.nodes["node2"] = fakeClusterNode{ip: "10.0.0.8", arch: "arm64"}
 	c.hosts["root@h1"].files[AppliedCommitFile] = strings.Repeat("ab", 20) + "\n"
 	out := mustRun(t, c, home, "cluster", "status")
 	for _, want := range []string{
@@ -381,7 +381,7 @@ func TestNodeRemoveFinishesAPartialRemoval(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	mustRun(t, c, home, "cluster", "node-add", "root@h2")
-	// A run cut off after Kubernetes deleted the node.
+	// A run cut off after the cluster deleted the node.
 	delete(c.nodes, "node2")
 	mustRun(t, c, home, "cluster", "node-remove", "node2")
 	if c.hosts["root@h2"].k3s {
@@ -568,7 +568,7 @@ func TestAConsoleThatDoesntGetReadyUndoesTheControlPlane(t *testing.T) {
 	}
 }
 
-func TestRemovingAnAppNamedAsTheConsolesNamespaceOrItsRepositorysPrefixRemovesNothing(t *testing.T) {
+func TestRemovingAnAppNamedAsTheConsolesRepositorysPrefixRemovesNothing(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	before, _ := consoleImage(t, c, "amd64")
@@ -859,7 +859,7 @@ func TestTheNodeCommandsPrintWhatTheyPrinted(t *testing.T) {
 		"cluster node-remove node1",
 		"cluster node-remove node2",
 	)
-	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.9", arch: "amd64"}
+	c.nodes["stray"] = fakeClusterNode{ip: "10.0.0.9", arch: "amd64"}
 	c.hosts["root@h3"].unreachable = true
 	got += transcript(t, c, home,
 		"cluster node-remove stray",
