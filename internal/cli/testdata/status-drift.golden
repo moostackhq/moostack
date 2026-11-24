@@ -1,0 +1,19 @@
+Cluster prod, k3s v1.30.0+k3s1
+
+NODE   ROLE           READY               K3S           ARCH   MEMORY    PRIVATE ADDRESS
+node1  control plane  yes                 v1.37.2+k3s1  amd64  1974 MiB  10.0.0.2
+node2  node           yes                 v1.37.2+k3s1  arm64  1974 MiB  10.0.0.3
+node3  node           not on the cluster                amd64  1974 MiB  10.0.0.4
+stray                 yes                 v1.37.2+k3s1  amd64  1974 MiB  10.0.0.9
+
+No apps.
+
+Drift:
+- the cluster applied commit abababababab, which the cluster directory doesn't have: fetch it
+- node1 runs k3s v1.37.2+k3s1, the cluster directory pins v1.30.0+k3s1
+- node2 runs k3s v1.37.2+k3s1, the cluster directory pins v1.30.0+k3s1
+- node2 is a control plane on one side and not on the other
+- node2 is at 10.0.0.8 on the cluster, and at 10.0.0.3 in the cluster directory
+- node2 is arm64 on the cluster, and amd64 in the cluster directory
+- node3 is in the cluster directory but not on the cluster
+- stray is on the cluster but not in the cluster directory; remove it with mooctl cluster node-remove stray

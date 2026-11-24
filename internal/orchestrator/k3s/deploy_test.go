@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -1262,16 +1263,17 @@ func TestNodesAreTheClustersNodesOrderedByName(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	status := func(ready corev1.ConditionStatus, arch, address string) corev1.NodeStatus {
+	status := func(ready corev1.ConditionStatus, arch, address, memory string) corev1.NodeStatus {
 		return corev1.NodeStatus{
-			Capacity:   corev1.ResourceList{corev1.ResourceMemory: resourceKi(2021376)},
+			Capacity:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(memory)},
 			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: ready}},
 			Addresses:  []corev1.NodeAddress{{Type: corev1.NodeHostName, Address: "host"}, {Type: corev1.NodeInternalIP, Address: address}, {Type: corev1.NodeInternalIP, Address: "fd00::1"}},
 			NodeInfo:   corev1.NodeSystemInfo{Architecture: arch, KubeletVersion: "v1.37.2+k3s1"},
 		}
 	}
-	make(id+"-z", map[string]string{"node-role.kubernetes.io/control-plane": "true"}, false, status(corev1.ConditionTrue, "amd64", "10.0.0.2"))
-	make(id+"-a", nil, true, status(corev1.ConditionFalse, "arm64", "10.0.0.3"))
+	make(id+"-z", map[string]string{"node-role.kubernetes.io/control-plane": "true"}, false, status(corev1.ConditionTrue, "amd64", "10.0.0.2", "2021376Ki"))
+	make(id+"-a", nil, true, status(corev1.ConditionFalse, "arm64", "10.0.0.3", "2014832Ki"))
+	make(id+"-g", nil, false, status(corev1.ConditionUnknown, "amd64", "10.0.0.4", "2Gi"))
 	make(id+"-m", map[string]string{"node-role.kubernetes.io/control-plane": "false"}, false, corev1.NodeStatus{})
 	all, err := deployer(t).Nodes(ctx)
 	if err != nil {
@@ -1284,7 +1286,8 @@ func TestNodesAreTheClustersNodesOrderedByName(t *testing.T) {
 		}
 	}
 	want := []model.NodeState{
-		{Name: id + "-a", Address: "10.0.0.3", Architecture: "arm64", Version: "v1.37.2+k3s1", MemoryMiB: 1974, Ready: "no, cordoned"},
+		{Name: id + "-a", Address: "10.0.0.3", Architecture: "arm64", Version: "v1.37.2+k3s1", MemoryMiB: 1967, Ready: "no, cordoned"},
+		{Name: id + "-g", Address: "10.0.0.4", Architecture: "amd64", Version: "v1.37.2+k3s1", MemoryMiB: 2048, Ready: "no"},
 		{Name: id + "-m", Ready: "?"},
 		{Name: id + "-z", Address: "10.0.0.2", Architecture: "amd64", Version: "v1.37.2+k3s1", MemoryMiB: 1974, ControlPlane: true, Ready: "yes"},
 	}
@@ -1802,6 +1805,9 @@ func TestARemovalOfAnAppOfContainersReturnsOnceNothingOfItIsLeft(t *testing.T) {
 	blocked(t, done, 3*time.Second, "with an object of the app still there")
 	if !terminating(t, name) {
 		t.Error("the app's namespace isn't being deleted")
+	}
+	if _, ok := appNamed(t, b, name); !ok {
+		t.Errorf("Apps lacks %s while it is being removed", name)
 	}
 	release()
 	if err := returned(t, done); err != nil {

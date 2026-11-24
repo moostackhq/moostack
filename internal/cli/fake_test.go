@@ -13,7 +13,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -48,7 +47,7 @@ import (
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
-func testHostKey(t *testing.T) ssh.PublicKey {
+func testHostKey(t testing.TB) ssh.PublicKey {
 	t.Helper()
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -64,12 +63,9 @@ func testHostKey(t *testing.T) ssh.PublicKey {
 // fakeCluster is a set of hosts and the Kubernetes cluster their k3s
 // makes, as mooctl's scripts see them.
 type fakeCluster struct {
-	// workloads are the Deployments, StatefulSets, DaemonSets and
-	// Ingresses of every namespace, as kubectl prints them.
-	workloads []map[string]any
 	// unissued is the name of a certificate that is never issued.
 	unissued string
-	t        *testing.T
+	t        testing.TB
 	mu       sync.Mutex
 	// hosts are the hosts by SSH target.
 	hosts map[string]*fakeNode
@@ -114,6 +110,8 @@ type fakeCluster struct {
 	// servicesDown makes the cluster's services not ready, until a wait
 	// for them if servicesComeUp.
 	servicesDown, servicesComeUp bool
+	// commitUnread makes the read of the applied commit fail.
+	commitUnread bool
 }
 
 // fakeOrchestrator is the cluster's orchestrator: a fake one that notes
@@ -135,6 +133,8 @@ type fakeOrchestrator struct {
 	// onApps, onRemove and onLogs, if set, run at each call of Apps, of
 	// Remove and of Logs.
 	onApps, onRemove, onLogs func()
+	// states, if set, are the apps Apps answers with.
+	states []model.AppState
 }
 
 func (o *fakeOrchestrator) called(format string, args ...any) {
@@ -199,7 +199,11 @@ func (o *fakeOrchestrator) Apps(ctx context.Context) ([]model.AppState, error) {
 	if o.onApps != nil {
 		o.onApps()
 	}
-	return o.Fake.Apps(ctx)
+	apps, err := o.Fake.Apps(ctx)
+	if err != nil || o.states == nil {
+		return apps, err
+	}
+	return slices.Clone(o.states), nil
 }
 
 // Remove removes the app from the fake cluster's namespaces as well.
@@ -226,7 +230,8 @@ func (o *fakeOrchestrator) Logs(ctx context.Context, app string, opts orchestrat
 	return o.Fake.Logs(ctx, app, opts, w)
 }
 
-// Nodes are the fake cluster's Kubernetes nodes.
+// Nodes are the fake cluster's Kubernetes nodes, each with 1974 MiB. A
+// node is a control plane if a host that runs a k3s server has its name.
 func (o *fakeOrchestrator) Nodes(ctx context.Context) ([]model.NodeState, error) {
 	o.called("Nodes")
 	if _, err := o.Fake.Nodes(ctx); err != nil {
@@ -236,7 +241,19 @@ func (o *fakeOrchestrator) Nodes(ctx context.Context) ([]model.NodeState, error)
 	defer o.c.mu.Unlock()
 	var nodes []model.NodeState
 	for name, n := range o.c.nodes {
-		nodes = append(nodes, model.NodeState{Name: name, Address: n.ip, Architecture: n.arch, Ready: "yes"})
+		s := model.NodeState{Name: name, Address: n.ip, Architecture: n.arch, Version: K3sVersion, MemoryMiB: 1974, Ready: cmp.Or(n.ready, "yes")}
+		for _, h := range o.c.hosts {
+			if h.server && h.k3s && strings.Contains(h.files[k3s.ConfigFile], "node-name: "+name+"\n") {
+				s.ControlPlane = true
+			}
+		}
+		if n.noMemory {
+			s.MemoryMiB = 0
+		}
+		if o.c.cordoned[name] {
+			s.Ready += ", cordoned"
+		}
+		nodes = append(nodes, s)
 	}
 	slices.SortFunc(nodes, func(a, b model.NodeState) int { return cmp.Compare(a.Name, b.Name) })
 	return nodes, nil
@@ -258,6 +275,10 @@ func (o *fakeOrchestrator) made(prefix string) []string {
 
 type fakeKubeNode struct {
 	ip, arch string
+	// ready is the node's Ready, "yes" if empty.
+	ready string
+	// noMemory makes the cluster know no memory of the node.
+	noMemory bool
 }
 
 type fakeNode struct {
@@ -283,7 +304,7 @@ type fakeNode struct {
 
 // imageArchive is an OCI image layout archive of a random image, as
 // buildx writes one, and the image's digest.
-func imageArchive(t *testing.T) ([]byte, string) {
+func imageArchive(t testing.TB) ([]byte, string) {
 	t.Helper()
 	img, err := random.Image(256, 1)
 	if err != nil {
@@ -311,7 +332,7 @@ func imageArchive(t *testing.T) ([]byte, string) {
 
 // newFakeCluster is a cluster with no hosts, a registry, and a release
 // that holds the console's image for amd64 and arm64.
-func newFakeCluster(t *testing.T) *fakeCluster {
+func newFakeCluster(t testing.TB) *fakeCluster {
 	c := &fakeCluster{t: t, hosts: map[string]*fakeNode{}, nodes: map[string]fakeKubeNode{}, apps: map[string]map[string]bool{}}
 	c.orch = &fakeOrchestrator{Fake: &orchestratortest.Fake{}, c: c, deployed: map[string]model.App{}}
 	registry := httptest.NewServer(ggcrregistry.New(ggcrregistry.Logger(log.New(io.Discard, "", 0))))
@@ -488,14 +509,6 @@ func ok(stdout string) (sshclient.Result, error) {
 	return sshclient.Result{Stdout: []byte(stdout)}, nil
 }
 
-func okJSON(items []map[string]any) (sshclient.Result, error) {
-	data, err := json.Marshal(map[string]any{"items": items})
-	if err != nil {
-		return fail(1, err.Error())
-	}
-	return ok(string(data))
-}
-
 func fail(code int, stderr string) (sshclient.Result, error) {
 	return sshclient.Result{ExitCode: code, Stderr: []byte(stderr)}, nil
 }
@@ -521,38 +534,12 @@ func (f *fakeConn) Run(_ context.Context, cmd string, _ io.Reader) (sshclient.Re
 			b.WriteString("route=" + r + "\n")
 		}
 		return ok(b.String())
-	case strings.HasPrefix(cmd, "k3s kubectl get nodes -o json"):
-		var items []map[string]any
-		for name, kn := range c.nodes {
-			labels := map[string]string{}
-			for _, h := range c.hosts {
-				if h.server && h.k3s && strings.Contains(h.files[k3s.ConfigFile], "node-name: "+name+"\n") {
-					labels["node-role.kubernetes.io/control-plane"] = "true"
-				}
-			}
-			items = append(items, map[string]any{
-				"metadata": map[string]any{"name": name, "labels": labels},
-				"spec":     map[string]any{"unschedulable": c.cordoned[name]},
-				"status": map[string]any{
-					"addresses":  []map[string]string{{"type": "InternalIP", "address": kn.ip}},
-					"capacity":   map[string]string{"memory": "2021376Ki"},
-					"conditions": []map[string]string{{"type": "Ready", "status": "True"}},
-					"nodeInfo":   map[string]string{"kubeletVersion": K3sVersion, "architecture": kn.arch},
-				},
-			})
-		}
-		return okJSON(items)
-	case strings.HasPrefix(cmd, "k3s kubectl get namespaces -l") && strings.Contains(cmd, "-o json"):
-		var items []map[string]any
-		for a := range c.apps {
-			items = append(items, map[string]any{"metadata": map[string]string{"name": a}})
-		}
-		return okJSON(items)
-	case strings.HasPrefix(cmd, "k3s kubectl get deployments,statefulsets,daemonsets,ingresses -A -o json"):
-		return okJSON(c.workloads)
 	case strings.HasPrefix(cmd, "mkdir -p "):
 		return ok("")
 	case cmd == AppliedCommitScript:
+		if c.commitUnread {
+			return fail(1, "cat: "+AppliedCommitFile+": Input/output error")
+		}
 		return ok(n.files[AppliedCommitFile])
 	case cmd == k3s.NodeNamesScript:
 		var out []string

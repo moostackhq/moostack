@@ -19,7 +19,7 @@ import (
 
 // sshKey writes an ed25519 key without a passphrase into dir, and returns
 // its path.
-func sshKey(t *testing.T, dir string) string {
+func sshKey(t testing.TB, dir string) string {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -42,7 +42,7 @@ func sshKey(t *testing.T, dir string) string {
 
 // mooctl runs mooctl with args in a home of its own, with git's identity
 // set, in the directory wd.
-func mooctl(t *testing.T, home, wd string, args ...string) (string, error) {
+func mooctl(t testing.TB, home, wd string, args ...string) (string, error) {
 	t.Helper()
 	t.Chdir(wd)
 	var out, errOut bytes.Buffer
@@ -51,7 +51,7 @@ func mooctl(t *testing.T, home, wd string, args ...string) (string, error) {
 	return out.String() + errOut.String(), err
 }
 
-func newHome(t *testing.T) string {
+func newHome(t testing.TB) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -64,7 +64,7 @@ func newHome(t *testing.T) string {
 }
 
 // git runs git with args in dir, and returns what it printed.
-func git(t *testing.T, dir string, args ...string) string {
+func git(t testing.TB, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir

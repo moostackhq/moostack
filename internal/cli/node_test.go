@@ -22,7 +22,7 @@ import (
 
 // onFake runs mooctl with args on the cluster prod of home, whose hosts
 // are c's.
-func onFake(t *testing.T, c *fakeCluster, home string, args ...string) (string, error) {
+func onFake(t testing.TB, c *fakeCluster, home string, args ...string) (string, error) {
 	t.Helper()
 	var out bytes.Buffer
 	env := fakeEnvFor(c, home, &out)
@@ -32,7 +32,7 @@ func onFake(t *testing.T, c *fakeCluster, home string, args ...string) (string, 
 
 // fakeProd is an initialised cluster prod with the hosts h1, h2 and h3
 // on 10.0.0.0/24.
-func fakeProd(t *testing.T) (*fakeCluster, string) {
+func fakeProd(t testing.TB) (*fakeCluster, string) {
 	t.Helper()
 	home := newHome(t)
 	key := sshKey(t, home)
@@ -46,7 +46,7 @@ func fakeProd(t *testing.T) (*fakeCluster, string) {
 	return c, home
 }
 
-func prodDir(t *testing.T, home string) *clusterdir.Dir {
+func prodDir(t testing.TB, home string) *clusterdir.Dir {
 	t.Helper()
 	d, err := clusterdir.Open(filepath.Join(home, "clusters", "default", "prod"))
 	if err != nil {
@@ -68,7 +68,7 @@ func nodeNames(t *testing.T, home string) []string {
 	return names
 }
 
-func mustRun(t *testing.T, c *fakeCluster, home string, args ...string) string {
+func mustRun(t testing.TB, c *fakeCluster, home string, args ...string) string {
 	t.Helper()
 	out, err := onFake(t, c, home, args...)
 	if err != nil {
@@ -362,19 +362,6 @@ func TestNodeRemoveFinishesAPartialRemoval(t *testing.T) {
 	}
 	if names := nodeNames(t, home); len(names) != 1 {
 		t.Errorf("nodes = %v", names)
-	}
-}
-
-func TestStatusOfADirectoryWithNodesButNoControlPlane(t *testing.T) {
-	c, home := fakeProd(t)
-	mustRun(t, c, home, "cluster", "node-add", "root@h1")
-	d := prodDir(t, home)
-	path := filepath.Join(d.Path, "nodes", "node1.yml")
-	data, _ := os.ReadFile(path)
-	os.WriteFile(path, []byte(strings.Replace(string(data), "control_plane: true\n", "", 1)), 0o644)
-	out, err := onFake(t, c, home, "cluster", "status")
-	if err == nil || !strings.Contains(err.Error(), "nodes but no control plane") || !strings.Contains(out, "node1") {
-		t.Errorf("status = %v\n%s", err, out)
 	}
 }
 

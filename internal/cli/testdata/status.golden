@@ -1,0 +1,10 @@
+Cluster prod, k3s v1.37.2+k3s1
+
+NODE   ROLE           READY          K3S           ARCH   MEMORY    PRIVATE ADDRESS
+node1  control plane  yes            v1.37.2+k3s1  amd64  1974 MiB  10.0.0.2
+node2  node           yes, cordoned  v1.37.2+k3s1  amd64  1974 MiB  10.0.0.3
+
+APP   READY  IMAGE                                                          HOSTS
+blog  1/1    ghcr.io/example/blog:1                                         blog.example.com, www.blog.example.com
+idle  0/0                                                                   
+shop  3/4    moostack.local/shop/jobs@sha256:0661d8f5d565, valkey/valkey:8  shop.example.com

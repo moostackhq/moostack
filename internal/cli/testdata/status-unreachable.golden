@@ -1,0 +1,5 @@
+Cluster prod, k3s v1.37.2+k3s1
+
+NODE   ROLE           ARCH   MEMORY    PRIVATE ADDRESS
+node1  control plane  amd64  1974 MiB  10.0.0.2
+node2  node           amd64  1974 MiB  10.0.0.3

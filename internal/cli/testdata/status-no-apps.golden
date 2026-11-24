@@ -1,0 +1,6 @@
+Cluster prod, k3s v1.37.2+k3s1
+
+NODE   ROLE           READY  K3S           ARCH   MEMORY    PRIVATE ADDRESS
+node1  control plane  yes    v1.37.2+k3s1  amd64  1974 MiB  10.0.0.2
+
+No apps.

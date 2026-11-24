@@ -281,60 +281,6 @@ func TestClusterRemoveWaitsForNoOtherOperation(t *testing.T) {
 	}
 }
 
-func TestStatusShowsAnAppOfSeveralContainers(t *testing.T) {
-	c, home := deployingProd(t)
-	c.apps["shop"] = map[string]bool{}
-	deployment := func(name, image string, replicas, ready int) map[string]any {
-		return map[string]any{
-			"kind":     "Deployment",
-			"metadata": map[string]string{"name": name, "namespace": "shop"},
-			"spec": map[string]any{
-				"replicas": replicas,
-				"template": map[string]any{"spec": map[string]any{"containers": []map[string]string{{"image": image}}}},
-			},
-			"status": map[string]int{"readyReplicas": ready},
-		}
-	}
-	c.workloads = []map[string]any{
-		deployment("jobs", "moostack.local/shop/jobs@sha256:1", 1, 1),
-		deployment("web", "moostack.local/shop/jobs@sha256:1", 2, 1),
-		deployment("cache", "valkey/valkey:8", 1, 1),
-		{"kind": "Ingress", "metadata": map[string]string{"name": "web", "namespace": "shop"}, "spec": map[string]any{"rules": []map[string]string{{"host": "shop.example.com"}}}},
-	}
-	out := mustRun(t, c, home, "cluster", "status")
-	want := "shop  3/4    moostack.local/shop/jobs@sha256:1, valkey/valkey:8  shop.example.com\n"
-	if !strings.Contains(out, want) {
-		t.Errorf("no %q in:\n%s", want, out)
-	}
-}
-
-func TestStatusShowsTwelveCharactersOfAnImagesDigest(t *testing.T) {
-	c, home := deployingProd(t)
-	c.apps["shop"] = map[string]bool{}
-	container := func(name, image string) map[string]any {
-		return map[string]any{
-			"kind":     "Deployment",
-			"metadata": map[string]string{"name": name, "namespace": "shop"},
-			"spec":     map[string]any{"template": map[string]any{"spec": map[string]any{"containers": []map[string]string{{"image": image}}}}},
-			"status":   map[string]int{"readyReplicas": 1},
-		}
-	}
-	digest := "0661d8f5d56599a9d355618bc035ff3ff6e45800674aa9e8063287a57637e17c"
-	c.workloads = []map[string]any{
-		container("web", "moostack.local/shop/web@sha256:"+digest),
-		container("jobs", "moostack.local/shop/web@sha256:"+digest),
-		container("cache", "valkey/valkey:8"),
-	}
-	out := mustRun(t, c, home, "cluster", "status")
-	want := "shop  3/3    moostack.local/shop/web@sha256:0661d8f5d565, valkey/valkey:8  \n"
-	if !strings.Contains(out, want) {
-		t.Errorf("no %q in:\n%s", want, out)
-	}
-	if strings.Contains(out, digest) {
-		t.Errorf("the whole digest is in:\n%s", out)
-	}
-}
-
 func TestShortImage(t *testing.T) {
 	for image, want := range map[string]string{
 		"moostack.local/shop/web@sha256:0661d8f5d56599a9d355618bc035ff3ff6e45800674aa9e8063287a57637e17c": "moostack.local/shop/web@sha256:0661d8f5d565",
