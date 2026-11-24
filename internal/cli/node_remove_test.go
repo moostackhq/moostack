@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"slices"
 
 	"os"
@@ -16,10 +15,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/moostackhq/moostack/internal/orchestrator"
 	"github.com/moostackhq/moostack/internal/sshclient"
 	"golang.org/x/crypto/ssh"
-
-	"github.com/moostackhq/moostack/internal/k3s"
 )
 
 // A node only Kubernetes has, whose host still runs k3s, is removed with
@@ -29,7 +27,7 @@ func TestRemovingANodeOnlyKubernetesHasWarnsItMayComeBack(t *testing.T) {
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	h2 := c.hosts["root@h2"]
 	h2.k3s = true
-	h2.files[k3s.ConfigFile] = "node-name: stray\n"
+	h2.nodeName = "stray"
 	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.3", arch: "amd64"}
 
 	out := mustRun(t, c, home, "cluster", "node-remove", "stray")
@@ -63,25 +61,6 @@ func TestTheLastNodeNeedsYesAfterTheDirectoryIsBroughtUpToItsRemote(t *testing.T
 	out, err := onFake(t, c, home, "cluster", "node-remove", "node1")
 	if err == nil || !c.hosts["root@h1"].k3s {
 		t.Errorf("node-remove node1 without --yes = %v, k3s on h1 %v:\n%s", err, c.hosts["root@h1"].k3s, out)
-	}
-}
-
-// A k3s version mooctl has no install script checksum for is refused
-// before node-add writes to the host.
-func TestAVersionWithoutAChecksumIsRefusedBeforeTouchingTheHost(t *testing.T) {
-	c, home := fakeProd(t)
-	d := prodDir(t, home)
-	path := filepath.Join(d.Path, "cluster.yml")
-	data, _ := os.ReadFile(path)
-	os.WriteFile(path, []byte(strings.Replace(string(data), K3sVersion, "v1.38.0+k3s1", 1)), 0o644)
-	git(t, d.Path, "commit", "--quiet", "-am", "pin v1.38.0")
-
-	out, err := onFake(t, c, home, "cluster", "node-add", "root@h1")
-	if err == nil {
-		t.Fatalf("an unknown version was installed:\n%s", out)
-	}
-	if c.ran("root@h1", "mkdir -p") {
-		t.Errorf("refused after writing to the host (%v); ran:\n%s", err, strings.Join(c.runs, "\n---\n"))
 	}
 }
 
@@ -124,17 +103,27 @@ func TestAControlPlaneWhoseUninstallWasCutOffCanBeRemoved(t *testing.T) {
 	h1.k3s, h1.server = false, false
 	delete(h1.files, AppliedCommitFile)
 	c.nodes = map[string]fakeKubeNode{}
-	noK3s := func(target, cmd string) (sshclient.Result, error, bool) {
-		if target == "root@h1" && strings.HasPrefix(cmd, "k3s ") {
-			return sshclient.Result{ExitCode: 127, Stderr: []byte("sh: 1: k3s: not found")}, nil, true
-		}
-		return sshclient.Result{}, nil, false
+	c.orch.Fail("Nodes", errors.New("reading the control plane's kubeconfig: exit 1: no such file"))
+	if out, err := onFake(t, c, home, "cluster", "node-remove", "node1", "--yes"); err != nil {
+		t.Errorf("node-remove node1 --yes: %v\n%s", err, out)
 	}
-	for _, args := range [][]string{{"--yes"}} {
-		out, err := onProbe(t, t.Context(), c, home, noK3s, append([]string{"cluster", "node-remove", "node1"}, args...)...)
-		if err != nil {
-			t.Errorf("node-remove node1 %v: %v\n%s", args, err, out)
-		}
+	if l := left(h1); l != "" || len(nodeNames(t, home)) != 0 {
+		t.Errorf("h1 still has %q, and the cluster directory the nodes %v", l, nodeNames(t, home))
+	}
+}
+
+// The cluster's nodes can't be read, and the node isn't its last.
+func TestARemovalThatCantReadTheClustersNodesRemovesNothing(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	mustRun(t, c, home, "cluster", "node-add", "root@h2")
+	c.orch.Fail("Nodes", errors.New("the API is down"))
+	out, err := onFake(t, c, home, "cluster", "node-remove", "node2")
+	if err == nil || err.Error() != "listing the cluster's nodes: the API is down" {
+		t.Errorf("node-remove node2: %v\n%s", err, out)
+	}
+	if len(c.orch.made("RemoveNode")) != 0 || len(nodeNames(t, home)) != 2 || c.locked {
+		t.Errorf("the orchestrator was asked for the removals %q, the cluster directory has %v, the lock is held: %t", c.orch.made("RemoveNode"), nodeNames(t, home), c.locked)
 	}
 }
 
@@ -168,14 +157,12 @@ func TestAnInterruptedUnreachableRemovalCommitsNothing(t *testing.T) {
 	c.hosts["root@h1"].unreachable = true
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	cut := func(target, cmd string) (sshclient.Result, error, bool) {
-		if target == "root@h2" && strings.Contains(cmd, "uninstall.sh") {
-			cancel()
-			return sshclient.Result{}, context.Canceled, true
-		}
-		return sshclient.Result{}, nil, false
+	c.orch.onUninstall = func(string) error {
+		cancel()
+		return context.Canceled
 	}
-	out, err := onProbe(t, ctx, c, home, cut, "cluster", "node-remove", "--unreachable", "node2")
+	unhooked := func(string, string) (sshclient.Result, error, bool) { return sshclient.Result{}, nil, false }
+	out, err := onProbe(t, ctx, c, home, unhooked, "cluster", "node-remove", "--unreachable", "node2")
 	if err == nil || !slices.Contains(nodeNames(t, home), "node2") {
 		t.Errorf("an interrupted removal = %v, nodes %v:\n%s", err, nodeNames(t, home), out)
 	}
@@ -219,61 +206,118 @@ func TestTheControlPlaneGoesAfterNodesOnlyKubernetesHas(t *testing.T) {
 	}
 }
 
-func TestAFailedUninstallKeepsTheNode(t *testing.T) {
+func TestAFailedUninstallKeepsTheNodeAndTheRemovalFinishesWhenRunAgain(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	mustRun(t, c, home, "cluster", "node-add", "root@h2")
-	drop := func(target, cmd string) (sshclient.Result, error, bool) {
-		if target == "root@h2" && strings.Contains(cmd, "uninstall.sh") {
-			return sshclient.Result{}, errors.New("connection reset"), true
+	c.orch.onUninstall = func(target string) error {
+		if target == "root@h2" {
+			return errors.New("connection reset")
 		}
-		return sshclient.Result{}, nil, false
+		return nil
 	}
-	out, err := onProbe(t, t.Context(), c, home, drop, "cluster", "node-remove", "node2")
-	_, inKube := c.nodes["node2"]
-	if err == nil && !slices.Contains(nodeNames(t, home), "node2") && inKube {
-		t.Errorf("node-remove = nil, the node file dropped, Kubernetes still has node2:\n%s", out)
+	out, err := onFake(t, c, home, "cluster", "node-remove", "node2")
+	if err == nil || err.Error() != "uninstalling from node2: connection reset; run node-remove again" {
+		t.Errorf("node-remove with an uninstall that fails: %v\n%s", err, out)
 	}
-}
-
-func TestUninstallRemovesOnlyWhatMooctlWrote(t *testing.T) {
-	agent := uninstallScript(k3s.Agent)
-	for _, never := range []string{"/var/lib/moostack", "/etc/moostack", "/var/lib/zot", "rm -rf"} {
-		if strings.Contains(agent, never) {
-			t.Errorf("a node's uninstall touches %s:\n%s", never, agent)
-		}
+	if want := "Removing node2 from prod\nDraining node2...\nUninstalling...\n"; out != want {
+		t.Errorf("output:\n%s\nwant:\n%s", out, want)
 	}
-	cp := uninstallScript(k3s.ControlPlane)
-	for _, want := range []string{k3s.ConfigFile, AppliedCommitFile, "rmdir /var/lib/moostack", "/var/lib/zot", "/etc/moostack/zot.json"} {
-		if !strings.Contains(cp, want) {
-			t.Errorf("the control plane's uninstall lacks %s:\n%s", want, cp)
-		}
+	if _, onCluster := c.nodes["node2"]; !onCluster || !slices.Contains(nodeNames(t, home), "node2") || c.locked {
+		t.Errorf("the cluster has node2: %t, the cluster directory has %v, the lock is held: %t", onCluster, nodeNames(t, home), c.locked)
+	}
+	c.orch.onUninstall = nil
+	mustRun(t, c, home, "cluster", "node-remove", "node2")
+	if _, onCluster := c.nodes["node2"]; onCluster || slices.Contains(nodeNames(t, home), "node2") || c.hosts["root@h2"].k3s {
+		t.Errorf("run again, the cluster has node2: %t, the cluster directory has %v, k3s is on h2: %t", onCluster, nodeNames(t, home), c.hosts["root@h2"].k3s)
 	}
 }
 
-func TestUninstallParsesAndDoesntWaitForItself(t *testing.T) {
-	for _, role := range []k3s.Role{k3s.ControlPlane, k3s.Agent} {
-		script := uninstallScript(role)
-		for _, sh := range []string{"sh", "bash", "dash"} {
-			if _, err := exec.LookPath(sh); err != nil {
-				continue
-			}
-			if out, err := exec.Command(sh, "-n", "-c", script).CombinedOutput(); err != nil {
-				t.Errorf("%s: %s's uninstall doesn't parse: %v\n%s", sh, role, err, out)
-			}
+// The control plane's uninstall fails at the orchestrator's part.
+func TestAControlPlaneWhoseUninstallFailsIsKeptWithItsRegistryRemoved(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	c.orch.onUninstall = func(string) error { return errors.New("exit 3") }
+	out, err := onFake(t, c, home, "cluster", "node-remove", "--yes", "node1")
+	if err == nil || err.Error() != "uninstalling from node1: exit 3; run node-remove again" {
+		t.Errorf("node-remove with an uninstall that fails: %v\n%s", err, out)
+	}
+	if !c.ran("root@h1", ownUninstallScript) || len(nodeNames(t, home)) != 1 {
+		t.Errorf("the registry's uninstall ran: %t, and the cluster directory has %v", c.ran("root@h1", ownUninstallScript), nodeNames(t, home))
+	}
+	c.orch.onUninstall = nil
+	mustRun(t, c, home, "cluster", "node-remove", "--yes", "node1")
+	if l := left(c.hosts["root@h1"]); l != "" || len(nodeNames(t, home)) != 0 {
+		t.Errorf("run again, h1 still has %q, and the cluster directory %v", l, nodeNames(t, home))
+	}
+}
+
+func TestANodeThatHoldsVolumesIsRemovedOnlyWithLoseVolumes(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	mustRun(t, c, home, "cluster", "node-add", "root@h2")
+	c.orch.Volumes["node2"] = []string{"pvc-1", "pvc-2"}
+	out, err := onFake(t, c, home, "cluster", "node-remove", "node2")
+	if err == nil || err.Error() != "node2 holds the volumes pvc-1, pvc-2, which go with it; pass --lose-volumes to remove it anyway" {
+		t.Errorf("node-remove of a node that holds volumes: %v", err)
+	}
+	if out != "Removing node2 from prod\n" || !c.hosts["root@h2"].k3s || len(nodeNames(t, home)) != 2 {
+		t.Errorf("the refusal printed\n%s\nk3s is on h2: %t, the cluster directory has %v", out, c.hosts["root@h2"].k3s, nodeNames(t, home))
+	}
+	mustRun(t, c, home, "cluster", "node-remove", "--lose-volumes", "node2")
+	if !c.orch.removals["node2"].LoseVolumes || c.hosts["root@h2"].k3s || len(nodeNames(t, home)) != 1 {
+		t.Errorf("with --lose-volumes node2 was removed with %+v, k3s is on h2: %t, the cluster directory has %v", c.orch.removals["node2"], c.hosts["root@h2"].k3s, nodeNames(t, home))
+	}
+}
+
+func TestARemovalThatFailsBeforeTheUninstallSaysWhatFailedAlone(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	mustRun(t, c, home, "cluster", "node-add", "root@h2")
+	c.orch.Fail("RemoveNode", errors.New("draining node2: no controller would start these pods again: shop/job"))
+	out, err := onFake(t, c, home, "cluster", "node-remove", "node2")
+	if err == nil || err.Error() != "draining node2: no controller would start these pods again: shop/job" {
+		t.Errorf("node-remove with a drain that fails: %v\n%s", err, out)
+	}
+	if len(nodeNames(t, home)) != 2 || !c.hosts["root@h2"].k3s || c.locked {
+		t.Errorf("the cluster directory has %v, k3s is on h2: %t, the lock is held: %t", nodeNames(t, home), c.hosts["root@h2"].k3s, c.locked)
+	}
+	c.orch.Fail("RemoveNode", nil)
+	mustRun(t, c, home, "cluster", "node-remove", "node2")
+	if len(nodeNames(t, home)) != 1 {
+		t.Errorf("run again, the cluster directory has %v", nodeNames(t, home))
+	}
+}
+
+func TestANodeIsNeverGivenTheControlPlanesOwnUninstall(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	mustRun(t, c, home, "cluster", "node-add", "root@h2")
+	mustRun(t, c, home, "cluster", "node-remove", "node2")
+	if c.ran("root@h2", "zot") || c.ran("root@h2", AppliedCommitFile) {
+		t.Errorf("a node's removal ran on its host:\n%s", strings.Join(c.runs, "\n---\n"))
+	}
+	mustRun(t, c, home, "cluster", "node-remove", "--yes", "node1")
+	if !c.ran("root@h1", ownUninstallScript) {
+		t.Error("the control plane's removal left the registry and the applied commit")
+	}
+}
+
+func TestTheControlPlanesOwnUninstallParsesAndDoesntWaitForItself(t *testing.T) {
+	for _, sh := range []string{"sh", "bash", "dash"} {
+		if _, err := exec.LookPath(sh); err != nil {
+			continue
 		}
-		waits := regexp.MustCompile(`pgrep -f '([^']+)'`).FindAllStringSubmatch(script, -1)
-		if want := map[bool]int{true: 2, false: 1}[role.ControlPlane]; len(waits) != want {
-			t.Fatalf("%s: %d pgreps, want %d, in\n%s", role, len(waits), want, script)
+		if out, err := exec.Command(sh, "-n", "-c", ownUninstallScript).CombinedOutput(); err != nil {
+			t.Errorf("%s: the uninstall doesn't parse: %v\n%s", sh, err, out)
 		}
-		for _, m := range waits {
-			if regexp.MustCompile(m[1]).MatchString(script) {
-				t.Errorf("%s: the script's own command line matches its pgrep pattern %q", role, m[1])
-			}
-		}
-		if !strings.HasSuffix(script, "exit $s") {
-			t.Errorf("%s: the script doesn't exit with the uninstall's status", role)
-		}
+	}
+	waits := regexp.MustCompile(`pgrep -f '([^']+)'`).FindAllStringSubmatch(ownUninstallScript, -1)
+	if len(waits) != 1 {
+		t.Fatalf("%d pgreps, want 1, in\n%s", len(waits), ownUninstallScript)
+	}
+	if regexp.MustCompile(waits[0][1]).MatchString(ownUninstallScript) {
+		t.Errorf("the script's own command line matches its pgrep pattern %q", waits[0][1])
 	}
 }
 
@@ -289,74 +333,34 @@ func writeUnder(t *testing.T, root, path, content string, mode os.FileMode) {
 	}
 }
 
-// uninstallUnder runs the uninstall of a node of role with its paths
-// under root and the commands of root's fake directory first on its
-// PATH, and returns its exit status and output. It refuses a script that
-// names a path elsewhere.
-func uninstallUnder(root string, role k3s.Role) (int, string) {
-	script := regexp.MustCompile(`(^|\s)(/usr/local/bin/|/etc/|/var/lib/)`).ReplaceAllString(uninstallScript(role), "${1}"+root+"${2}")
-	for _, m := range regexp.MustCompile(`(?:^|[\s>])(/[^\s;)]*)`).FindAllStringSubmatch(script, -1) {
-		if m[1] != "/dev/null" && !strings.HasPrefix(m[1], root+"/") {
-			return -1, "the script names " + m[1] + ", outside " + root
-		}
-	}
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"PATH=" + filepath.Join(root, "fake") + ":/usr/bin:/bin"}
-	out, _ := cmd.CombinedOutput()
-	return cmd.ProcessState.ExitCode(), string(out)
-}
-
-// Each script runs with its paths under a directory of the test's, and a
-// systemctl and a pgrep that log their calls. k3s's uninstall script
-// logs its call and exits with status, or is absent for status -1. pgrep
-// finds an install running the first installing times it is asked.
-func TestUninstallRemovesWhatIsThereAndFailsAsK3ssDoes(t *testing.T) {
+// The script runs with its paths under a directory of the test's, and a
+// systemctl and a pgrep that log their calls. pgrep finds a download
+// running the first downloading times it is asked.
+func TestTheControlPlanesOwnUninstallRemovesTheRegistryAndTheAppliedCommitAndNothingElse(t *testing.T) {
 	zots := []string{"/etc/moostack/zot.json", "/etc/systemd/system/moostack-zot.service", "/usr/local/bin/zot", "/usr/local/bin/zot.download", "/var/lib/zot/blob", "/var/lib/private/zot/blob"}
 	for name, c := range map[string]struct {
-		role       k3s.Role
-		status     int
-		installing int
-		// kept are the files there that the script leaves, and removed
-		// the files there, and their directories, that it removes.
+		downloading   int
 		kept, removed []string
-		// calls are what the script runs, in order.
-		calls string
+		calls         string
 	}{
 		"a control plane": {
-			role:    k3s.ControlPlane,
-			kept:    []string{"/etc/other"},
-			removed: append([]string{k3s.ConfigFile, k3s.RegistriesFile, k3s.AutoDeployFile("issuer"), AppliedCommitFile, "/etc/rancher/k3s", "/etc/moostack", "/var/lib/moostack", "/var/lib/zot", "/var/lib/private/zot"}, zots...),
-			calls:   "pgrep k3s-uninstall daemon-reload pgrep disable---now-moostack-zot.service daemon-reload",
-		},
-		"a control plane whose k3s fails to uninstall": {
-			role:    k3s.ControlPlane,
-			status:  3,
-			removed: append([]string{k3s.ConfigFile, AppliedCommitFile}, zots...),
-			calls:   "pgrep k3s-uninstall daemon-reload pgrep disable---now-moostack-zot.service daemon-reload",
-		},
-		"a control plane whose k3s is gone": {
-			role:    k3s.ControlPlane,
-			status:  -1,
-			removed: append([]string{k3s.ConfigFile, AppliedCommitFile}, zots...),
-			calls:   "pgrep daemon-reload pgrep disable---now-moostack-zot.service daemon-reload",
+			kept:    []string{"/etc/other", "/etc/rancher/k3s/config.yaml", "/usr/local/bin/k3s"},
+			removed: append([]string{AppliedCommitFile, "/etc/moostack", "/var/lib/moostack", "/var/lib/zot", "/var/lib/private/zot"}, zots...),
+			calls:   "pgrep disable---now-moostack-zot.service daemon-reload",
 		},
 		"a control plane with files of others beside mooctl's": {
-			role:    k3s.ControlPlane,
-			kept:    []string{"/etc/moostack/other", "/var/lib/moostack/other", "/etc/rancher/k3s/other"},
-			removed: append([]string{k3s.ConfigFile, AppliedCommitFile}, zots...),
-			calls:   "pgrep k3s-uninstall daemon-reload pgrep disable---now-moostack-zot.service daemon-reload",
+			kept:    []string{"/etc/moostack/other", "/var/lib/moostack/other"},
+			removed: append([]string{AppliedCommitFile}, zots...),
+			calls:   "pgrep disable---now-moostack-zot.service daemon-reload",
 		},
-		"a control plane with an install still running": {
-			role:       k3s.ControlPlane,
-			installing: 1,
-			removed:    append([]string{k3s.ConfigFile, AppliedCommitFile}, zots...),
-			calls:      "pgrep pgrep k3s-uninstall daemon-reload pgrep disable---now-moostack-zot.service daemon-reload",
+		"a control plane with a download still running": {
+			downloading: 1,
+			removed:     append([]string{AppliedCommitFile}, zots...),
+			calls:       "pgrep pgrep disable---now-moostack-zot.service daemon-reload",
 		},
-		"a node": {
-			role:    k3s.Agent,
-			kept:    append([]string{AppliedCommitFile}, zots...),
-			removed: []string{k3s.ConfigFile, k3s.RegistriesFile, "/etc/rancher/k3s"},
-			calls:   "pgrep k3s-uninstall daemon-reload",
+		"a host with nothing of it": {
+			kept:  []string{"/etc/other"},
+			calls: "pgrep disable---now-moostack-zot.service daemon-reload",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -369,16 +373,20 @@ func TestUninstallRemovesWhatIsThereAndFailsAsK3ssDoes(t *testing.T) {
 				}
 			}
 			log := filepath.Join(root, "calls")
-			if c.status >= 0 {
-				write("/usr/local/bin/"+map[bool]string{true: "k3s-uninstall.sh", false: "k3s-agent-uninstall.sh"}[c.role.ControlPlane],
-					fmt.Sprintf("#!/bin/sh\necho k3s-uninstall >> %s\nexit %d\n", log, c.status), 0o755)
-			}
 			write("/fake/systemctl", fmt.Sprintf("#!/bin/sh\necho \"$*\" | tr ' ' - >> %s\n", log), 0o755)
-			write("/fake/pgrep", fmt.Sprintf("#!/bin/sh\necho pgrep >> %[1]s\n[ \"$(grep -c pgrep %[1]s)\" -le %[2]d ]\n", log, c.installing), 0o755)
+			write("/fake/pgrep", fmt.Sprintf("#!/bin/sh\necho pgrep >> %[1]s\n[ \"$(grep -c pgrep %[1]s)\" -le %[2]d ]\n", log, c.downloading), 0o755)
 			write("/fake/sleep", "#!/bin/sh\n", 0o755)
 
-			if got, out := uninstallUnder(root, c.role); got != max(c.status, 0) {
-				t.Errorf("the script exits %d, want %d:\n%s", got, max(c.status, 0), out)
+			script := regexp.MustCompile(`(^|\s)(/usr/local/bin/|/etc/|/var/lib/)`).ReplaceAllString(ownUninstallScript, "${1}"+root+"${2}")
+			for _, m := range regexp.MustCompile(`(?:^|[\s>])(/[^\s;)]*)`).FindAllStringSubmatch(script, -1) {
+				if m[1] != "/dev/null" && !strings.HasPrefix(m[1], root+"/") {
+					t.Fatalf("the script names %s, outside %s", m[1], root)
+				}
+			}
+			cmd := exec.Command("sh", "-c", script)
+			cmd.Env = []string{"PATH=" + filepath.Join(root, "fake") + ":/usr/bin:/bin"}
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Errorf("the script fails: %v\n%s", err, out)
 			}
 			for _, f := range c.removed {
 				if _, err := os.Stat(filepath.Join(root, f)); err == nil {
@@ -398,62 +406,37 @@ func TestUninstallRemovesWhatIsThereAndFailsAsK3ssDoes(t *testing.T) {
 	}
 }
 
-// A host goes through installs that put some of mooctl's files there, and
-// uninstalls, with k3s's own uninstall script there or not, passing or
-// failing. After each uninstall the host has none of the role's files,
-// keeps every other, and the script exited as k3s's did.
-func TestSequencesOfInstallsAndUninstallsLeaveOnlyWhatIsntMooctls(t *testing.T) {
-	zots := []string{"/etc/moostack/zot.json", "/etc/systemd/system/moostack-zot.service", "/usr/local/bin/zot", "/usr/local/bin/zot.download", "/var/lib/zot/blob", "/var/lib/private/zot/blob", AppliedCommitFile}
-	others := []string{"/etc/other", "/etc/moostack/other", "/var/lib/moostack/other", "/etc/rancher/k3s/other", "/usr/local/bin/other", "/var/lib/other/blob"}
-	for seed := range uint64(40) {
-		rng := rand.New(rand.NewPCG(seed, 1))
-		role := k3s.RoleOf(rng.IntN(2) == 0)
-		root := t.TempDir()
-		var mine []string
-		for _, f := range (k3s.Written{Role: role}).Files() {
-			mine = append(mine, f.Path)
+func TestOnlyAFailedUninstallSaysToRunTheRemovalAgain(t *testing.T) {
+	for step, want := range map[orchestrator.Step]string{
+		orchestrator.Draining:     "draining node2: these pods are still there: shop/web-1",
+		orchestrator.Uninstalling: "uninstalling from node2: exit 1; run node-remove again",
+		orchestrator.Deleting:     "deleting node node2: it is still there after 1m0s",
+	} {
+		c, home := fakeProd(t)
+		mustRun(t, c, home, "cluster", "node-add", "root@h1")
+		mustRun(t, c, home, "cluster", "node-add", "root@h2")
+		c.orch.failRemovalAt = map[orchestrator.Step]error{step: errors.New(strings.TrimSuffix(want, "; run node-remove again"))}
+		out, err := onFake(t, c, home, "cluster", "node-remove", "node2")
+		if err == nil || err.Error() != want {
+			t.Errorf("node-remove that fails at step %v: %v\nwant %s\n%s", step, err, want, out)
 		}
-		if role.ControlPlane {
-			mine = append(mine, zots...)
+		if !slices.Contains(nodeNames(t, home), "node2") || c.locked {
+			t.Errorf("step %v: the cluster directory has %v, and the lock is held: %t", step, nodeNames(t, home), c.locked)
 		}
-		own := "/usr/local/bin/k3s-agent-uninstall.sh"
-		if role.ControlPlane {
-			own = "/usr/local/bin/k3s-uninstall.sh"
-		}
-		writeUnder(t, root, "/fake/systemctl", "#!/bin/sh\n", 0o755)
-		writeUnder(t, root, "/fake/pgrep", "#!/bin/sh\nexit 1\n", 0o755)
-		kept := map[string]bool{}
-		for step := range 6 {
-			for _, f := range mine {
-				if rng.IntN(2) == 0 {
-					writeUnder(t, root, f, "x", 0o644)
-				}
-			}
-			for _, f := range others {
-				if rng.IntN(3) == 0 {
-					writeUnder(t, root, f, "x", 0o644)
-					kept[f] = true
-				}
-			}
-			status := 0
-			if rng.IntN(3) > 0 {
-				status = rng.IntN(2) * 3
-				writeUnder(t, root, own, fmt.Sprintf("#!/bin/sh\nrm -f \"$0\"\nexit %d\n", status), 0o755)
-			}
-			got, out := uninstallUnder(root, role)
-			if got != status {
-				t.Fatalf("seed %d, step %d, %s: the script exits %d, want %d:\n%s", seed, step, role, got, status, out)
-			}
-			for _, f := range mine {
-				if _, err := os.Stat(filepath.Join(root, f)); err == nil {
-					t.Fatalf("seed %d, step %d, %s: %s is left", seed, step, role, f)
-				}
-			}
-			for f := range kept {
-				if _, err := os.Stat(filepath.Join(root, f)); err != nil {
-					t.Fatalf("seed %d, step %d, %s: %s is gone", seed, step, role, f)
-				}
-			}
-		}
+	}
+}
+
+func TestAnInterruptedRemovalThroughTheControlPlaneKeepsTheNode(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	mustRun(t, c, home, "cluster", "node-add", "root@h2")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	c.orch.onUninstall = func(string) error {
+		cancel(errors.New("interrupted"))
+		return context.Canceled
+	}
+	_, _, err := streams(t, c, home, ctx, "cluster", "node-remove", "node2")
+	if err == nil || !slices.Contains(nodeNames(t, home), "node2") || c.locked {
+		t.Errorf("an interrupted removal: %v; the cluster directory has %v, and the lock is held: %t", err, nodeNames(t, home), c.locked)
 	}
 }

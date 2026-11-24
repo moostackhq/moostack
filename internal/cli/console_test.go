@@ -2,13 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
-
-	"github.com/moostackhq/moostack/internal/k3s"
 )
 
 // consoleOn runs mooctl console on c, and returns standard output,
@@ -63,8 +64,7 @@ func TestEachConsoleGetsAnotherToken(t *testing.T) {
 
 func TestConsoleOfANodeWithoutAPublicAddressIsAtItsPrivateOne(t *testing.T) {
 	c, home := fakeProd(t)
-	c.hosts["root@h1"].addrs = []string{"ens10 10.0.0.2/32"}
-	c.hosts["root@h1"].routes = []string{"ens10"}
+	c.hosts["root@h1"].public = netip.Addr{}
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	stdout, _, opened, err := consoleOn(t, c, home, nil)
 	if err != nil {
@@ -147,21 +147,101 @@ func TestABrowserThatCantBeOpenedIsNoError(t *testing.T) {
 	}
 }
 
-func TestConsoleRefusesAClusterWithoutNodesOrWithoutAConsole(t *testing.T) {
+func TestConsoleRefusesAClusterWithoutNodesAndAnArgument(t *testing.T) {
 	c, home := fakeProd(t)
 	if _, _, _, err := consoleOn(t, c, home, nil); err == nil || !strings.Contains(err.Error(), "cluster prod has no nodes yet") {
 		t.Errorf("mooctl console on a cluster without nodes: %v", err)
 	}
-	mustRun(t, c, home, "cluster", "node-add", "root@h1")
-	delete(c.hosts["root@h1"].files, k3s.AutoDeployFile("console"))
-	stdout, _, opened, err := consoleOn(t, c, home, nil)
-	if err == nil || !strings.Contains(err.Error(), "cluster prod has no console") {
-		t.Errorf("mooctl console on a cluster without a console: %v", err)
-	}
-	if stdout != "" || len(opened) != 0 {
-		t.Errorf("standard output is %q, and the browser opened %q", stdout, opened)
-	}
 	if _, err := onFake(t, c, home, "console", "more"); err == nil {
 		t.Error("mooctl console with an argument: no error")
 	}
+}
+
+// The console's container isn't running: it starts, or it was removed.
+func TestConsoleWaitsForAConsoleThatIsntRunningAndIssuesNoTokenMeanwhile(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	image := c.consoleRuns
+	c.stopConsole()
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		stdout, stderr, opened, err := consoleOn(t, c, home, nil)
+		if err == nil || err.Error() != "the console doesn't answer at https://192.0.2.10/console/login: it answered 404" {
+			t.Errorf("mooctl console on a cluster whose console never runs: %v", err)
+		}
+		if stdout != "" || stderr != "Waiting for the console...\n" || len(opened) != 0 || len(c.orch.made("ConsoleToken")) != 0 {
+			t.Errorf("it printed %q, said %q, opened %q and asked for %d tokens", stdout, stderr, opened, len(c.orch.made("ConsoleToken")))
+		}
+		if took := time.Since(start); took != 2*time.Minute {
+			t.Errorf("it gave up after %v, want 2m", took)
+		}
+	})
+	synctest.Test(t, func(t *testing.T) {
+		go func() {
+			time.Sleep(30 * time.Second)
+			c.orch.RunConsole(t.Context(), image, nil)
+		}()
+		start := time.Now()
+		stdout, _, opened, err := consoleOn(t, c, home, nil)
+		if err != nil || !strings.Contains(stdout, "Token: ") || len(opened) != 1 {
+			t.Errorf("mooctl console on a cluster whose console starts after 30 seconds: %v, printed %q, opened %q", err, stdout, opened)
+		}
+		if took := time.Since(start); took < 30*time.Second || took > 34*time.Second {
+			t.Errorf("it took %v, want the 30 seconds the console took to start", took)
+		}
+	})
+}
+
+func TestTheConsolesURLIsItsLoginPageAtTheAddress(t *testing.T) {
+	for address, want := range map[string]string{
+		"203.0.113.7": "https://203.0.113.7/console/login",
+		"2001:db8::7": "https://[2001:db8::7]/console/login",
+	} {
+		if got := consoleURL(netip.MustParseAddr(address)); got != want {
+			t.Errorf("the console's URL at %s is %q, want %q", address, got, want)
+		}
+	}
+}
+
+func TestConsoleFailsWhenATokenCantBeRead(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	c.orch.Fail("ConsoleToken", errors.New("the console isn't running"))
+	stdout, _, opened, err := consoleOn(t, c, home, nil)
+	if err == nil || err.Error() != "getting a login token: the console isn't running" || stdout != "" || len(opened) != 0 {
+		t.Errorf("mooctl console without a token: %v, printed %q, opened %q", err, stdout, opened)
+	}
+	if got := c.orch.made(""); !slices.Equal(got[len(got)-1:], []string{"ConsoleToken"}) || c.orch.hosts != 1 {
+		t.Errorf("the calls to the orchestrator ended with %q, through %d control plane connections; want ConsoleToken alone, through one", got, c.orch.hosts)
+	}
+}
+
+func TestConsoleInterruptedWhileItWaitsFailsWithTheCauseEveryTime(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	c.stopConsole()
+	for range 20 {
+		ctx, cancel := context.WithCancelCause(t.Context())
+		var out bytes.Buffer
+		env := fakeEnvFor(c, home, &out)
+		env.Stderr = &lineHook{on: "Waiting for the console...", do: func() { cancel(errors.New("interrupted")) }}
+		err := New(env).Run(ctx, []string{"mooctl", "-c", "prod", "console"})
+		if err == nil || err.Error() != "interrupted" || out.Len() != 0 {
+			t.Fatalf("mooctl console interrupted while it waits: %v, printed %q; want the interrupt alone", err, out.String())
+		}
+	}
+}
+
+// lineHook is a writer that calls do when it is written a line that
+// starts with on.
+type lineHook struct {
+	on string
+	do func()
+}
+
+func (h *lineHook) Write(p []byte) (int, error) {
+	if strings.HasPrefix(string(p), h.on) {
+		h.do()
+	}
+	return len(p), nil
 }

@@ -45,9 +45,8 @@ var zotSHA256 = map[string]string{
 const downloadLimits = "--max-time 600 --speed-limit 10240 --speed-time 60"
 
 // ZotScript installs zot on the control plane, of architecture arch,
-// listening on its private address, and waits until it answers. It runs
-// the script first before it starts its download.
-func ZotScript(arch string, private netip.Addr, first string) string {
+// listening on its private address, and waits until it answers.
+func ZotScript(arch string, private netip.Addr) string {
 	listen := netip.AddrPortFrom(private, Port)
 	config, err := json.Marshal(map[string]any{
 		"distSpecVersion": "1.1.1",
@@ -90,7 +89,6 @@ WantedBy=multi-user.target
 `
 	url := fmt.Sprintf("https://github.com/project-zot/zot/releases/download/%s/zot-linux-%s-minimal", zotVersion, arch)
 	return fmt.Sprintf(`set -e
-%[9]s
 curl -sfL --retry 3 %[7]s -o /usr/local/bin/zot.download %[1]s
 echo '%[2]s  /usr/local/bin/zot.download' | sha256sum -c --quiet
 chmod 755 /usr/local/bin/zot.download
@@ -109,7 +107,7 @@ for i in $(seq 60); do
 done
 echo "zot doesn't answer at %[6]s" >&2
 journalctl -u %[4]s -n 20 --no-pager >&2
-exit 1`, sshclient.ShellQuote(url), zotSHA256[arch], config, zotUnit, unit, listen, downloadLimits, zotConfig, first)
+exit 1`, sshclient.ShellQuote(url), zotSHA256[arch], config, zotUnit, unit, listen, downloadLimits, zotConfig)
 }
 
 // ZotUninstallScript removes zot and its images from the control plane,

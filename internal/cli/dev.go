@@ -16,7 +16,6 @@ import (
 	"github.com/moostackhq/moostack/internal/clusterdir"
 	"github.com/moostackhq/moostack/internal/deployfile"
 	"github.com/moostackhq/moostack/internal/interrupt"
-	"github.com/moostackhq/moostack/internal/k3s"
 )
 
 func init() {
@@ -113,13 +112,13 @@ func devConsoleDeploy(ctx context.Context, env Env, cmd *cli.Command) error {
 			return err
 		}
 	}
-	image, err := buildAndPush(ctx, env, k3s.ConsoleRepository, "the console", deployfile.Build{Dockerfile: build}, []string{cp.Architecture}, cp, cpClient)
+	image, err := buildAndPush(ctx, env, consoleRepository, "the console", deployfile.Build{Dockerfile: build}, []string{cp.Architecture}, cp, cpClient)
 	if err != nil {
 		return err
 	}
 	say(env, "Waiting for the console to be ready...")
 	_, digest, _ := strings.Cut(image, "@sha256:")
-	if err := runConsole(ctx, cpClient, cp, digest); err != nil {
+	if err := runConsole(ctx, orchestratorThrough(env, cpClient), cpClient, cp, digest); err != nil {
 		return err
 	}
 	fmt.Fprintf(env.Stdout, "Deployed the console to %s\nImage: %s\n", d.Cluster.Ref, image)

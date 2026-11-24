@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sync"
 	"time"
@@ -40,16 +41,36 @@ func init() {
 const requestTimeout = time.Minute
 
 type Backend struct {
+	mu sync.Mutex
 	// host is the control plane the API is reached through, nil if it
 	// isn't reached through one.
-	host orchestrator.Host
+	host    orchestrator.Host
+	cluster Cluster
+	api     *api
+}
 
-	mu  sync.Mutex
-	api *api
+// Cluster is what the backend is told of a cluster to make hosts its
+// nodes.
+type Cluster struct {
+	// Version is the k3s version of the cluster's nodes.
+	Version string
+	// Email is the email of the ACME account that certificates are
+	// issued to, empty for self-signed ones.
+	Email string
+	// Registry is the name nodes pull the cluster's own images from, and
+	// RegistryPort the port of that registry on the control plane's
+	// private address.
+	Registry     string
+	RegistryPort uint16
+	// ControlPlane is the control plane's private address, invalid for a
+	// cluster without one.
+	ControlPlane netip.Addr
 }
 
 // api is a connection to the cluster's API.
 type api struct {
+	// config is how the connection was made.
+	config *rest.Config
 	client kubernetes.Interface
 	// streams is client without a bound on how long an answer takes.
 	streams kubernetes.Interface
@@ -83,9 +104,9 @@ func InCluster() (*Backend, error) {
 // file and runs no command that the kubeconfig names. Its own
 // errors hold nothing of the kubeconfig; a failed read's error is
 // host's. With a nil host, every call that
-// needs the API fails.
-func Through(host orchestrator.Host) *Backend {
-	return &Backend{host: host}
+// needs the API fails, until AddNode has made a host the control plane.
+func Through(host orchestrator.Host, cluster Cluster) *Backend {
+	return &Backend{host: host, cluster: cluster}
 }
 
 func newAPI(config *rest.Config) (*api, error) {
@@ -106,6 +127,7 @@ func newAPI(config *rest.Config) (*api, error) {
 		return nil, err
 	}
 	return &api{
+		config:  config,
 		client:  client,
 		streams: streams,
 		dynamic: dyn,
@@ -122,9 +144,19 @@ func (b *Backend) connect(ctx context.Context) (*api, error) {
 		return b.api, nil
 	}
 	if b.host == nil {
-		return nil, errors.New("the cluster has no control plane to reach it through")
+		return nil, errNoControlPlane
 	}
-	kubeconfig, err := b.host.Run(ctx, "cat "+kubeconfigFile, nil)
+	a, err := connectThrough(ctx, b.host)
+	if err != nil {
+		return nil, err
+	}
+	b.api = a
+	return a, nil
+}
+
+// connectThrough connects to the API through host, a control plane.
+func connectThrough(ctx context.Context, host orchestrator.Host) (*api, error) {
+	kubeconfig, err := host.Run(ctx, "cat "+kubeconfigFile, nil)
 	if err != nil {
 		return nil, fmt.Errorf("reading the control plane's %s: %w", kubeconfigFile, err)
 	}
@@ -132,7 +164,6 @@ func (b *Backend) connect(ctx context.Context) (*api, error) {
 	if !ok {
 		return nil, fmt.Errorf("the control plane's %s isn't a kubeconfig", kubeconfigFile)
 	}
-	host := b.host
 	config.Dial = func(ctx context.Context, _, addr string) (net.Conn, error) { return host.DialTCP(ctx, addr) }
 	config.Proxy = func(*http.Request) (*url.URL, error) { return nil, nil }
 	config.Timeout = requestTimeout
@@ -140,7 +171,6 @@ func (b *Backend) connect(ctx context.Context) (*api, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the control plane's %s can't be connected with", kubeconfigFile)
 	}
-	b.api = a
 	return a, nil
 }
 

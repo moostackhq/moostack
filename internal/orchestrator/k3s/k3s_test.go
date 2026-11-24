@@ -55,6 +55,8 @@ var (
 	// reader is how the backend connects: as an account that may only
 	// list pods.
 	reader *rest.Config
+	// server is the container the k3s server runs in.
+	server string
 )
 
 func TestMain(m *testing.M) {
@@ -67,11 +69,12 @@ func TestMain(m *testing.M) {
 }
 
 func run(m *testing.M) (int, error) {
-	// A fuzz worker runs a fuzz target alone, which needs no cluster.
+	// A fuzz worker starts no cluster.
 	if slices.Contains(os.Args, "-test.fuzzworker") {
 		return m.Run(), nil
 	}
 	name := fmt.Sprintf("moostack-orchestrator-test-%d", os.Getpid())
+	server = name
 	if out, err := exec.Command("docker", "run", "-d", "--rm", "--name", name, "--memory", "1g", "-p", "127.0.0.1::6443", image,
 		"server", "--disable-agent", "--disable=traefik,servicelb,metrics-server,local-storage,coredns").CombinedOutput(); err != nil {
 		return 0, fmt.Errorf("starting %s: %v\n%s", image, err, out)
@@ -514,25 +517,6 @@ func TestPodsBeyondOnePageAreListed(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("Running listed %d of the %d containers in %s", len(got), count, ns)
-	}
-}
-
-func TestAMethodTheBackendDoesntHaveYetSaysSo(t *testing.T) {
-	ctx := context.Background()
-	b := backend(t)
-	_, preflight := b.Preflight(ctx, nil, orchestrator.NodeRequest{})
-	_, token := b.ConsoleToken(ctx)
-	for method, err := range map[string]error{
-		"Preflight":    preflight,
-		"AddNode":      b.AddNode(ctx, nil, model.Node{}),
-		"RemoveNode":   b.RemoveNode(ctx, "node-1", nil, orchestrator.RemoveOptions{}),
-		"Uninstall":    b.Uninstall(ctx, nil, model.Node{}),
-		"RunConsole":   b.RunConsole(ctx, "example.test/console:1", nil),
-		"ConsoleToken": token,
-	} {
-		if want := method + ": the k3s backend can't do this yet"; err == nil || err.Error() != want {
-			t.Errorf("%s: %v, want %q", method, err, want)
-		}
 	}
 }
 

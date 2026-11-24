@@ -101,9 +101,10 @@ func Contract(t *testing.T, cluster func(t *testing.T) Cluster) {
 		slices.Sort(out)
 		return out
 	}
-	// node makes a new host the node asked for, and removes it when the
-	// test ends, if the cluster still has it. It skips the test on a cluster without hosts.
-	node := func(t *testing.T, c Cluster, want orchestrator.NodeRequest) (model.Node, orchestrator.Host) {
+	// node makes a new host the node asked for, telling step the steps,
+	// and removes it when the test ends, if the cluster still has it. It
+	// skips the test on a cluster without hosts.
+	node := func(t *testing.T, c Cluster, want orchestrator.NodeRequest, step func(orchestrator.Step)) (model.Node, orchestrator.Host) {
 		t.Helper()
 		if c.Host == nil {
 			t.Skip("the cluster has no hosts to make nodes of")
@@ -123,11 +124,11 @@ func Contract(t *testing.T, cluster func(t *testing.T) Cluster) {
 			if !slices.ContainsFunc(nodes, func(s model.NodeState) bool { return s.Name == want.Name }) {
 				return
 			}
-			if err := c.Orchestrator.RemoveNode(ctx, want.Name, host, orchestrator.RemoveOptions{}); err != nil {
+			if err := c.Orchestrator.RemoveNode(ctx, want.Name, host, orchestrator.RemoveOptions{}, func(orchestrator.Step) {}); err != nil {
 				t.Errorf("removing %s: %v", want.Name, err)
 			}
 		})
-		if err := c.Orchestrator.AddNode(within(t), host, n); err != nil {
+		if err := c.Orchestrator.AddNode(within(t), host, n, step); err != nil {
 			t.Fatalf("AddNode: %v", err)
 		}
 		return n, host
@@ -387,7 +388,7 @@ func Contract(t *testing.T, cluster func(t *testing.T) Cluster) {
 	t.Run("a host becomes the node asked for, and the cluster has it", func(t *testing.T) {
 		c := cluster(t)
 		name := unique("node")
-		n, _ := node(t, c, orchestrator.NodeRequest{Name: name})
+		n, _ := node(t, c, orchestrator.NodeRequest{Name: name}, func(orchestrator.Step) {})
 		if n.Name != name || n.ControlPlane {
 			t.Errorf("Preflight returned the node %q, control plane %t, want %q, which isn't one", n.Name, n.ControlPlane, name)
 		}
@@ -410,7 +411,7 @@ func Contract(t *testing.T, cluster func(t *testing.T) Cluster) {
 		var want []string
 		for _, letter := range letters {
 			want = append(want, id+"-"+letter)
-			node(t, c, orchestrator.NodeRequest{Name: id + "-" + letter})
+			node(t, c, orchestrator.NodeRequest{Name: id + "-" + letter}, func(orchestrator.Step) {})
 		}
 		slices.Sort(want)
 		nodes, err := c.Orchestrator.Nodes(within(t))
@@ -432,17 +433,59 @@ func Contract(t *testing.T, cluster func(t *testing.T) Cluster) {
 		c := cluster(t)
 		for _, reached := range []bool{true, false} {
 			name := unique("node")
-			_, host := node(t, c, orchestrator.NodeRequest{Name: name})
+			_, host := node(t, c, orchestrator.NodeRequest{Name: name}, func(orchestrator.Step) {})
 			at := host
 			if !reached {
 				at = nil
 			}
-			if err := c.Orchestrator.RemoveNode(within(t), name, at, orchestrator.RemoveOptions{}); err != nil {
+			if err := c.Orchestrator.RemoveNode(within(t), name, at, orchestrator.RemoveOptions{}, func(orchestrator.Step) {}); err != nil {
 				t.Fatalf("RemoveNode, host reached %t: %v", reached, err)
 			}
 			if _, ok := nodeState(t, c.Orchestrator, name); ok {
 				t.Errorf("Nodes has %s after its removal, host reached %t", name, reached)
 			}
+		}
+	})
+
+	t.Run("adding and removing a node tell each step as they start it, in order", func(t *testing.T) {
+		c := cluster(t)
+		name := unique("node")
+		var steps []orchestrator.Step
+		tell := func(s orchestrator.Step) { steps = append(steps, s) }
+		_, host := node(t, c, orchestrator.NodeRequest{Name: name}, tell)
+		if want := []orchestrator.Step{orchestrator.Installing, orchestrator.Starting, orchestrator.WaitingForNode}; !slices.Equal(steps, want) {
+			t.Errorf("the steps of AddNode were %v, want Installing, Starting, WaitingForNode", steps)
+		}
+		steps = nil
+		if err := c.Orchestrator.RemoveNode(within(t), name, host, orchestrator.RemoveOptions{}, tell); err != nil {
+			t.Fatalf("RemoveNode: %v", err)
+		}
+		if want := []orchestrator.Step{orchestrator.Draining, orchestrator.Uninstalling, orchestrator.Deleting}; !slices.Equal(steps, want) {
+			t.Errorf("the steps of RemoveNode were %v, want Draining, Uninstalling, Deleting", steps)
+		}
+	})
+
+	t.Run("a node isn't added under the name of a node the cluster has, which stays", func(t *testing.T) {
+		c := cluster(t)
+		name := unique("node")
+		n, _ := node(t, c, orchestrator.NodeRequest{Name: name}, func(orchestrator.Step) {})
+		var steps []orchestrator.Step
+		if err := c.Orchestrator.AddNode(within(t), c.Host(t), n, func(s orchestrator.Step) { steps = append(steps, s) }); err == nil {
+			t.Error("AddNode under the name of a node the cluster has succeeded")
+		}
+		if _, ok := nodeState(t, c.Orchestrator, name); !ok || len(steps) != 0 {
+			t.Errorf("after the refusal the cluster has the node: %t, and the steps told were %v", ok, steps)
+		}
+	})
+
+	t.Run("removing a node the cluster doesn't have succeeds", func(t *testing.T) {
+		o := cluster(t).Orchestrator
+		var steps []orchestrator.Step
+		if err := o.RemoveNode(within(t), unique("node"), nil, orchestrator.RemoveOptions{}, func(s orchestrator.Step) { steps = append(steps, s) }); err != nil {
+			t.Errorf("RemoveNode: %v", err)
+		}
+		if len(steps) != 0 {
+			t.Errorf("RemoveNode of a node that isn't there, without a host, told the steps %v", steps)
 		}
 	})
 

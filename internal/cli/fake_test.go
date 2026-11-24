@@ -18,12 +18,13 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"maps"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
-	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -33,14 +34,12 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
-	"gopkg.in/yaml.v3"
 
 	ggcrregistry "github.com/google/go-containerregistry/pkg/registry"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/layout"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 
-	"github.com/moostackhq/moostack/internal/k3s"
 	"github.com/moostackhq/moostack/internal/model"
 	"github.com/moostackhq/moostack/internal/orchestrator"
 	"github.com/moostackhq/moostack/internal/orchestrator/orchestratortest"
@@ -60,8 +59,8 @@ func testHostKey(t testing.TB) ssh.PublicKey {
 	return k
 }
 
-// fakeCluster is a set of hosts and the Kubernetes cluster their k3s
-// makes, as mooctl's scripts see them.
+// fakeCluster is a set of hosts and the cluster the orchestrator makes
+// of them, as mooctl's commands see them.
 type fakeCluster struct {
 	// unissued is the name of a certificate that is never issued.
 	unissued string
@@ -69,11 +68,10 @@ type fakeCluster struct {
 	mu       sync.Mutex
 	// hosts are the hosts by SSH target.
 	hosts map[string]*fakeNode
-	// nodes are the Kubernetes nodes by name.
+	// nodes are the nodes the cluster has, by name.
 	nodes map[string]fakeKubeNode
-	// apps are the app namespaces.
+	// apps holds an entry for each app the cluster has, by name.
 	apps map[string]map[string]bool
-	// orch is the cluster's orchestrator.
 	orch *fakeOrchestrator
 	// locked says the operation lock is held.
 	locked bool
@@ -90,9 +88,10 @@ type fakeCluster struct {
 	// consoles are the digests of the console's images in the release,
 	// by architecture.
 	consoles map[string]string
-	// consoleRuns is the image the console's Deployment runs, and
-	// consoleSeen the one a command was last told it runs.
-	consoleRuns, consoleSeen string
+	// consoleRuns is the image the console runs from, and consoleAt the
+	// addresses it was last run on.
+	consoleRuns string
+	consoleAt   []string
 	// tokens are the login tokens the console issued.
 	tokens []string
 	// consolePageAfter is how many requests for the console's login page
@@ -103,9 +102,10 @@ type fakeCluster struct {
 	consolePageStalls bool
 	// ingressDials are the addresses the ingress was connected to at.
 	ingressDials []string
-	// consoleFails makes the console never get ready.
-	consoleFails bool
-	// cordoned are the Kubernetes nodes marked unschedulable.
+	// consoleFails makes the console never get ready, and zotFails zot's
+	// install fail.
+	consoleFails, zotFails bool
+	// cordoned are the cluster's nodes that take no new pods.
 	cordoned map[string]bool
 	// servicesDown makes the cluster's services not ready, until a wait
 	// for them if servicesComeUp.
@@ -135,6 +135,257 @@ type fakeOrchestrator struct {
 	onApps, onRemove, onLogs func()
 	// states, if set, are the apps Apps answers with.
 	states []model.AppState
+	// asked are the nodes Preflight was asked for, and added the nodes
+	// AddNode made, by name.
+	asked []orchestrator.NodeRequest
+	added map[string]model.Node
+	// removals are the options of each RemoveNode, by node.
+	removals map[string]orchestrator.RemoveOptions
+	// onUninstall, if set, runs as the orchestrator uninstalls from the
+	// host at target, by Uninstall or by RemoveNode, which fails with its
+	// error if it returns one.
+	onUninstall func(target string) error
+	// failRemovalAt makes RemoveNode fail with the error once it told the
+	// step.
+	failRemovalAt map[orchestrator.Step]error
+	// onRunConsole, if set, runs at each call of RunConsole.
+	onRunConsole func()
+	// zotAtInstalling says zot's install ran on a host a moment after
+	// AddNode told Installing, before it told Starting.
+	zotAtInstalling bool
+	// lingers makes AddNode wait, once it told Starting, until its
+	// context ends or 5 seconds passed; addEnded is what ended it, nil
+	// for the time.
+	lingers  bool
+	addEnded error
+}
+
+// hostOf is the fake host that host is a connection to.
+func hostOf(host orchestrator.Host) *fakeNode {
+	return host.(orchestratorHost).r.(interface{ node() *fakeNode }).node()
+}
+
+// sync makes the fake orchestrator's nodes those of the fake cluster,
+// which tests add to and take from.
+func (o *fakeOrchestrator) sync() {
+	ctx := context.Background()
+	has, err := o.Fake.Nodes(ctx)
+	if err != nil {
+		return
+	}
+	o.c.mu.Lock()
+	want := maps.Clone(o.c.nodes)
+	o.c.mu.Unlock()
+	silent := func(orchestrator.Step) {}
+	for _, n := range has {
+		if _, ok := want[n.Name]; !ok {
+			o.Fake.RemoveNode(ctx, n.Name, nil, orchestrator.RemoveOptions{Unreachable: true}, silent)
+		}
+		delete(want, n.Name)
+	}
+	for name := range want {
+		o.Fake.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: name}, silent)
+	}
+}
+
+// Preflight finds the host to be what the fake host is, and refuses one
+// that has k3s, has less than 806 MiB, is asked for an address that
+// isn't its private one, doesn't reach the control plane, or is to join
+// a control plane of another k3s version than mooctl's.
+func (o *fakeOrchestrator) Preflight(ctx context.Context, host orchestrator.Host, want orchestrator.NodeRequest) (model.Node, error) {
+	o.called("Preflight %s", want.Name)
+	if _, err := o.Fake.Preflight(ctx, host, want); err != nil {
+		return model.Node{}, err
+	}
+	h := hostOf(host)
+	o.c.mu.Lock()
+	defer o.c.mu.Unlock()
+	o.asked = append(o.asked, want)
+	switch {
+	case h.k3s:
+		return model.Node{}, errors.New("it can't be a node: it has k3s, or k3s's files, already")
+	case h.memMiB < 806:
+		return model.Node{}, fmt.Errorf("it can't be a node: it has %d MiB of memory, and a node needs at least 806 MiB", h.memMiB)
+	case want.PrivateAddress.IsValid() && want.PrivateAddress != h.private:
+		return model.Node{}, fmt.Errorf("%s isn't a private IPv4 address", want.PrivateAddress)
+	case !want.ControlPlane && h.noReach:
+		return model.Node{}, errors.New("exit 1: it doesn't reach the control plane")
+	}
+	if !want.ControlPlane {
+		for _, cp := range o.c.hosts {
+			if cp.server && cp.version != K3sVersion {
+				return model.Node{}, fmt.Errorf("the control plane runs k3s %s, and the cluster is to run %s", cp.version, K3sVersion)
+			}
+		}
+	}
+	n := model.Node{
+		Name: want.Name, ControlPlane: want.ControlPlane,
+		PrivateAddress: h.private, Interface: "ens10", PublicAddress: h.public,
+		Architecture: goArchOf(h.arch), MemoryMiB: h.memMiB, GOGC: "25", GOMEMLIMIT: fmt.Sprintf("%dMiB", h.memMiB/10),
+	}
+	return n, nil
+}
+
+// AddNode installs k3s on the fake host and makes it a node of the fake
+// cluster, unless the host fails its install or its start: then it
+// tells Uninstalling and leaves the host as it was.
+func (o *fakeOrchestrator) AddNode(ctx context.Context, host orchestrator.Host, n model.Node, step func(orchestrator.Step)) error {
+	o.called("AddNode %s", n.Name)
+	o.sync()
+	h := hostOf(host)
+	o.c.mu.Lock()
+	failInstall, failStart := h.failInstall, h.failStart
+	o.c.mu.Unlock()
+	if ctx.Err() == nil && (failInstall || failStart) {
+		step(orchestrator.Installing)
+		if failInstall {
+			step(orchestrator.Uninstalling)
+			return errors.New("installing k3s: exit 1: install failed")
+		}
+		step(orchestrator.Starting)
+		step(orchestrator.WaitingForNode)
+		step(orchestrator.Uninstalling)
+		return errors.New("starting k3s: exit 1: k3s-agent: token is invalid")
+	}
+	err := o.Fake.AddNode(ctx, host, n, func(s orchestrator.Step) {
+		step(s)
+		if s == orchestrator.Installing {
+			time.Sleep(20 * time.Millisecond)
+			if o.c.ran(h.target, "zot serve") {
+				o.zotAtInstalling = true
+			}
+		}
+		if s == orchestrator.Starting && o.lingers {
+			select {
+			case <-ctx.Done():
+				o.addEnded = context.Cause(ctx)
+			case <-time.After(5 * time.Second):
+			}
+		}
+	})
+
+	if err != nil {
+		return err
+	}
+	o.c.mu.Lock()
+	defer o.c.mu.Unlock()
+	h.k3s, h.server, h.version, h.nodeName = true, n.ControlPlane, K3sVersion, n.Name
+	o.c.nodes[n.Name] = fakeKubeNode{ip: n.PrivateAddress.String(), arch: n.Architecture, controlPlane: n.ControlPlane}
+	o.added[n.Name] = n
+	return nil
+}
+
+// uninstalled takes k3s from the fake host, and with a control plane's
+// the cluster's nodes.
+func (o *fakeOrchestrator) uninstalled(host orchestrator.Host) error {
+	h := hostOf(host)
+	if o.onUninstall != nil {
+		if err := o.onUninstall(h.target); err != nil {
+			return err
+		}
+	}
+	o.c.mu.Lock()
+	defer o.c.mu.Unlock()
+	if h.server {
+		o.c.nodes = map[string]fakeKubeNode{}
+	}
+	h.k3s, h.server = false, false
+	return nil
+}
+
+// RemoveNode takes the node from the fake cluster, unless a host that
+// can be reached and wasn't uninstalled from still runs k3s as it: its
+// kubelet registers the node again.
+func (o *fakeOrchestrator) RemoveNode(ctx context.Context, name string, host orchestrator.Host, opts orchestrator.RemoveOptions, step func(orchestrator.Step)) error {
+	o.called("RemoveNode %s", name)
+	o.sync()
+	o.c.mu.Lock()
+	o.removals[name] = opts
+	o.c.mu.Unlock()
+	var failed error
+	err := o.Fake.RemoveNode(ctx, name, host, opts, func(s orchestrator.Step) {
+		if failed != nil {
+			return
+		}
+		step(s)
+		if failed = o.failRemovalAt[s]; failed != nil {
+			return
+		}
+		if s == orchestrator.Uninstalling {
+			if err := o.uninstalled(host); err != nil {
+				failed = fmt.Errorf("uninstalling from %s: %w", name, err)
+			}
+		}
+	})
+	if err != nil {
+		return err
+	}
+	if failed != nil {
+		o.sync()
+		return failed
+	}
+	o.c.mu.Lock()
+	defer o.c.mu.Unlock()
+	for _, h := range o.c.hosts {
+		if h.k3s && !h.unreachable && h.nodeName == name {
+			return nil
+		}
+	}
+	delete(o.c.nodes, name)
+	return nil
+}
+
+func (o *fakeOrchestrator) Uninstall(ctx context.Context, host orchestrator.Host, n model.Node) error {
+	o.called("Uninstall %s", n.Name)
+	if err := o.Fake.Uninstall(ctx, host, n); err != nil {
+		return err
+	}
+	return o.uninstalled(host)
+}
+
+// RunConsole fails for a console that never gets ready.
+func (o *fakeOrchestrator) RunConsole(ctx context.Context, image string, addresses []netip.Addr) error {
+	o.called("RunConsole %s", image)
+	if o.onRunConsole != nil {
+		o.onRunConsole()
+	}
+	o.c.mu.Lock()
+	fails := o.c.consoleFails
+	o.c.mu.Unlock()
+	if fails && ctx.Err() == nil {
+		return errors.New("the console isn't ready: deployment moostack-console: 0 of 1 replicas are updated and available")
+	}
+	if err := o.Fake.RunConsole(ctx, image, addresses); err != nil {
+		return err
+	}
+	o.c.mu.Lock()
+	defer o.c.mu.Unlock()
+	o.c.consoleRuns, o.c.consoleAt = image, nil
+	for _, a := range addresses {
+		o.c.consoleAt = append(o.c.consoleAt, a.String())
+	}
+	return nil
+}
+
+// ConsoleToken issues another token each time.
+func (o *fakeOrchestrator) ConsoleToken(ctx context.Context) (string, error) {
+	o.called("ConsoleToken")
+	if _, err := o.Fake.ConsoleToken(ctx); err != nil {
+		return "", err
+	}
+	o.c.mu.Lock()
+	defer o.c.mu.Unlock()
+	token := strings.Repeat("A", 25) + string(rune('A'+len(o.c.tokens)))
+	o.c.tokens = append(o.c.tokens, token)
+	return token, nil
+}
+
+// stopConsole makes the cluster run no console.
+func (c *fakeCluster) stopConsole() {
+	c.orch.Fake.RunConsole(context.Background(), "", nil)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.consoleRuns = ""
 }
 
 func (o *fakeOrchestrator) called(format string, args ...any) {
@@ -230,8 +481,7 @@ func (o *fakeOrchestrator) Logs(ctx context.Context, app string, opts orchestrat
 	return o.Fake.Logs(ctx, app, opts, w)
 }
 
-// Nodes are the fake cluster's Kubernetes nodes, each with 1974 MiB. A
-// node is a control plane if a host that runs a k3s server has its name.
+// Nodes are the fake cluster's nodes, each with 1974 MiB.
 func (o *fakeOrchestrator) Nodes(ctx context.Context) ([]model.NodeState, error) {
 	o.called("Nodes")
 	if _, err := o.Fake.Nodes(ctx); err != nil {
@@ -241,12 +491,7 @@ func (o *fakeOrchestrator) Nodes(ctx context.Context) ([]model.NodeState, error)
 	defer o.c.mu.Unlock()
 	var nodes []model.NodeState
 	for name, n := range o.c.nodes {
-		s := model.NodeState{Name: name, Address: n.ip, Architecture: n.arch, Version: K3sVersion, MemoryMiB: 1974, Ready: cmp.Or(n.ready, "yes")}
-		for _, h := range o.c.hosts {
-			if h.server && h.k3s && strings.Contains(h.files[k3s.ConfigFile], "node-name: "+name+"\n") {
-				s.ControlPlane = true
-			}
-		}
+		s := model.NodeState{Name: name, Address: n.ip, Architecture: n.arch, Version: K3sVersion, MemoryMiB: 1974, Ready: cmp.Or(n.ready, "yes"), ControlPlane: n.controlPlane}
 		if n.noMemory {
 			s.MemoryMiB = 0
 		}
@@ -274,7 +519,8 @@ func (o *fakeOrchestrator) made(prefix string) []string {
 }
 
 type fakeKubeNode struct {
-	ip, arch string
+	ip, arch     string
+	controlPlane bool
 	// ready is the node's Ready, "yes" if empty.
 	ready string
 	// noMemory makes the cluster know no memory of the node.
@@ -284,15 +530,20 @@ type fakeKubeNode struct {
 type fakeNode struct {
 	target string
 	key    ssh.PublicKey
+	// arch is the host's architecture as uname prints it.
 	arch   string
 	memMiB int
-	addrs  []string
-	routes []string
-	k3s    bool
-	server bool
+	// private and public are the host's addresses; public is invalid for
+	// a host behind NAT.
+	private, public netip.Addr
+	// k3s says the orchestrator has made the host a node, server that it
+	// is the control plane, and nodeName what the node is called.
+	k3s, server bool
+	nodeName    string
 	// zot says zot is installed.
-	zot         bool
-	version     string
+	zot     bool
+	version string
+	// files are the files the commands wrote on the host themselves.
 	files       map[string]string
 	unreachable bool
 	// failInstall makes k3s's install fail on the host, and failStart
@@ -334,7 +585,7 @@ func imageArchive(t testing.TB) ([]byte, string) {
 // that holds the console's image for amd64 and arm64.
 func newFakeCluster(t testing.TB) *fakeCluster {
 	c := &fakeCluster{t: t, hosts: map[string]*fakeNode{}, nodes: map[string]fakeKubeNode{}, apps: map[string]map[string]bool{}}
-	c.orch = &fakeOrchestrator{Fake: &orchestratortest.Fake{}, c: c, deployed: map[string]model.App{}}
+	c.orch = &fakeOrchestrator{Fake: &orchestratortest.Fake{Volumes: map[string][]string{}}, c: c, deployed: map[string]model.App{}, added: map[string]model.Node{}, removals: map[string]orchestrator.RemoveOptions{}}
 	registry := httptest.NewServer(ggcrregistry.New(ggcrregistry.Logger(log.New(io.Discard, "", 0))))
 	t.Cleanup(registry.Close)
 	c.registry = registry.Listener.Addr().String()
@@ -364,10 +615,11 @@ func newFakeCluster(t testing.TB) *fakeCluster {
 	return c
 }
 
-// host adds a 2 GB amd64 host at target, with the private address addr.
+// host adds a 2 GB amd64 host at target, with the private address addr
+// and the public address 192.0.2.10.
 func (c *fakeCluster) host(target, addr string) *fakeNode {
 	n := &fakeNode{target: target, key: testHostKey(c.t), arch: "x86_64", memMiB: 1974,
-		addrs: []string{"eth0 192.0.2.10/32", "ens10 " + addr + "/32"}, routes: []string{"eth0"}, files: map[string]string{}}
+		private: netip.MustParseAddr(addr), public: netip.MustParseAddr("192.0.2.10"), files: map[string]string{}}
 	c.hosts[target] = n
 	return n
 }
@@ -412,17 +664,9 @@ type fakeConn struct {
 
 func (f *fakeConn) Close() error { return nil }
 
+func (f *fakeConn) node() *fakeNode { return f.n }
+
 func (f *fakeConn) RunStoppable(ctx context.Context, cmd string) (sshclient.Result, error) {
-	// A node whose k3s fails to start never becomes Ready.
-	if strings.Contains(cmd, "isn't Ready at") {
-		f.c.mu.Lock()
-		stuck := slices.ContainsFunc(hostsOf(f.c.hosts), func(h *fakeNode) bool { return h.failStart })
-		f.c.mu.Unlock()
-		if stuck {
-			<-ctx.Done()
-			return sshclient.Result{}, ctx.Err()
-		}
-	}
 	return f.Run(ctx, cmd, nil)
 }
 
@@ -442,15 +686,10 @@ func left(n *fakeNode) string {
 	return strings.Join(has, " ")
 }
 
-func hostsOf(hosts map[string]*fakeNode) []*fakeNode {
-	var out []*fakeNode
-	for _, h := range hosts {
-		out = append(out, h)
+func (f *fakeConn) Upload(ctx context.Context, file string, r io.Reader, _ fs.FileMode, _ string) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
-	return out
-}
-
-func (f *fakeConn) Upload(_ context.Context, file string, r io.Reader, _ fs.FileMode, _ string) error {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -499,12 +738,6 @@ func (l *fakeLock) Close() error {
 	return nil
 }
 
-var (
-	nodeNameInScript = regexp.MustCompile(`get node '([^']+)'`)
-	readyAtInScript  = regexp.MustCompile(`= "([0-9.]+) True"`)
-	quotedName       = regexp.MustCompile(`(?:delete node|drain|uncordon) '([^']+)'`)
-)
-
 func ok(stdout string) (sshclient.Result, error) {
 	return sshclient.Result{Stdout: []byte(stdout)}, nil
 }
@@ -513,27 +746,17 @@ func fail(code int, stderr string) (sshclient.Result, error) {
 	return sshclient.Result{ExitCode: code, Stderr: []byte(stderr)}, nil
 }
 
-// Run answers the scripts mooctl runs, and fails any other.
-func (f *fakeConn) Run(_ context.Context, cmd string, _ io.Reader) (sshclient.Result, error) {
+// Run answers the scripts the commands run themselves, and fails any
+// other.
+func (f *fakeConn) Run(ctx context.Context, cmd string, _ io.Reader) (sshclient.Result, error) {
+	if ctx.Err() != nil {
+		return sshclient.Result{}, ctx.Err()
+	}
 	c, n := f.c, f.n
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	first, _, _ := strings.Cut(cmd, "\n")
 	c.runs = append(c.runs, n.target+": "+cmd)
 	switch {
-	case cmd == k3s.FactsScript:
-		var b strings.Builder
-		fmt.Fprintf(&b, "arch=%s\nmem_kib=%d\nsystemd=yes\nhas=curl\nhas=flock\nhas=ip\n", n.arch, n.memMiB*1024)
-		if n.k3s {
-			b.WriteString("k3s=yes\n")
-		}
-		for _, a := range n.addrs {
-			b.WriteString("addr=" + a + "\n")
-		}
-		for _, r := range n.routes {
-			b.WriteString("route=" + r + "\n")
-		}
-		return ok(b.String())
 	case strings.HasPrefix(cmd, "mkdir -p "):
 		return ok("")
 	case cmd == AppliedCommitScript:
@@ -541,116 +764,15 @@ func (f *fakeConn) Run(_ context.Context, cmd string, _ io.Reader) (sshclient.Re
 			return fail(1, "cat: "+AppliedCommitFile+": Input/output error")
 		}
 		return ok(n.files[AppliedCommitFile])
-	case cmd == k3s.NodeNamesScript:
-		var out []string
-		for name := range c.nodes {
-			out = append(out, "node/"+name)
-		}
-		sort.Strings(out)
-		return ok(strings.Join(out, "\n"))
-	case cmd == k3s.VersionScript:
-		return ok(n.version + "\n")
-	case strings.HasPrefix(first, "curl -sk --max-time 10"):
-		if n.noReach {
-			return fail(1, "it doesn't reach the control plane")
-		}
-		return ok("")
-	case cmd == "cat "+k3s.AgentTokenFile:
-		return ok("K10agent::node:token\n")
 	case strings.Contains(cmd, "zot serve"):
+		if c.zotFails {
+			return fail(1, "zot doesn't answer at 10.0.0.2:5000")
+		}
 		n.zot = true
 		return ok("")
-	case cmd == k3s.StartScript:
-		if n.failStart {
-			return fail(1, "k3s-agent: token is invalid")
-		}
-		return ok("")
-	case strings.Contains(cmd, "INSTALL_K3S_EXEC="):
-		if n.failInstall {
-			return fail(1, "install failed")
-		}
-		var config struct {
-			Name string `yaml:"node-name"`
-			IP   string `yaml:"node-ip"`
-		}
-		yaml.Unmarshal([]byte(n.files[k3s.ConfigFile]), &config)
-		n.k3s, n.server, n.version = true, strings.Contains(cmd, "INSTALL_K3S_EXEC=server"), K3sVersion
-		c.nodes[config.Name] = fakeKubeNode{ip: config.IP, arch: k3s.RoleOf(true).String()[:0] + goArchOf(n.arch)}
-		return ok("")
-	case strings.Contains(cmd, "isn't Ready at"):
-		name := nodeNameInScript.FindStringSubmatch(cmd)[1]
-		ip := readyAtInScript.FindStringSubmatch(cmd)[1]
-		if kn, found := c.nodes[name]; found && kn.ip == ip {
-			return ok("")
-		}
-		return fail(1, name+" isn't Ready at "+ip+" after 10 minutes")
-	case strings.Contains(cmd, "uninstall.sh"):
-		// The files under k3s's directory go, and those the script names.
-		n.k3s = false
-		for path := range n.files {
-			if strings.HasPrefix(path, "/var/lib/rancher/k3s/") || strings.Contains(cmd, " "+path) {
-				delete(n.files, path)
-			}
-		}
-		if strings.Contains(cmd, "systemctl disable --now moostack-zot.service") && strings.Contains(cmd, "rm -rf /var/lib/zot /var/lib/private/zot") {
-			n.zot = false
-		}
-		if n.server {
-			c.nodes = map[string]fakeKubeNode{}
-		}
-		return ok("")
-	case strings.Contains(first, "k3s kubectl get pv"):
-		return ok("")
-	case strings.Contains(first, "k3s kubectl drain"):
-		name := quotedName.FindStringSubmatch(first)[1]
-		if _, found := c.nodes[name]; !found {
-			return fail(1, `Error from server (NotFound): nodes "`+name+`" not found`)
-		}
-		return ok("")
-	case strings.Contains(first, "k3s kubectl uncordon"):
-		return ok("")
-	case strings.Contains(first, "k3s kubectl delete node"):
-		name := quotedName.FindStringSubmatch(first)[1]
-		// A kubelet still running registers its node again.
-		for _, h := range c.hosts {
-			if h.k3s && !h.unreachable && strings.Contains(h.files[k3s.ConfigFile], "node-name: "+name+"\n") {
-				return ok("")
-			}
-		}
-		delete(c.nodes, name)
-		return ok("")
-	case strings.Contains(first, "k3s kubectl get namespaces -l"):
-		var out []string
-		for a := range c.apps {
-			out = append(out, "namespace/"+a)
-		}
-		return ok(strings.Join(out, "\n"))
-	case cmd == k3s.ConsoleImageScript:
-		// k3s applies the objects it is given a moment after they are
-		// written: the first answer after a change is the image before.
-		objects, written := n.files[k3s.AutoDeployFile("console")]
-		if !written {
-			return fail(1, `deployments.apps "moostack-console" not found`)
-		}
-		_, image, _ := strings.Cut(objects, "          image: ")
-		image, _, _ = strings.Cut(image, "\n")
-		answer := cmp.Or(c.consoleRuns, image)
-		c.consoleRuns, c.consoleSeen = image, answer
-		if answer == "" {
-			return fail(1, `deployments.apps "moostack-console" not found`)
-		}
-		return ok(answer)
-	case cmd == k3s.ConsoleTokenScript:
-		if _, written := n.files[k3s.AutoDeployFile("console")]; !written {
-			return fail(1, `Error from server (NotFound): deployments.apps "moostack-console" not found`)
-		}
-		token := strings.Repeat("A", 25) + string(rune('A'+len(c.tokens)))
-		c.tokens = append(c.tokens, token)
-		return ok(token + "\n")
-	case cmd == k3s.ConsoleReadyScript:
-		if c.consoleFails {
-			return fail(1, "error: timed out waiting for the condition")
-		}
+	case cmd == ownUninstallScript:
+		n.zot = false
+		delete(n.files, AppliedCommitFile)
 		return ok("")
 	}
 	c.t.Errorf("the fake cluster has no answer to a script on %s:\n%s", n.target, cmd)
@@ -690,7 +812,7 @@ func (c *fakeCluster) ingress(addr string) net.Conn {
 		status := http.StatusNotFound
 		c.mu.Lock()
 		stalls := false
-		if _, installed := c.hosts["root@h1"].files[k3s.AutoDeployFile("console")]; installed && req.URL.Path == "/console/login" {
+		if c.consoleRuns != "" && req.URL.Path == "/console/login" {
 			c.pageProbes++
 			if c.pageProbes > c.consolePageAfter {
 				status, stalls = http.StatusOK, c.consolePageStalls
@@ -720,3 +842,12 @@ var ingressCert = sync.OnceValue(func() tls.Certificate {
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 })
+
+// hasApp makes the cluster of c have an app.
+func hasApp(t testing.TB, c *fakeCluster) {
+	t.Helper()
+	app := model.App{Name: "web", Containers: []model.Container{{Name: "web", Image: "example.test/web:1"}}}
+	if err := c.orch.Fake.Deploy(t.Context(), app, func(orchestrator.Step) {}); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -7,15 +7,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os/exec"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/urfave/cli/v3"
 
 	"github.com/moostackhq/moostack/internal/interrupt"
-	"github.com/moostackhq/moostack/internal/k3s"
 )
 
 // consoleCommand is mooctl console.
@@ -53,14 +52,11 @@ func console(ctx context.Context, env Env, cmd *cli.Command) error {
 		return err
 	}
 	defer cpClient.Close()
-	if _, err := run(ctx, cpClient, k3s.ConsoleImageScript, ""); err != nil {
-		return fmt.Errorf("cluster %s has no console: %w", d.Cluster.Ref, err)
-	}
 	address := cp.PrivateAddress
 	if cp.PublicAddress.IsValid() {
 		address = cp.PublicAddress
 	}
-	url := k3s.ConsoleURL(address)
+	url := consoleURL(address)
 	ingress := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
@@ -77,6 +73,9 @@ func console(ctx context.Context, env Env, cmd *cli.Command) error {
 		if err == nil {
 			break
 		}
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
 		if waitCtx.Err() == nil {
 			last = err
 		}
@@ -88,19 +87,32 @@ func console(ctx context.Context, env Env, cmd *cli.Command) error {
 		case <-ctx.Done():
 			return context.Cause(ctx)
 		case <-waitCtx.Done():
+			if ctx.Err() != nil {
+				return context.Cause(ctx)
+			}
 			return fmt.Errorf("the console doesn't answer at %s: %w", url, cmp.Or(last, err))
 		case <-time.After(2 * time.Second):
 		}
 	}
-	token, err := run(ctx, cpClient, k3s.ConsoleTokenScript, "")
+	token, err := orchestratorThrough(env, cpClient).ConsoleToken(ctx)
 	if err != nil {
 		return fmt.Errorf("getting a login token: %w", err)
 	}
-	fmt.Fprintf(env.Stdout, "URL: %s\nToken: %s\n", url, strings.TrimSpace(token))
+	fmt.Fprintf(env.Stdout, "URL: %s\nToken: %s\n", url, token)
 	if env.Browser != nil {
 		env.Browser(url)
 	}
 	return nil
+}
+
+// consoleURL is the URL of the console's login page at address, one of
+// the control plane node's.
+func consoleURL(address netip.Addr) string {
+	host := address.String()
+	if address.Is6() {
+		host = "[" + host + "]"
+	}
+	return "https://" + host + "/console/login"
 }
 
 // loginPageAnswers asks for the console's login page at url, and fails

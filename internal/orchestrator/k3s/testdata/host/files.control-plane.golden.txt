@@ -1,0 +1,89 @@
+==> /etc/rancher/k3s/config.yaml <==
+advertise-address: 10.0.0.2
+agent-token: the-token
+bind-address: 10.0.0.2
+flannel-iface: ens10
+node-external-ip: 192.0.2.10
+node-ip: 10.0.0.2
+node-name: node1
+write-kubeconfig-mode: "0600"
+
+==> /etc/rancher/k3s/registries.yaml <==
+mirrors:
+    moostack.local:
+        endpoint:
+            - http://10.0.0.2:5000
+
+==> /etc/systemd/system/k3s.service.d/memory.conf <==
+[Service]
+Environment=GOGC=25
+Environment=GOMEMLIMIT=491MiB
+
+==> /var/lib/rancher/k3s/agent/etc/kubelet.conf.d/10-moostack.conf <==
+apiVersion: kubelet.config.k8s.io/v1beta1
+evictionHard:
+    memory.available: 100Mi
+kind: KubeletConfiguration
+kubeReserved:
+    memory: 650Mi
+systemReserved:
+    memory: 200Mi
+
+==> /var/lib/rancher/k3s/server/manifests/moostack-cert-manager.yaml <==
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: cert-manager
+  namespace: kube-system
+spec:
+  repo: https://charts.jetstack.io
+  chart: cert-manager
+  version: v1.21.3
+  targetNamespace: cert-manager
+  createNamespace: true
+  valuesContent: |-
+    crds:
+      enabled: true
+
+==> /var/lib/rancher/k3s/server/manifests/moostack-issuer.yaml <==
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: moostack
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: "ops@example.com"
+    privateKeySecretRef:
+      name: moostack-acme-account
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik
+
+==> /var/lib/rancher/k3s/server/manifests/moostack-traefik-config.yaml <==
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    ports:
+      web:
+        allowACMEByPass: true
+        http:
+          redirections:
+            entryPoint:
+              to: websecure
+              scheme: https
+              permanent: true
+    providers:
+      kubernetesIngress:
+        allowExternalNameServices: true
+    deployment:
+      kind: DaemonSet
+    service:
+      spec:
+        externalTrafficPolicy: Local
+

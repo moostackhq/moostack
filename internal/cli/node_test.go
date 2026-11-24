@@ -4,19 +4,25 @@ import (
 	"context"
 	"maps"
 	"net"
+	"net/netip"
 	"slices"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
 
 	"bytes"
+	"errors"
+	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/moostackhq/moostack/internal/clusterdir"
-	"github.com/moostackhq/moostack/internal/k3s"
+	"github.com/moostackhq/moostack/internal/model"
+	"github.com/moostackhq/moostack/internal/orchestrator"
 	"github.com/moostackhq/moostack/internal/registry"
 )
 
@@ -97,22 +103,30 @@ func TestNodeAddMakesTheFirstTheControlPlaneAndJoinsTheOthers(t *testing.T) {
 	if !h1.server || h2.server || !h2.k3s {
 		t.Errorf("h1 server %v, h2 server %v k3s %v", h1.server, h2.server, h2.k3s)
 	}
-	if !strings.Contains(h1.files[k3s.ConfigFile], "agent-token:") {
-		t.Errorf("the control plane has no agent token:\n%s", h1.files[k3s.ConfigFile])
-	}
 	if !h1.zot || h2.zot {
 		t.Errorf("zot on h1 %v, on h2 %v", h1.zot, h2.zot)
 	}
-	if !c.ran("root@h1", "set -e\n"+k3s.DownloadedScript+"\ncurl ") {
-		t.Error("zot's install doesn't wait for k3s's download")
+	if !c.ran("root@h1", "set -e\ncurl ") {
+		t.Error("zot's install didn't run on the control plane")
 	}
-	for name, h := range map[string]*fakeNode{"h1": h1, "h2": h2} {
-		if got, want := h.files[k3s.RegistriesFile], "mirrors:\n    moostack.local:\n        endpoint:\n            - http://10.0.0.2:5000\n"; got != want {
-			t.Errorf("%s's registries:\n%s\nwant:\n%s", name, got, want)
+	asked := []orchestrator.NodeRequest{{Name: "node1", ControlPlane: true}, {Name: "node2"}}
+	if !slices.Equal(c.orch.asked, asked) {
+		t.Errorf("the hosts were checked as %+v, want %+v", c.orch.asked, asked)
+	}
+	for name, want := range map[string]model.Node{
+		"node1": {Name: "node1", ControlPlane: true, PrivateAddress: netip.MustParseAddr("10.0.0.2"), Interface: "ens10", PublicAddress: netip.MustParseAddr("192.0.2.10"), Architecture: "amd64", MemoryMiB: 1974, GOGC: "25", GOMEMLIMIT: "197MiB"},
+		"node2": {Name: "node2", PrivateAddress: netip.MustParseAddr("10.0.0.3"), Interface: "ens10", PublicAddress: netip.MustParseAddr("192.0.2.10"), Architecture: "amd64", MemoryMiB: 1974, GOGC: "25", GOMEMLIMIT: "197MiB"},
+	} {
+		if got := c.orch.added[name]; got != want {
+			t.Errorf("the orchestrator was asked to add\n%+v, want what it found the host to be,\n%+v", got, want)
 		}
-	}
-	if cfg := h2.files[k3s.ConfigFile]; !strings.Contains(cfg, "K10agent::node:token") || !strings.Contains(cfg, "https://10.0.0.2:6443") {
-		t.Errorf("the agent joins with:\n%s", cfg)
+		written, err := d.Node(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := modelNode(written); got != want {
+			t.Errorf("the cluster directory holds\n%+v, want\n%+v", got, want)
+		}
 	}
 	if c.locked {
 		t.Error("the lock is still held")
@@ -176,8 +190,11 @@ func TestNodeAddRefusesBeforeChangingAnything(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error()+out, tc.want) {
 				t.Fatalf("err = %v, want %q\n%s", err, tc.want, out)
 			}
-			if c.ran("root@h2", "INSTALL_K3S_EXEC") {
-				t.Error("k3s was installed")
+			if added := c.orch.made("AddNode"); len(added) != 1 {
+				t.Errorf("the orchestrator was asked to add %q, want node1 alone", added)
+			}
+			if c.ran("root@h2", "") {
+				t.Errorf("the refusal ran on the host:\n%s", strings.Join(c.runs, "\n---\n"))
 			}
 			if got := git(t, prodDir(t, home).Path, "rev-parse", "HEAD"); got != head {
 				t.Error("the directory was committed")
@@ -193,11 +210,15 @@ func TestAFailedJoinIsUndone(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	c.hosts["root@h2"].failInstall = true
-	if out, err := onFake(t, c, home, "cluster", "node-add", "root@h2"); err == nil {
-		t.Fatalf("a failed install passed:\n%s", out)
+	out, err := onFake(t, c, home, "cluster", "node-add", "root@h2")
+	if err == nil || err.Error() != "installing k3s: exit 1: install failed" {
+		t.Fatalf("a failed install: %v\n%s", err, out)
 	}
-	if !c.ran("root@h2", "uninstall.sh") {
-		t.Error("the host wasn't cleaned up")
+	if want := "Adding node2 to prod (node, amd64, 1974 MiB, 10.0.0.3)\nInstalling k3s...\nUninstalling...\n"; out != want {
+		t.Errorf("the output of a failed install:\n%s\nwant:\n%s", out, want)
+	}
+	if l := left(c.hosts["root@h2"]); l != "" {
+		t.Errorf("h2 still has %s", l)
 	}
 	if names := nodeNames(t, home); len(names) != 1 {
 		t.Errorf("nodes = %v", names)
@@ -215,8 +236,8 @@ func TestAJoinWhoseK3sFailsToStartIsUndone(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "starting k3s: exit 1: k3s-agent: token is invalid") {
 		t.Fatalf("err %v:\n%s", err, out)
 	}
-	if !c.ran("root@h2", "uninstall.sh") {
-		t.Error("the host wasn't cleaned up")
+	if l := left(c.hosts["root@h2"]); l != "" || strings.Count(out, "Uninstalling...\n") != 1 {
+		t.Errorf("h2 still has %q after:\n%s", l, out)
 	}
 	if names := nodeNames(t, home); len(names) != 1 {
 		t.Errorf("nodes = %v", names)
@@ -233,8 +254,11 @@ func TestNodeRemove(t *testing.T) {
 		t.Errorf("the control plane went before the agents:\n%s", out)
 	}
 	out := mustRun(t, c, home, "cluster", "node-remove", "node2")
-	if !strings.Contains(out, "Removed node2 from prod") || !c.ran("root@h1", "drain 'node2'") || !c.ran("root@h2", "uninstall.sh") {
-		t.Errorf("output:\n%s", out)
+	if want := "Removing node2 from prod\nDraining node2...\nUninstalling...\nRemoved node2 from prod\n"; out != want || c.hosts["root@h2"].k3s {
+		t.Errorf("output:\n%s\nwant:\n%s\nk3s on h2: %t", out, want, c.hosts["root@h2"].k3s)
+	}
+	if got, want := c.orch.removals["node2"], (orchestrator.RemoveOptions{}); got != want || !slices.Equal(c.orch.made("RemoveNode"), []string{"RemoveNode node2"}) {
+		t.Errorf("the orchestrator was asked for the removals %q, node2's with %+v", c.orch.made("RemoveNode"), got)
 	}
 	if _, found := c.nodes["node2"]; found {
 		t.Error("Kubernetes still has node2")
@@ -245,9 +269,12 @@ func TestNodeRemove(t *testing.T) {
 	if out, err := onFake(t, c, home, "cluster", "node-remove", "node3"); err == nil {
 		t.Errorf("an unreachable node went without --unreachable:\n%s", out)
 	}
-	mustRun(t, c, home, "cluster", "node-remove", "--unreachable", "node3")
+	out = mustRun(t, c, home, "cluster", "node-remove", "--unreachable", "node3")
 	if _, found := c.nodes["node3"]; found {
 		t.Error("Kubernetes still has node3")
+	}
+	if want := "Removing node3 from prod\nWarning: node3 can't be reached; if k3s still runs there, it registers again: run k3s-agent-uninstall.sh on it.\nRemoved node3 from prod\n"; out != want || !c.orch.removals["node3"].Unreachable {
+		t.Errorf("output:\n%s\nwant:\n%s\nremoved with %+v", out, want, c.orch.removals["node3"])
 	}
 
 	// The last node goes with --yes only.
@@ -339,8 +366,8 @@ func TestAnOperationRefusesWhileAnotherHoldsTheLock(t *testing.T) {
 	if out, err := onFake(t, c, home, "cluster", "node-add", "root@h2"); err == nil || !strings.Contains(err.Error(), "another mooctl operation") {
 		t.Errorf("node-add = %v\n%s", err, out)
 	}
-	if c.ran("root@h2", "INSTALL_K3S_EXEC") {
-		t.Error("node-add went on")
+	if added := c.orch.made("AddNode"); len(added) != 1 {
+		t.Errorf("node-add went on: the orchestrator was asked to add %q", added)
 	}
 	if out, err := onFake(t, c, home, "cluster", "node-remove", "node1", "--yes"); err == nil {
 		t.Errorf("node-remove went on:\n%s", out)
@@ -406,7 +433,7 @@ func TestNodeAddMakesThePublicAddressTheNodesExternalOne(t *testing.T) {
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	natted := c.host("root@h2", "10.0.0.3")
-	natted.addrs, natted.routes = []string{"ens10 10.0.0.3/24"}, []string{"ens10"}
+	natted.public = netip.Addr{}
 	mustRun(t, c, home, "cluster", "node-add", "root@h2")
 
 	d := prodDir(t, home)
@@ -414,15 +441,15 @@ func TestNodeAddMakesThePublicAddressTheNodesExternalOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n1.PublicAddress.String() != "192.0.2.10" || !strings.Contains(c.hosts["root@h1"].files[k3s.ConfigFile], "node-external-ip: 192.0.2.10\n") {
-		t.Errorf("node1 has the public address %s and the config:\n%s", n1.PublicAddress, c.hosts["root@h1"].files[k3s.ConfigFile])
+	if n1.PublicAddress.String() != "192.0.2.10" || c.orch.added["node1"].PublicAddress != n1.PublicAddress {
+		t.Errorf("node1 has the public address %s, and the orchestrator was given %s", n1.PublicAddress, c.orch.added["node1"].PublicAddress)
 	}
 	n2, err := d.Node("node2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n2.PublicAddress.IsValid() || strings.Contains(c.hosts["root@h2"].files[k3s.ConfigFile], "node-external-ip") {
-		t.Errorf("node2, behind NAT, has the public address %s and the config:\n%s", n2.PublicAddress, c.hosts["root@h2"].files[k3s.ConfigFile])
+	if n2.PublicAddress.IsValid() || c.orch.added["node2"].PublicAddress.IsValid() {
+		t.Errorf("node2, behind NAT, has the public address %s, and the orchestrator was given %s", n2.PublicAddress, c.orch.added["node2"].PublicAddress)
 	}
 	data, err := os.ReadFile(filepath.Join(d.Path, "nodes", "node2.yml"))
 	if err != nil {
@@ -438,7 +465,7 @@ func TestNodeAddMakesThePublicAddressTheNodesExternalOne(t *testing.T) {
 // of the first tag.
 func consoleImage(t *testing.T, c *fakeCluster, arch string) (tags []string, digest string) {
 	t.Helper()
-	repo, err := name.NewRepository(c.registry+"/"+k3s.ConsoleRepository, name.Insecure)
+	repo, err := name.NewRepository(c.registry+"/"+consoleRepository, name.Insecure)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -478,17 +505,8 @@ func TestAddingTheControlPlaneInstallsTheConsoleAndAddingAnotherNodeDoesnt(t *te
 	if digest != c.consoles["amd64"] {
 		t.Errorf("the registry's image for amd64 is %s, the release's is %s", digest, c.consoles["amd64"])
 	}
-	objects := c.hosts["root@h1"].files[k3s.AutoDeployFile("console")]
-	for _, want := range []string{
-		"image: moostack.local/" + k3s.ConsoleRepository + "@sha256:" + tags[0],
-		"match: (Host(`192.0.2.10`) || Host(`10.0.0.2`)) && (Path(`/console`) || PathPrefix(`/console/`))",
-	} {
-		if !strings.Contains(objects, want) {
-			t.Errorf("the console's objects lack %q:\n%s", want, objects)
-		}
-	}
-	if !c.ran("root@h1", k3s.ConsoleReadyScript) {
-		t.Error("node-add didn't wait for the console to be ready")
+	if want := "moostack.local/" + consoleRepository + "@sha256:" + tags[0]; c.consoleRuns != want || !slices.Equal(c.consoleAt, []string{"192.0.2.10", "10.0.0.2"}) {
+		t.Errorf("the console runs from %s on %q, want %s on the node's public and private addresses", c.consoleRuns, c.consoleAt, want)
 	}
 	if left, _ := filepath.Glob(filepath.Join(os.TempDir(), "mooctl-console-*")); len(left) != 0 {
 		t.Errorf("the downloaded archive was left in %v", left)
@@ -496,8 +514,8 @@ func TestAddingTheControlPlaneInstallsTheConsoleAndAddingAnotherNodeDoesnt(t *te
 
 	downloads := c.downloads.Load()
 	mustRun(t, c, home, "cluster", "node-add", "root@h2")
-	if _, ok := c.hosts["root@h2"].files[k3s.AutoDeployFile("console")]; ok {
-		t.Error("a node that isn't the control plane got the console's objects")
+	if runs := c.orch.made("RunConsole"); len(runs) != 1 {
+		t.Errorf("the console was run %d times, want once, with the control plane", len(runs))
 	}
 	if got := c.downloads.Load(); got != downloads {
 		t.Errorf("adding a node that isn't the control plane downloaded %d files", got-downloads)
@@ -524,7 +542,7 @@ func TestAConsoleThatCantBeDownloadedRefusesTheNodeBeforeChangingIt(t *testing.T
 		t.Errorf("node-add without a console to download: %v\n%s", err, out)
 	}
 	h1 := c.hosts["root@h1"]
-	if h1.k3s || len(h1.files) != 0 || c.ran("root@h1", "INSTALL_K3S") {
+	if h1.k3s || len(h1.files) != 0 || len(c.orch.made("AddNode")) != 0 {
 		t.Errorf("the host was changed: k3s %v, files %v", h1.k3s, slices.Collect(maps.Keys(h1.files)))
 	}
 	if nodes := nodeNames(t, home); len(nodes) != 0 {
@@ -554,8 +572,8 @@ func TestRemovingAnAppNamedAsTheConsolesNamespaceOrItsRepositorysPrefixRemovesNo
 	c, home := fakeProd(t)
 	mustRun(t, c, home, "cluster", "node-add", "root@h1")
 	before, _ := consoleImage(t, c, "amd64")
-	prefix, _, _ := strings.Cut(k3s.ConsoleRepository, "/")
-	for _, name := range []string{k3s.ConsoleNamespace, prefix} {
+	prefix, _, _ := strings.Cut(consoleRepository, "/")
+	for _, name := range []string{"kube-system", prefix} {
 		if out, err := onFake(t, c, home, "deploy", "--remove", name); err == nil || !strings.Contains(err.Error(), "there is no app "+name) {
 			t.Errorf("deploy --remove %s: %v\n%s", name, err, out)
 		}
@@ -582,5 +600,423 @@ func TestRemovingAnAppNamedMoostackLeavesTheConsolesImage(t *testing.T) {
 	}
 	if got, _ := consoleImage(t, c, "amd64"); !slices.Equal(got, tags) {
 		t.Errorf("the console's images are tagged %q after apps were removed, were %q", got, tags)
+	}
+}
+
+func TestNodeAddAsksTheOrchestratorForTheNameAndTheAddressGiven(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "--name", "cp", "--private-address", "10.0.0.2", "root@h1")
+	mustRun(t, c, home, "cluster", "node-add", "root@h2")
+	want := []orchestrator.NodeRequest{{Name: "cp", ControlPlane: true, PrivateAddress: netip.MustParseAddr("10.0.0.2")}, {Name: "node1"}}
+	if !slices.Equal(c.orch.asked, want) {
+		t.Errorf("the hosts were checked as %+v, want %+v", c.orch.asked, want)
+	}
+}
+
+func TestTheFirstNodeOfAnotherArchitectureWarnsOnlyIfTheClusterHasApps(t *testing.T) {
+	for _, apps := range []bool{false, true} {
+		c, home := fakeProd(t)
+		c.hosts["root@h2"].arch = "aarch64"
+		c.hosts["root@h3"].arch = "aarch64"
+		mustRun(t, c, home, "cluster", "node-add", "root@h1")
+		if apps {
+			hasApp(t, c)
+		}
+		out := mustRun(t, c, home, "cluster", "node-add", "root@h2")
+		warning := "Warning: node2 is the cluster's first arm64 node; deploy its built apps again to run them there.\n"
+		if strings.Contains(out, warning) != apps || len(c.orch.made("Apps")) != 1 {
+			t.Errorf("with apps %t, after %d reads of the apps, node-add printed:\n%s", apps, len(c.orch.made("Apps")), out)
+		}
+		// The second arm64 node is no news.
+		if out := mustRun(t, c, home, "cluster", "node-add", "root@h3"); strings.Contains(out, "Warning") || len(c.orch.made("Apps")) != 1 {
+			t.Errorf("with apps %t, after %d reads of the apps, the second arm64 node printed:\n%s", apps, len(c.orch.made("Apps")), out)
+		}
+	}
+	// Apps that can't be read are no warning and no failure.
+	c, home := fakeProd(t)
+	c.hosts["root@h2"].arch = "aarch64"
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	hasApp(t, c)
+	c.orch.Fail("Apps", errors.New("the API is down"))
+	if out := mustRun(t, c, home, "cluster", "node-add", "root@h2"); strings.Contains(out, "Warning") {
+		t.Errorf("node-add with apps that can't be read printed:\n%s", out)
+	}
+}
+
+// Adding the control plane fails at each of its steps in turn.
+func TestAControlPlaneWhoseAddFailsAtAnyStepLeavesNothingOnTheHost(t *testing.T) {
+	for step, tc := range map[string]struct {
+		fail func(c *fakeCluster)
+		want string
+		// uninstalls says the command has the orchestrator uninstall.
+		uninstalls bool
+	}{
+		"the orchestrator's install":         {func(c *fakeCluster) { c.hosts["root@h1"].failInstall = true }, "installing k3s: exit 1: install failed", false},
+		"the registry's install":             {func(c *fakeCluster) { c.zotFails = true }, "installing zot: exit 1: zot doesn't answer at 10.0.0.2:5000", true},
+		"the push of the console":            {func(c *fakeCluster) { c.registry = "" }, "the console's image: ", true},
+		"the console":                        {func(c *fakeCluster) { c.consoleFails = true }, "the console isn't ready: ", true},
+		"an orchestrator that tells no step": {func(c *fakeCluster) { c.orch.Fail("AddNode", errors.New("writing /etc/file: no space left")) }, "writing /etc/file: no space left", false},
+	} {
+		t.Run(step, func(t *testing.T) {
+			c, home := fakeProd(t)
+			tc.fail(c)
+			out, err := onFake(t, c, home, "cluster", "node-add", "root@h1")
+			if err == nil || !strings.HasPrefix(err.Error(), tc.want) {
+				t.Fatalf("node-add: %v, want an error that starts with %q\n%s", err, tc.want, out)
+			}
+			h1 := c.hosts["root@h1"]
+			if l := left(h1); l != "" || !c.ran("root@h1", ownUninstallScript) {
+				t.Errorf("h1 still has %q; its registry's uninstall ran: %t", l, c.ran("root@h1", ownUninstallScript))
+			}
+			if got := len(c.orch.made("Uninstall")) == 1; got != tc.uninstalls {
+				t.Errorf("the orchestrator was asked to uninstall: %t, want %t", got, tc.uninstalls)
+			}
+			if said := strings.Count(out, "Uninstalling...\n"); said != 1 {
+				t.Errorf("the output says Uninstalling... %d times, want once:\n%s", said, out)
+			}
+			if len(nodeNames(t, home)) != 0 || len(c.nodes) != 0 || c.locked {
+				t.Errorf("the cluster directory has %v, the cluster %d nodes, and the lock is held: %t", nodeNames(t, home), len(c.nodes), c.locked)
+			}
+			if status := git(t, prodDir(t, home).Path, "status", "--porcelain"); status != "" {
+				t.Errorf("left in the directory: %s", status)
+			}
+		})
+	}
+}
+
+func TestANodeWhoseAddFailsIsNotGivenTheControlPlanesOwnUninstall(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	c.hosts["root@h2"].failStart = true
+	if _, err := onFake(t, c, home, "cluster", "node-add", "root@h2"); err == nil {
+		t.Fatal("a join whose start fails passed")
+	}
+	if c.ran("root@h2", "") || len(c.orch.made("Uninstall")) != 0 || !c.hosts["root@h1"].zot {
+		t.Errorf("the failed join ran on its host:\n%s\nthe orchestrator was asked to uninstall %d times, and zot is on h1: %t", strings.Join(c.runs, "\n---\n"), len(c.orch.made("Uninstall")), c.hosts["root@h1"].zot)
+	}
+}
+
+func TestAJoinThatFailsBeforeItChangesTheHostSaysNothingOfAnUninstall(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	c.orch.Fail("AddNode", errors.New("reading the join token on the control plane: exit 1"))
+	out, err := onFake(t, c, home, "cluster", "node-add", "root@h2")
+	if err == nil || err.Error() != "reading the join token on the control plane: exit 1" {
+		t.Fatalf("node-add: %v\n%s", err, out)
+	}
+	if want := "Adding node2 to prod (node, amd64, 1974 MiB, 10.0.0.3)\n"; out != want {
+		t.Errorf("output:\n%s\nwant:\n%s", out, want)
+	}
+	if len(nodeNames(t, home)) != 1 || c.locked {
+		t.Errorf("the cluster directory has %v, and the lock is held: %t", nodeNames(t, home), c.locked)
+	}
+}
+
+func TestTheRegistrysInstallStartsOnceTheOrchestratorStartsTheControlPlane(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	if c.orch.zotAtInstalling || !c.hosts["root@h1"].zot {
+		t.Errorf("zot's install ran while the orchestrator installed: %t; zot is on h1: %t", c.orch.zotAtInstalling, c.hosts["root@h1"].zot)
+	}
+}
+
+// streams runs mooctl with args on prod and returns each stream.
+func streams(t *testing.T, c *fakeCluster, home string, ctx context.Context, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	env := fakeEnvFor(c, home, &out)
+	env.Stderr = &errOut
+	err = New(env).Run(ctx, append([]string{"mooctl", "-c", "prod"}, args...))
+	return out.String(), errOut.String(), err
+}
+
+func TestTheNodeCommandsPrintTheirResultOnStandardOutputAndTheRestOnStandardError(t *testing.T) {
+	c, home := fakeProd(t)
+	c.hosts["root@h2"].arch = "aarch64"
+	for _, tc := range []struct {
+		args           []string
+		stdout, stderr string
+	}{
+		{[]string{"cluster", "node-add", "root@h1"}, "Added node1 to prod\n", "Adding node1 to prod (control plane, amd64, 1974 MiB, 10.0.0.2)\nDownloading the console...\nInstalling k3s and zot...\nWaiting for node1 to be Ready...\nInstalling the console...\n"},
+		{[]string{"deploy", "--remove", "none"}, "", ""},
+		{[]string{"cluster", "node-add", "root@h2"}, "Added node2 to prod\n", "Adding node2 to prod (node, arm64, 1974 MiB, 10.0.0.3)\nInstalling k3s...\nWaiting for node2 to be Ready...\nWarning: node2 is the cluster's first arm64 node; deploy its built apps again to run them there.\n"},
+		{[]string{"cluster", "node-add", "root@h3"}, "Added node3 to prod\n", "Adding node3 to prod (node, amd64, 1974 MiB, 10.0.0.4)\nInstalling k3s...\nWaiting for node3 to be Ready...\n"},
+		{[]string{"cluster", "node-remove", "node2"}, "Removed node2 from prod\n", "Removing node2 from prod\nDraining node2...\nUninstalling...\n"},
+		{[]string{"cluster", "node-remove", "--unreachable", "node3"}, "Removed node3 from prod\n", "Removing node3 from prod\nWarning: node3 can't be reached; if k3s still runs there, it registers again: run k3s-agent-uninstall.sh on it.\n"},
+		{[]string{"cluster", "node-remove", "--yes", "node1"}, "Removed node1 from prod\n", "Removing node1 from prod\nUninstalling...\n"},
+	} {
+		switch tc.args[len(tc.args)-1] {
+		case "none":
+			hasApp(t, c)
+			continue
+		case "node3":
+			if tc.args[1] == "node-remove" {
+				c.hosts["root@h3"].unreachable = true
+			}
+		}
+		stdout, stderr, err := streams(t, c, home, t.Context(), tc.args...)
+		if err != nil || stdout != tc.stdout || stderr != tc.stderr {
+			t.Errorf("mooctl %s: %v\nstandard output:\n%s\nwant:\n%s\nstandard error:\n%s\nwant:\n%s", strings.Join(tc.args, " "), err, stdout, tc.stdout, stderr, tc.stderr)
+		}
+	}
+	c.host("root@h4", "10.0.0.5").failInstall = true
+	if _, _, err := streams(t, c, home, t.Context(), "cluster", "node-add", "root@h4"); err == nil {
+		t.Fatal("node-add on a cluster without nodes, of a host whose install fails, passed")
+	}
+	stdout, stderr, err := streams(t, c, home, t.Context(), "cluster", "node-remove", "node9")
+	if err == nil || stdout != "" || stderr != "" {
+		t.Errorf("a refused node-remove: %v, printed %q and said %q, want nothing but its error", err, stdout, stderr)
+	}
+}
+
+func TestAnInterruptedAddOfAControlPlaneStillLeavesNothingOnTheHost(t *testing.T) {
+	c, home := fakeProd(t)
+	ctx, cancel := context.WithCancelCause(t.Context())
+	c.orch.onRunConsole = func() { cancel(errors.New("interrupted")) }
+	_, stderr, err := streams(t, c, home, ctx, "cluster", "node-add", "root@h1")
+	if err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("node-add interrupted while the console is run: %v", err)
+	}
+	if l := left(c.hosts["root@h1"]); l != "" || len(c.orch.made("Uninstall")) != 1 || !strings.HasSuffix(stderr, "Uninstalling...\n") {
+		t.Errorf("h1 still has %q after %d uninstalls by the orchestrator; it said:\n%s", l, len(c.orch.made("Uninstall")), stderr)
+	}
+	if len(nodeNames(t, home)) != 0 || c.locked {
+		t.Errorf("the cluster directory has %v, and the lock is held: %t", nodeNames(t, home), c.locked)
+	}
+}
+
+func TestACommandThatActsOnNodesReachesTheClusterThroughItsControlPlane(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	if c.orch.hosts != 0 {
+		t.Errorf("adding the first node built %d orchestrators through a control plane, of a cluster without one", c.orch.hosts)
+	}
+	for _, args := range [][]string{
+		{"cluster", "node-add", "root@h2"},
+		{"cluster", "node-remove", "node2"},
+		{"console"},
+	} {
+		before := c.orch.hosts
+		mustRun(t, c, home, args...)
+		if got := c.orch.hosts - before; got != 1 {
+			t.Errorf("mooctl %s built %d orchestrators through the control plane, want 1", strings.Join(args, " "), got)
+		}
+	}
+}
+
+func TestARegistryInstallThatFailsEndsTheOrchestratorsAddAtOnce(t *testing.T) {
+	c, home := fakeProd(t)
+	c.zotFails, c.orch.lingers = true, true
+	start := time.Now()
+	out, err := onFake(t, c, home, "cluster", "node-add", "root@h1")
+	if err == nil || err.Error() != "installing zot: exit 1: zot doesn't answer at 10.0.0.2:5000" {
+		t.Errorf("node-add: %v\n%s", err, out)
+	}
+	if c.orch.addEnded == nil || time.Since(start) > 4*time.Second {
+		t.Errorf("the orchestrator's add ended with %v after %s, want the registry's failure, at once", c.orch.addEnded, time.Since(start))
+	}
+	if l := left(c.hosts["root@h1"]); l != "" {
+		t.Errorf("h1 still has %s", l)
+	}
+}
+
+// transcript runs each of the commands on c and returns them with what
+// each printed and how it failed. A command that starts with a + is run
+// with an operator who types the cluster's name.
+func transcript(t *testing.T, c *fakeCluster, home string, commands ...string) string {
+	t.Helper()
+	var b strings.Builder
+	for _, command := range commands {
+		args := strings.Fields(strings.TrimPrefix(command, "+"))
+		var out string
+		var err error
+		if strings.HasPrefix(command, "+") {
+			out, err = typing(t, c, home, []string{"prod"}, append([]string{"-c", "prod"}, args...)...)
+		} else {
+			out, err = onFake(t, c, home, args...)
+		}
+		b.WriteString("$ mooctl " + strings.Join(args, " ") + "\n" + out)
+		if err != nil {
+			b.WriteString("error: " + err.Error() + "\n")
+		}
+	}
+	return strings.ReplaceAll(b.String(), home, "<home>")
+}
+
+func TestTheNodeCommandsPrintWhatTheyPrinted(t *testing.T) {
+	c, home := fakeProd(t)
+	c.hosts["root@h3"].arch = "aarch64"
+	c.host("root@h4", "10.0.0.5").failInstall = true
+	got := transcript(t, c, home,
+		"cluster node-add root@h1",
+		"cluster node-add root@h2",
+	)
+	hasApp(t, c)
+	got += transcript(t, c, home,
+		"cluster node-add --name db root@h3",
+		"cluster node-add root@h4",
+		"cluster node-add --name db root@h4",
+		"cluster node-remove node1",
+		"cluster node-remove node2",
+	)
+	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.9", arch: "amd64"}
+	c.hosts["root@h3"].unreachable = true
+	got += transcript(t, c, home,
+		"cluster node-remove stray",
+		"cluster node-remove db",
+		"cluster node-remove --unreachable db",
+		"cluster node-remove absent",
+		"cluster node-remove node1",
+		"cluster node-remove --yes node1",
+	)
+	golden(t, "node.golden", got)
+}
+
+func TestTheNodeCommandsWithoutTheControlPlanePrintWhatTheyPrinted(t *testing.T) {
+	c, home := fakeProd(t)
+	got := transcript(t, c, home,
+		"cluster node-add root@h1",
+		"cluster node-add root@h2",
+		"cluster node-add root@h3",
+	)
+	c.hosts["root@h1"].unreachable = true
+	c.hosts["root@h3"].unreachable = true
+	got += transcript(t, c, home,
+		"cluster node-add root@h2",
+		"cluster node-remove node2",
+		"cluster node-remove --unreachable node1",
+		"cluster node-remove --unreachable node2",
+		"cluster node-remove --unreachable node3",
+		"cluster node-remove --unreachable node1",
+		"cluster node-remove --unreachable --yes node1",
+	)
+	golden(t, "node-unreachable.golden", got)
+}
+
+func TestClusterRemovePrintsWhatItPrinted(t *testing.T) {
+	c, home := fakeProd(t)
+	got := transcript(t, c, home,
+		"cluster node-add root@h1",
+		"cluster node-add root@h2",
+		"cluster node-add root@h3",
+	)
+	c.hosts["root@h3"].unreachable = true
+	got += transcript(t, c, home,
+		"+cluster remove prod",
+		"+cluster remove --unreachable prod",
+	)
+	golden(t, "cluster-remove.golden", got)
+}
+
+// Sequences of node-add and node-remove, some failing at a step of the
+// orchestrator's, run against a model of the cluster: the names of its
+// nodes, in the order they joined, with the host of each. After every
+// command the cluster directory, the cluster and the hosts hold the
+// model's nodes and nothing else, the control plane is the first that
+// joined, and the lock is free.
+func TestSequencesOfNodeCommandsMatchAModel(t *testing.T) {
+	for seed := range uint64(25) {
+		rng := rand.New(rand.NewPCG(seed, 7))
+		c, home := fakeProd(t)
+		c.host("root@h4", "10.0.0.5")
+		targets := slices.Sorted(maps.Keys(c.hosts))
+		type node struct{ name, target string }
+		var model []node
+		var history []string
+		check := func() {
+			t.Helper()
+			var want, onHosts []string
+			for _, n := range model {
+				want = append(want, n.name)
+			}
+			slices.Sort(want)
+			for _, target := range targets {
+				if h := c.hosts[target]; h.k3s {
+					onHosts = append(onHosts, h.nodeName)
+				} else if l := left(h); l != "" {
+					t.Fatalf("seed %d: %s, no node, still has %s after\n%s", seed, target, l, strings.Join(history, "\n"))
+				}
+			}
+			slices.Sort(onHosts)
+			inCluster := slices.Sorted(maps.Keys(c.nodes))
+			inDir := nodeNames(t, home)
+			slices.Sort(inDir)
+			if !slices.Equal(inDir, want) || !slices.Equal(inCluster, want) || !slices.Equal(onHosts, want) || c.locked {
+				t.Fatalf("seed %d: the cluster directory has %v, the cluster %v, the hosts %v, want %v; the lock is held: %t; after\n%s", seed, inDir, inCluster, onHosts, want, c.locked, strings.Join(history, "\n"))
+			}
+			if len(model) > 0 {
+				cp, ok, err := prodDir(t, home).ControlPlane()
+				if err != nil || !ok || cp.Name != model[0].name || !c.hosts[model[0].target].zot {
+					t.Fatalf("seed %d: the control plane is %q (%v, %v), with zot on the first node's host: %t, want %s; after\n%s", seed, cp.Name, ok, err, c.hosts[model[0].target].zot, model[0].name, strings.Join(history, "\n"))
+				}
+			}
+		}
+		for range 14 {
+			c.orch.failRemovalAt, c.orch.onUninstall = nil, nil
+			for _, h := range c.hosts {
+				h.failInstall, h.failStart = false, false
+			}
+			c.consoleFails, c.zotFails = false, false
+			if add := rng.IntN(2) == 0; add {
+				target := targets[rng.IntN(len(targets))]
+				taken := slices.ContainsFunc(model, func(n node) bool { return n.target == target })
+				fault := []string{"", "", "install", "start", "console", "zot"}[rng.IntN(6)]
+				switch fault {
+				case "install":
+					c.hosts[target].failInstall = true
+				case "start":
+					c.hosts[target].failStart = len(model) > 0
+				case "console":
+					c.consoleFails = true
+				case "zot":
+					c.zotFails = true
+				}
+				fails := taken || fault == "install" || (fault == "start" && len(model) > 0) || ((fault == "console" || fault == "zot") && len(model) == 0)
+				name := fmt.Sprintf("n%d", len(history))
+				out, err := onFake(t, c, home, "cluster", "node-add", "--name", name, target)
+				history = append(history, fmt.Sprintf("node-add --name %s %s, fault %q: %v", name, target, fault, err))
+				if (err != nil) != fails {
+					t.Fatalf("seed %d: failed %t, want %t:\n%s\n%s", seed, err != nil, fails, strings.Join(history, "\n"), out)
+				}
+				if err == nil {
+					model = append(model, node{name, target})
+				}
+			} else {
+				name := "absent"
+				at := -1
+				if len(model) > 0 && rng.IntN(5) > 0 {
+					at = rng.IntN(len(model))
+					name = model[at].name
+				}
+				yes := rng.IntN(2) == 0
+				fault := []orchestrator.Step{0, 0, orchestrator.Draining, orchestrator.Uninstalling, orchestrator.Deleting}[rng.IntN(5)]
+				if fault != 0 {
+					c.orch.failRemovalAt = map[orchestrator.Step]error{fault: errors.New("a fault")}
+				}
+				args := []string{"cluster", "node-remove", name}
+				if yes {
+					args = append(args, "--yes")
+				}
+				fails := at < 0 || (at == 0 && (len(model) > 1 || !yes)) || (at > 0 && fault != 0)
+				out, err := onFake(t, c, home, args...)
+				history = append(history, fmt.Sprintf("%s, fault at step %d: %v", strings.Join(args[1:], " "), fault, err))
+				if (err != nil) != fails {
+					t.Fatalf("seed %d: failed %t, want %t:\n%s\n%s", seed, err != nil, fails, strings.Join(history, "\n"), out)
+				}
+				if err == nil {
+					model = slices.Delete(model, at, at+1)
+				} else if at > 0 && fault == orchestrator.Deleting {
+					// The host is uninstalled from and the node is kept: the
+					// removal run again finishes it.
+					c.orch.failRemovalAt = nil
+					if out, err := onFake(t, c, home, "cluster", "node-remove", name); err != nil {
+						t.Fatalf("seed %d: the removal run again: %v\n%s\n%s", seed, err, strings.Join(history, "\n"), out)
+					}
+					history = append(history, "node-remove "+name+" again")
+					model = slices.Delete(model, at, at+1)
+				}
+			}
+			check()
+		}
 	}
 }

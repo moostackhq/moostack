@@ -31,6 +31,9 @@ type Fake struct {
 	// Logged is what Logs writes, by app, in place of a line for each
 	// running container. Set it before the first call.
 	Logged map[string]string
+	// Volumes are the volumes nodes hold, by node. Set it before the
+	// first call.
+	Volumes map[string][]string
 
 	mu       sync.Mutex
 	apps     map[string]model.App
@@ -254,29 +257,81 @@ func (f *Fake) Preflight(ctx context.Context, _ orchestrator.Host, want orchestr
 	return n, nil
 }
 
-// AddNode fails for a node the cluster has already.
-func (f *Fake) AddNode(ctx context.Context, _ orchestrator.Host, n model.Node) error {
-	defer f.mu.Unlock()
-	if err := f.begin(ctx, "AddNode"); err != nil {
+// AddNode fails for a node the cluster has already, and tells no step
+// then. It calls step without holding the fake, and if ctx has ended
+// once a step is told, it tells Uninstalling and fails with nothing
+// added.
+func (f *Fake) AddNode(ctx context.Context, _ orchestrator.Host, n model.Node, step func(orchestrator.Step)) error {
+	err := f.begin(ctx, "AddNode")
+	if err == nil {
+		if _, has := f.nodes[n.Name]; has {
+			err = fmt.Errorf("the cluster has a node %s already", n.Name)
+		}
+	}
+	f.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	if _, ok := f.nodes[n.Name]; ok {
-		return fmt.Errorf("the cluster has a node %s already", n.Name)
+	step(orchestrator.Installing)
+	if ctx.Err() != nil {
+		step(orchestrator.Uninstalling)
+		return context.Cause(ctx)
 	}
+	f.mu.Lock()
 	if f.nodes == nil {
 		f.nodes = map[string]model.Node{}
 	}
 	f.nodes[n.Name] = n
+	f.mu.Unlock()
+	for _, s := range []orchestrator.Step{orchestrator.Starting, orchestrator.WaitingForNode} {
+		step(s)
+		if ctx.Err() != nil {
+			step(orchestrator.Uninstalling)
+			f.mu.Lock()
+			delete(f.nodes, n.Name)
+			f.mu.Unlock()
+			return context.Cause(ctx)
+		}
+	}
 	return nil
 }
 
-// RemoveNode succeeds for a node the cluster doesn't have.
-func (f *Fake) RemoveNode(ctx context.Context, name string, _ orchestrator.Host, _ orchestrator.RemoveOptions) error {
-	defer f.mu.Unlock()
-	if err := f.begin(ctx, "RemoveNode"); err != nil {
+// RemoveNode succeeds for a node the cluster doesn't have, of which it
+// tells no Draining and no Deleting. It tells Uninstalling if it has a
+// host. It refuses a node that Volumes gives volumes, unless o says to
+// lose them. It calls step without holding the fake, and fails with the
+// node kept if ctx has ended once a step is told.
+func (f *Fake) RemoveNode(ctx context.Context, name string, host orchestrator.Host, o orchestrator.RemoveOptions, step func(orchestrator.Step)) error {
+	err := f.begin(ctx, "RemoveNode")
+	_, has := f.nodes[name]
+	f.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	delete(f.nodes, name)
+	if has && !o.Unreachable {
+		if held := f.Volumes[name]; len(held) > 0 && !o.LoseVolumes {
+			return &orchestrator.VolumesError{Node: name, Volumes: slices.Clone(held)}
+		}
+		step(orchestrator.Draining)
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+	}
+	if host != nil {
+		step(orchestrator.Uninstalling)
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+	}
+	if has {
+		step(orchestrator.Deleting)
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+		f.mu.Lock()
+		delete(f.nodes, name)
+		f.mu.Unlock()
+	}
 	return nil
 }
 

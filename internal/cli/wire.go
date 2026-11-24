@@ -6,10 +6,13 @@ import (
 	"io"
 	"io/fs"
 	"net"
+	"net/netip"
 	"strings"
 
+	"github.com/moostackhq/moostack/internal/clusterdir"
 	"github.com/moostackhq/moostack/internal/orchestrator"
 	"github.com/moostackhq/moostack/internal/orchestrator/k3s"
+	"github.com/moostackhq/moostack/internal/registry"
 	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
@@ -17,6 +20,13 @@ import (
 // cluster through cp, the connection to its control plane, or reaches
 // none if cp is nil.
 func orchestratorThrough(env Env, cp remote) orchestrator.Orchestrator {
+	return orchestratorOf(env, clusterdir.Cluster{}, netip.Addr{}, cp)
+}
+
+// orchestratorOf is orchestratorThrough for the cluster c, whose
+// control plane's private address is at, invalid if it has none: its
+// orchestrator makes hosts c's nodes.
+func orchestratorOf(env Env, c clusterdir.Cluster, at netip.Addr, cp remote) orchestrator.Orchestrator {
 	var host orchestrator.Host
 	if cp != nil {
 		host = orchestratorHost{cp}
@@ -24,7 +34,7 @@ func orchestratorThrough(env Env, cp remote) orchestrator.Orchestrator {
 	if env.Orchestrator != nil {
 		return env.Orchestrator(host)
 	}
-	return k3s.Through(host)
+	return k3s.Through(host, k3s.Cluster{Version: c.K3s, Email: c.Email, Registry: registry.Name, RegistryPort: registry.Port, ControlPlane: at})
 }
 
 // orchestratorHost is a remote as an orchestrator acts on it. A command

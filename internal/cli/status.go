@@ -12,7 +12,6 @@ import (
 
 	"github.com/moostackhq/moostack/internal/clusterdir"
 	"github.com/moostackhq/moostack/internal/gitrepo"
-	"github.com/moostackhq/moostack/internal/k3s"
 	"github.com/moostackhq/moostack/internal/model"
 )
 
@@ -74,7 +73,7 @@ func clusterStatus(ctx context.Context, env Env, cmd *cli.Command) error {
 	fmt.Fprintln(env.Stdout)
 	fmt.Fprintln(w, "NODE\tROLE\tREADY\tK3S\tARCH\tMEMORY\tPRIVATE ADDRESS")
 	for _, n := range nodes {
-		role := k3s.RoleOf(n.ControlPlane)
+		role := roleName(n.ControlPlane)
 		i := slices.IndexFunc(onCluster, func(seen model.NodeState) bool { return seen.Name == n.Name })
 		if i < 0 {
 			fmt.Fprintf(w, "%s\t%s\t%s\t\t%s\t%s\t%s\n", n.Name, role, "not on the cluster", n.Architecture, mib(n.MemoryMiB), n.PrivateAddress)
@@ -152,7 +151,7 @@ func printDirNodes(env Env, w *tabwriter.Writer, nodes []clusterdir.Node) {
 	fmt.Fprintln(env.Stdout)
 	fmt.Fprintln(w, "NODE\tROLE\tARCH\tMEMORY\tPRIVATE ADDRESS")
 	for _, n := range nodes {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", n.Name, k3s.RoleOf(n.ControlPlane), n.Architecture, mib(n.MemoryMiB), n.PrivateAddress)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", n.Name, roleName(n.ControlPlane), n.Architecture, mib(n.MemoryMiB), n.PrivateAddress)
 	}
 	w.Flush()
 }

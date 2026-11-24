@@ -1,0 +1,38 @@
+$ mooctl cluster node-add root@h1
+Adding node1 to prod (control plane, amd64, 1974 MiB, 10.0.0.2)
+Downloading the console...
+Installing k3s and zot...
+Waiting for node1 to be Ready...
+Installing the console...
+Added node1 to prod
+$ mooctl cluster node-add root@h2
+Adding node2 to prod (node, amd64, 1974 MiB, 10.0.0.3)
+Installing k3s...
+Waiting for node2 to be Ready...
+Added node2 to prod
+$ mooctl cluster node-add root@h3
+Adding node3 to prod (node, amd64, 1974 MiB, 10.0.0.4)
+Installing k3s...
+Waiting for node3 to be Ready...
+Added node3 to prod
+$ mooctl cluster node-add root@h2
+error: root@h2 is node node2 of prod already
+$ mooctl cluster node-remove node2
+error: node1: connecting to root@h1: no route to host
+Pass --unreachable to remove nodes without the control plane.
+$ mooctl cluster node-remove --unreachable node1
+error: node1 is the control plane, which goes last; remove the other 2 nodes first, with --unreachable
+$ mooctl cluster node-remove --unreachable node2
+Removing node2 from prod
+Uninstalling...
+Removed node2 from prod
+$ mooctl cluster node-remove --unreachable node3
+Removing node3 from prod
+Warning: node3 can't be reached; if k3s still runs there, uninstall it there.
+Removed node3 from prod
+$ mooctl cluster node-remove --unreachable node1
+error: node1 is the cluster's last node: removing it removes the cluster's k3s and everything running on it; pass --yes to remove it
+$ mooctl cluster node-remove --unreachable --yes node1
+Removing node1 from prod
+Warning: node1 can't be reached; if k3s still runs there, uninstall it there.
+Removed node1 from prod

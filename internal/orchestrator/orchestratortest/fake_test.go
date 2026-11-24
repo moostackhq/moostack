@@ -67,9 +67,11 @@ func calls(ctx context.Context) map[string]func(f *orchestratortest.Fake) error 
 			_, err := f.Preflight(ctx, host, orchestrator.NodeRequest{Name: "node-9"})
 			return err
 		},
-		"AddNode": func(f *orchestratortest.Fake) error { return f.AddNode(ctx, host, model.Node{Name: "node-9"}) },
+		"AddNode": func(f *orchestratortest.Fake) error {
+			return f.AddNode(ctx, host, model.Node{Name: "node-9"}, func(orchestrator.Step) {})
+		},
 		"RemoveNode": func(f *orchestratortest.Fake) error {
-			return f.RemoveNode(ctx, "node-1", host, orchestrator.RemoveOptions{})
+			return f.RemoveNode(ctx, "node-1", host, orchestrator.RemoveOptions{}, func(orchestrator.Step) {})
 		},
 		"Uninstall":    func(f *orchestratortest.Fake) error { return f.Uninstall(ctx, host, model.Node{Name: "node-1"}) },
 		"Nodes":        func(f *orchestratortest.Fake) error { _, err := f.Nodes(ctx); return err },
@@ -86,7 +88,7 @@ func cluster(t *testing.T) *orchestratortest.Fake {
 	shop := model.App{Name: "shop", Containers: []model.Container{{Name: "web", Image: "example.test/web:1", Host: "shop.example.test"}}}
 	if err := errors.Join(
 		f.Deploy(ctx, shop, func(orchestrator.Step) {}),
-		f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-1"}),
+		f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-1"}, func(orchestrator.Step) {}),
 		f.RunConsole(ctx, "example.test/console:1", nil),
 	); err != nil {
 		t.Fatal(err)
@@ -198,11 +200,11 @@ func TestCallsOfTheFakeAtOnceLeaveWhatSomeOrderOfThemWould(t *testing.T) {
 					f.Deploy(ctx, deployed, func(orchestrator.Step) {}),
 					f.Certificate(ctx, app, "web"),
 					f.Logs(ctx, app, orchestrator.LogOptions{}, io.Discard),
-					f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: node}),
+					f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: node}, func(orchestrator.Step) {}),
 					f.RunConsole(ctx, "example.test/console:1", nil),
 				)
 				if i < rounds-1 {
-					err = errors.Join(err, f.Remove(ctx, app), f.RemoveNode(ctx, node, nil, orchestrator.RemoveOptions{}))
+					err = errors.Join(err, f.Remove(ctx, app), f.RemoveNode(ctx, node, nil, orchestrator.RemoveOptions{}, func(orchestrator.Step) {}))
 				}
 				if err != nil {
 					t.Error(err)
@@ -437,13 +439,13 @@ func TestTheFakeRefusesWhatItCantDo(t *testing.T) {
 			t.Errorf("Certificate of %s, which has no host, succeeded", container)
 		}
 	}
-	if err := f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-1"}); err != nil {
+	if err := f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-1"}, func(orchestrator.Step) {}); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-1"}); err == nil {
+	if err := f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-1"}, func(orchestrator.Step) {}); err == nil {
 		t.Error("adding a node the cluster has succeeded")
 	}
-	if err := f.RemoveNode(ctx, "node-7", nil, orchestrator.RemoveOptions{}); err != nil {
+	if err := f.RemoveNode(ctx, "node-7", nil, orchestrator.RemoveOptions{}, func(orchestrator.Step) {}); err != nil {
 		t.Errorf("removing a node the cluster doesn't have: %v", err)
 	}
 	nameless := model.App{Containers: []model.Container{{Name: "web"}}}
@@ -468,17 +470,17 @@ func TestTheFakesPreflightTakesTheAddressAskedForAndANodeWithoutOneHasNone(t *te
 	}
 	if n, _ := f.Preflight(ctx, orchestratortest.Host{}, orchestrator.NodeRequest{Name: "node-0", ControlPlane: true}); !n.ControlPlane {
 		t.Error("Preflight returned a node that isn't the control plane asked for")
-	} else if err := f.AddNode(ctx, orchestratortest.Host{}, n); err != nil {
+	} else if err := f.AddNode(ctx, orchestratortest.Host{}, n, func(orchestrator.Step) {}); err != nil {
 		t.Fatal(err)
 	} else if nodes, _ := f.Nodes(ctx); len(nodes) != 1 || !nodes[0].ControlPlane {
 		t.Errorf("the control plane added is %+v", nodes)
-	} else if err := f.RemoveNode(ctx, "node-0", nil, orchestrator.RemoveOptions{}); err != nil {
+	} else if err := f.RemoveNode(ctx, "node-0", nil, orchestrator.RemoveOptions{}, func(orchestrator.Step) {}); err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := f.Preflight(ctx, orchestratortest.Host{}, orchestrator.NodeRequest{Name: "node-2"}); n.PrivateAddress != netip.MustParseAddr("10.0.0.1") {
 		t.Errorf("Preflight without an address asked for returned %s, want 10.0.0.1", n.PrivateAddress)
 	}
-	if err := f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-3"}); err != nil {
+	if err := f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-3"}, func(orchestrator.Step) {}); err != nil {
 		t.Fatal(err)
 	}
 	if nodes, _ := f.Nodes(ctx); len(nodes) != 1 || nodes[0].Address != "" {
@@ -553,14 +555,14 @@ func TestSequencesOfOperationsMatchAModel(t *testing.T) {
 				delete(apps, app)
 			case 2:
 				history = append(history, "add "+node)
-				err := f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: node, PrivateAddress: netip.MustParseAddr("10.0.0.2")})
+				err := f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: node, PrivateAddress: netip.MustParseAddr("10.0.0.2")}, func(orchestrator.Step) {})
 				if (err != nil) != nodes[node] {
 					fail("AddNode: %v, with the node there: %t", err, nodes[node])
 				}
 				nodes[node] = true
 			case 3:
 				history = append(history, "remove "+node)
-				if err := f.RemoveNode(ctx, node, orchestratortest.Host{}, orchestrator.RemoveOptions{}); err != nil {
+				if err := f.RemoveNode(ctx, node, orchestratortest.Host{}, orchestrator.RemoveOptions{}, func(orchestrator.Step) {}); err != nil {
 					fail("RemoveNode: %v", err)
 				}
 				delete(nodes, node)
@@ -619,6 +621,128 @@ func TestSequencesOfOperationsMatchAModel(t *testing.T) {
 					fail("Nodes has %s, which the model doesn't", n.Name)
 				}
 			}
+		}
+	}
+}
+
+func TestTheFakeRefusesToRemoveANodeThatHoldsVolumesUnlessToldToLoseThem(t *testing.T) {
+	ctx := context.Background()
+	f := &orchestratortest.Fake{Volumes: map[string][]string{"node-1": {"data", "cache"}}}
+	steps := func(n *[]orchestrator.Step) func(orchestrator.Step) {
+		return func(s orchestrator.Step) { *n = append(*n, s) }
+	}
+	if err := f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-1"}, func(orchestrator.Step) {}); err != nil {
+		t.Fatal(err)
+	}
+	var told []orchestrator.Step
+	err := f.RemoveNode(ctx, "node-1", orchestratortest.Host{}, orchestrator.RemoveOptions{}, steps(&told))
+	var held *orchestrator.VolumesError
+	if !errors.As(err, &held) || held.Node != "node-1" || !slices.Equal(held.Volumes, []string{"data", "cache"}) {
+		t.Fatalf("RemoveNode of a node that holds volumes: %v, want a VolumesError of node-1's data and cache", err)
+	}
+	if want := "node-1 holds the volumes data, cache, which go with it"; err.Error() != want {
+		t.Errorf("the refusal reads %q, want %q", err, want)
+	}
+	if nodes, _ := f.Nodes(ctx); len(nodes) != 1 || len(told) != 0 {
+		t.Errorf("the refusal left %d nodes and told the steps %v, want the node and no step", len(nodes), told)
+	}
+	if err := f.RemoveNode(ctx, "node-1", orchestratortest.Host{}, orchestrator.RemoveOptions{LoseVolumes: true}, steps(&told)); err != nil {
+		t.Fatalf("RemoveNode, losing volumes: %v", err)
+	}
+	if want := []orchestrator.Step{orchestrator.Draining, orchestrator.Uninstalling, orchestrator.Deleting}; !slices.Equal(told, want) {
+		t.Errorf("the steps were %v, want Draining, Uninstalling, Deleting", told)
+	}
+}
+
+func TestTheFakeTellsTheStepsOfARemovalItHasToDo(t *testing.T) {
+	ctx := context.Background()
+	for name, tc := range map[string]struct {
+		there bool
+		host  orchestrator.Host
+		o     orchestrator.RemoveOptions
+		want  []orchestrator.Step
+	}{
+		"a node whose host can't be reached":             {there: true, o: orchestrator.RemoveOptions{Unreachable: true}, want: []orchestrator.Step{orchestrator.Deleting}},
+		"a node without a host":                          {there: true, want: []orchestrator.Step{orchestrator.Draining, orchestrator.Deleting}},
+		"a host the cluster has no node of":              {host: orchestratortest.Host{}, want: []orchestrator.Step{orchestrator.Uninstalling}},
+		"a node that holds volumes and can't be reached": {there: true, o: orchestrator.RemoveOptions{Unreachable: true}, want: []orchestrator.Step{orchestrator.Deleting}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := &orchestratortest.Fake{Volumes: map[string][]string{}}
+			if strings.Contains(name, "volumes") {
+				f.Volumes["node-1"] = []string{"data"}
+			}
+			if tc.there {
+				if err := f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-1"}, func(orchestrator.Step) {}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var told []orchestrator.Step
+			if err := f.RemoveNode(ctx, "node-1", tc.host, tc.o, func(s orchestrator.Step) { told = append(told, s) }); err != nil {
+				t.Fatalf("RemoveNode: %v", err)
+			}
+			if !slices.Equal(told, tc.want) {
+				t.Errorf("the steps were %v, want %v", told, tc.want)
+			}
+			if nodes, _ := f.Nodes(ctx); len(nodes) != 0 {
+				t.Errorf("the cluster still has %d nodes", len(nodes))
+			}
+		})
+	}
+}
+
+func TestTheFakeTellsNoStepWhenItRefusesANode(t *testing.T) {
+	ctx := context.Background()
+	f := &orchestratortest.Fake{}
+	var told []orchestrator.Step
+	tell := func(s orchestrator.Step) { told = append(told, s) }
+	f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-1"}, tell)
+	told = nil
+	if err := f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-1"}, tell); err == nil || err.Error() != "the cluster has a node node-1 already" {
+		t.Fatalf("adding a node the cluster has: %v", err)
+	}
+	if len(told) != 0 {
+		t.Errorf("the steps were %v, want none", told)
+	}
+}
+
+func TestANodeOperationOfTheFakeWhoseContextEndsAtAnyStepFailsAndChangesNothing(t *testing.T) {
+	cause := errors.New("the operation lock is lost")
+	for _, at := range []orchestrator.Step{orchestrator.Installing, orchestrator.Starting, orchestrator.WaitingForNode} {
+		f := &orchestratortest.Fake{}
+		ctx, cancel := context.WithCancelCause(context.Background())
+		var told []orchestrator.Step
+		err := f.AddNode(ctx, orchestratortest.Host{}, model.Node{Name: "node-1"}, func(s orchestrator.Step) {
+			told = append(told, s)
+			if s == at {
+				cancel(cause)
+			}
+		})
+		if !errors.Is(err, cause) || len(told) == 0 || told[len(told)-1] != orchestrator.Uninstalling {
+			t.Errorf("AddNode whose context ends at step %v: %v after the steps %v, want the cause, with Uninstalling told last", at, err, told)
+		}
+		if nodes, _ := f.Nodes(context.Background()); len(nodes) != 0 {
+			t.Errorf("the cluster has %d nodes after an add cut off at step %v", len(nodes), at)
+		}
+	}
+	for _, at := range []orchestrator.Step{orchestrator.Draining, orchestrator.Uninstalling, orchestrator.Deleting} {
+		f := &orchestratortest.Fake{}
+		if err := f.AddNode(context.Background(), orchestratortest.Host{}, model.Node{Name: "node-1"}, func(orchestrator.Step) {}); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancelCause(context.Background())
+		var last orchestrator.Step
+		err := f.RemoveNode(ctx, "node-1", orchestratortest.Host{}, orchestrator.RemoveOptions{}, func(s orchestrator.Step) {
+			last = s
+			if s == at {
+				cancel(cause)
+			}
+		})
+		if !errors.Is(err, cause) || last != at {
+			t.Errorf("RemoveNode whose context ends at step %v: %v after the last step %v, want the cause, and no step more", at, err, last)
+		}
+		if nodes, _ := f.Nodes(context.Background()); len(nodes) != 1 {
+			t.Errorf("the cluster has %d nodes after a removal cut off at step %v, want the node kept", len(nodes), at)
 		}
 	}
 }

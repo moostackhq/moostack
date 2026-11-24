@@ -591,7 +591,7 @@ func TestALogFollowedThroughAHostGoesOnPastTheTimeARequestHas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := k3s.Through(hostTo{&controlPlane{kubeconfig: string(text)}, api.Listener.Addr().String()})
+	b := k3s.Through(hostTo{&controlPlane{kubeconfig: string(text)}, api.Listener.Addr().String()}, k3s.Cluster{})
 	w := make(lineWriter, 4)
 	done := make(chan error, 1)
 	go func() {

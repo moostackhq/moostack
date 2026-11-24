@@ -1211,7 +1211,7 @@ func TestACallThroughAHostToAnAPIThatNeverAnswersFailsInTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := k3s.Through(hostTo{&controlPlane{kubeconfig: string(text)}, silent.Listener.Addr().String()})
+	b := k3s.Through(hostTo{&controlPlane{kubeconfig: string(text)}, silent.Listener.Addr().String()}, k3s.Cluster{})
 	done := make(chan error, 1)
 	start := time.Now()
 	go func() {
@@ -1518,7 +1518,7 @@ func (h *controlPlane) DialTCP(ctx context.Context, addr string) (net.Conn, erro
 
 func TestThroughAHostTheBackendReadsTheKubeconfigOnceAndDialsTheAPIThroughIt(t *testing.T) {
 	host := &controlPlane{kubeconfig: string(kubeconfig)}
-	b := k3s.Through(host)
+	b := k3s.Through(host, k3s.Cluster{})
 	if err := b.Check(shop("shop")); err != nil || len(host.runs) != 0 {
 		t.Errorf("Check: %v, after the commands %q on the host, want none", err, host.runs)
 	}
@@ -1614,7 +1614,7 @@ func TestAKubeconfigMakesTheBackendRunNothingAndReadNoFile(t *testing.T) {
 		}
 		host := &controlPlane{kubeconfig: string(text)}
 		// The token in the file is one that may list pods.
-		_, err = k3s.Through(host).Running(within(t, 30*time.Second))
+		_, err = k3s.Through(host, k3s.Cluster{}).Running(within(t, 30*time.Second))
 		if err == nil {
 			t.Errorf("%s: the backend listed pods with a credential the kubeconfig doesn't hold", name)
 		}
@@ -1626,7 +1626,7 @@ func TestAKubeconfigMakesTheBackendRunNothingAndReadNoFile(t *testing.T) {
 
 func TestCallsAtOnceThroughOneHostReadTheKubeconfigOnce(t *testing.T) {
 	host := &controlPlane{kubeconfig: string(kubeconfig)}
-	b := k3s.Through(host)
+	b := k3s.Through(host, k3s.Cluster{})
 	var calls sync.WaitGroup
 	for range 8 {
 		calls.Go(func() {
@@ -1644,7 +1644,7 @@ func TestCallsAtOnceThroughOneHostReadTheKubeconfigOnce(t *testing.T) {
 }
 
 func TestWithoutAHostEveryCallThatNeedsTheAPIFails(t *testing.T) {
-	b := k3s.Through(nil)
+	b := k3s.Through(nil, k3s.Cluster{})
 	ctx := within(t, time.Minute)
 	_, nodes := b.Nodes(ctx)
 	_, running := b.Running(ctx)
@@ -1693,19 +1693,19 @@ func TestTheKubeconfigIsInNoErrorAndNoFile(t *testing.T) {
 		t.Fatal("the kubeconfig has no client-key-data")
 	}
 	errs := map[string]error{
-		"no kubeconfig on the host":       k3s.Through(&controlPlane{}).Deploy(short(), shop(name), step),
-		"a kubeconfig that can't be read": k3s.Through(&controlPlane{kubeconfig: garbled}).Deploy(short(), shop(name), step),
-		"a kubeconfig cut short":          k3s.Through(&controlPlane{kubeconfig: string(kubeconfig[:len(kubeconfig)/2])}).Deploy(short(), shop(name), step),
-		"a host that connects nowhere":    k3s.Through(&controlPlane{kubeconfig: string(kubeconfig), broken: true}).Deploy(short(), shop(name), step),
+		"no kubeconfig on the host":       k3s.Through(&controlPlane{}, k3s.Cluster{}).Deploy(short(), shop(name), step),
+		"a kubeconfig that can't be read": k3s.Through(&controlPlane{kubeconfig: garbled}, k3s.Cluster{}).Deploy(short(), shop(name), step),
+		"a kubeconfig cut short":          k3s.Through(&controlPlane{kubeconfig: string(kubeconfig[:len(kubeconfig)/2])}, k3s.Cluster{}).Deploy(short(), shop(name), step),
+		"a host that connects nowhere":    k3s.Through(&controlPlane{kubeconfig: string(kubeconfig), broken: true}, k3s.Cluster{}).Deploy(short(), shop(name), step),
 	}
-	b := k3s.Through(&controlPlane{kubeconfig: string(kubeconfig)})
+	b := k3s.Through(&controlPlane{kubeconfig: string(kubeconfig)}, k3s.Cluster{})
 	errs["a kind that isn't kept in a namespace"] = b.Deploy(short(), manifestsOf(t, name, "apiVersion: v1\nkind: Namespace\nmetadata: {name: "+name+"}"), step)
 	errs["an object the API refuses"] = b.Deploy(short(), manifestsOf(t, name, "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: c}\ndata: {a: [b]}"), step)
 	errs["a rollout that isn't ready in time"] = b.Deploy(short(), shop(name), step)
 	errs["a chart that isn't installed in time"] = b.Deploy(short(), chartOf(t, name, "one"), step)
 	errs["a certificate that isn't issued in time"] = b.Certificate(short(), name, "web")
 	lost := &controlPlane{kubeconfig: string(kubeconfig)}
-	c := k3s.Through(lost)
+	c := k3s.Through(lost, k3s.Cluster{})
 	if _, err := c.Nodes(short()); err != nil {
 		t.Fatal(err)
 	}

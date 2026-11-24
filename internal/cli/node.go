@@ -3,7 +3,6 @@ package cli
 import (
 	"cmp"
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"net/http"
@@ -18,20 +17,37 @@ import (
 
 	"github.com/moostackhq/moostack/internal/clusterdir"
 	"github.com/moostackhq/moostack/internal/interrupt"
-	"github.com/moostackhq/moostack/internal/k3s"
+	"github.com/moostackhq/moostack/internal/model"
+	"github.com/moostackhq/moostack/internal/orchestrator"
 	"github.com/moostackhq/moostack/internal/registry"
 	"github.com/moostackhq/moostack/internal/release"
-	"github.com/moostackhq/moostack/internal/sshclient"
 )
 
 // undoTimeout bounds undoing a failed node-add.
 const undoTimeout = 5 * time.Minute
 
-// uncordonTimeout bounds putting a node back after a failed drain.
-const uncordonTimeout = 30 * time.Second
+// roleName is how the operator sees what a node is in its cluster.
+func roleName(controlPlane bool) string {
+	if controlPlane {
+		return "control plane"
+	}
+	return "node"
+}
 
-// appLabel is the label that marks an app's namespace with its name.
-const appLabel = "moostack.dev/app"
+// modelNode is n as an orchestrator takes it.
+func modelNode(n clusterdir.Node) model.Node {
+	return model.Node{
+		Name:           n.Name,
+		ControlPlane:   n.ControlPlane,
+		PrivateAddress: n.PrivateAddress,
+		Interface:      n.Interface,
+		PublicAddress:  n.PublicAddress,
+		Architecture:   n.Architecture,
+		MemoryMiB:      n.MemoryMiB,
+		GOGC:           n.GOGC,
+		GOMEMLIMIT:     n.GOMEMLIMIT,
+	}
+}
 
 // nodeAdd is mooctl cluster node-add.
 func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
@@ -101,9 +117,10 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	orch := orchestratorOf(env, d.Cluster, cp.PrivateAddress, cpClient)
 	var known []string
 	if hasCP {
-		if known, err = kubeNodeNames(ctx, cpClient); err != nil {
+		if known, err = clusterNodeNames(ctx, orch); err != nil {
 			return err
 		}
 	}
@@ -121,64 +138,27 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 		return err
 	}
 
-	// Preflight.
-	role := k3s.RoleOf(!hasCP)
-	out, err := run(ctx, host, k3s.FactsScript, "")
+	found, err := orch.Preflight(ctx, orchestratorHost{host}, orchestrator.NodeRequest{Name: name, ControlPlane: !hasCP, PrivateAddress: override})
 	if err != nil {
 		return fmt.Errorf("%s: %w", target, err)
-	}
-	facts, err := k3s.ParseFacts(out)
-	if err != nil {
-		return fmt.Errorf("%s: %w", target, err)
-	}
-	if _, err := k3s.InstallScript(d.Cluster.K3s, role); err != nil {
-		return err
-	}
-	if err := facts.Check(role); err != nil {
-		return fmt.Errorf("%s can't be a %s: %w", target, role, err)
-	}
-	private, err := facts.PrivateAddress(override)
-	if err != nil {
-		return fmt.Errorf("%s: %w", target, err)
-	}
-	gogc, gomemlimit := k3s.Memory(facts.MemoryMiB, role)
-	var token string
-	if hasCP {
-		if _, err := run(ctx, host, k3s.ReachScript(cp.PrivateAddress), ""); err != nil {
-			return fmt.Errorf("%s: %w", target, err)
-		}
-		v, err := run(ctx, cpClient, k3s.VersionScript, "")
-		if err != nil {
-			return fmt.Errorf("reading k3s's version on %s: %w", cp.Name, err)
-		}
-		if v = strings.TrimSpace(v); v != d.Cluster.K3s {
-			return fmt.Errorf("%s runs k3s %s, and the cluster file pins %s", cp.Name, v, d.Cluster.K3s)
-		}
-		out, err := run(ctx, cpClient, "cat "+k3s.AgentTokenFile, "")
-		if err != nil {
-			return fmt.Errorf("reading the join token on %s: %w", cp.Name, err)
-		}
-		token = strings.TrimSpace(out)
-	} else {
-		token = rand.Text()
 	}
 	node := clusterdir.Node{
 		Name:           name,
 		Target:         target,
 		HostKey:        key,
-		PrivateAddress: private.Addr,
-		Interface:      private.Interface,
-		PublicAddress:  facts.PublicAddress(),
-		Architecture:   facts.Architecture,
-		MemoryMiB:      facts.MemoryMiB,
-		GOGC:           gogc,
-		GOMEMLIMIT:     gomemlimit,
-		ControlPlane:   role.ControlPlane,
+		PrivateAddress: found.PrivateAddress,
+		Interface:      found.Interface,
+		PublicAddress:  found.PublicAddress,
+		Architecture:   found.Architecture,
+		MemoryMiB:      found.MemoryMiB,
+		GOGC:           found.GOGC,
+		GOMEMLIMIT:     found.GOMEMLIMIT,
+		ControlPlane:   !hasCP,
 	}
 
-	say(env, "Adding %s to %s (%s, %s, %d MiB, %s)", name, d.Cluster.Ref, role, facts.Architecture, facts.MemoryMiB, private.Addr)
+	say(env, "Adding %s to %s (%s, %s, %d MiB, %s)", name, d.Cluster.Ref, roleName(node.ControlPlane), node.Architecture, node.MemoryMiB, node.PrivateAddress)
 	var console string
-	if role.ControlPlane {
+	if node.ControlPlane {
 		say(env, "Downloading the console...")
 		dir, err := os.MkdirTemp("", "mooctl-console-")
 		if err != nil {
@@ -186,31 +166,19 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 		}
 		defer os.RemoveAll(dir)
 		client := &http.Client{Timeout: 10 * time.Minute}
-		if console, err = release.Fetch(ctx, client, cmp.Or(env.Release, release.URL), "console-linux-"+facts.Architecture+".tar", dir); err != nil {
+		if console, err = release.Fetch(ctx, client, cmp.Or(env.Release, release.URL), "console-linux-"+node.Architecture+".tar", dir); err != nil {
 			return err
 		}
 	}
 
-	// Install, undoing it all if it fails.
-	if err := install(ctx, env, d, cp, host, cpClient, node, token, console); err != nil {
-		say(env, "Uninstalling...")
-		undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoTimeout)
-		defer cancel()
-		if _, uerr := run(undoCtx, host, uninstallScript(role), ""); uerr != nil {
-			err = errors.Join(err, fmt.Errorf("uninstalling from %s: %w", target, uerr))
-		}
-		if hasCP {
-			if _, uerr := run(undoCtx, cpClient, "k3s kubectl delete node "+sshclient.ShellQuote(name)+" --ignore-not-found --request-timeout=60s", ""); uerr != nil {
-				err = errors.Join(err, uerr)
-			}
-		}
+	if err := add(ctx, env, orch, host, node, console); err != nil {
 		return err
 	}
 	if err := d.WriteNode(node); err != nil {
 		return err
 	}
 	recordOn := cpClient
-	if role.ControlPlane {
+	if node.ControlPlane {
 		recordOn = host
 	}
 	if err := op.finish(ctx, "node-add "+name, remoteHost{recordOn}); err != nil {
@@ -218,7 +186,7 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 	}
 	fmt.Fprintf(env.Stdout, "Added %s to %s\n", name, d.Cluster.Ref)
 	if hasCP && !slices.ContainsFunc(nodes, func(n clusterdir.Node) bool { return n.Architecture == node.Architecture }) {
-		if apps, err := run(ctx, cpClient, "k3s kubectl get namespaces -l "+appLabel+" -o name --request-timeout=30s", ""); err == nil && strings.TrimSpace(apps) != "" {
+		if apps, err := orch.Apps(ctx); err == nil && len(apps) > 0 {
 			fmt.Fprintf(env.Stderr, "Warning: %s is the cluster's first %s node; deploy its built apps again to run them there.\n", name, node.Architecture)
 		}
 	}
@@ -236,22 +204,21 @@ func notANode(d *clusterdir.Dir, nodes []clusterdir.Node, target string) error {
 	return nil
 }
 
-// kubeNodeNames are the names of the cluster's Kubernetes nodes, read on
-// its control plane cp.
-func kubeNodeNames(ctx context.Context, cp remote) ([]string, error) {
-	out, err := run(ctx, cp, k3s.NodeNamesScript, "")
+// clusterNodeNames are the names of the nodes the cluster has.
+func clusterNodeNames(ctx context.Context, orch orchestrator.Orchestrator) ([]string, error) {
+	nodes, err := orch.Nodes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing the cluster's nodes: %w", err)
 	}
 	var names []string
-	for _, line := range strings.Fields(out) {
-		names = append(names, strings.TrimPrefix(line, "node/"))
+	for _, n := range nodes {
+		names = append(names, n.Name)
 	}
 	return names, nil
 }
 
 // freeName is the first of node1, node2 and so on that neither a node of
-// nodes nor a Kubernetes node of known has.
+// nodes nor a node of known, those the cluster has, is called.
 func freeName(nodes []clusterdir.Node, known []string) string {
 	for i := 1; ; i++ {
 		name := fmt.Sprintf("node%d", i)
@@ -261,141 +228,132 @@ func freeName(nodes []clusterdir.Node, known []string) string {
 	}
 }
 
-// uninstallScript removes k3s from a node of role, and from the control
-// plane the registry and the applied commit as well, and fails if k3s's
-// uninstall fails.
-func uninstallScript(role k3s.Role) string {
-	script := k3s.UninstallScript(role)
-	if !role.ControlPlane {
-		return script
+// ownUninstallScript removes from a control plane what the commands put
+// there themselves: the registry and the applied commit.
+var ownUninstallScript = registry.ZotUninstallScript + "\nrm -f " + AppliedCommitFile + "\nrmdir " + path.Dir(AppliedCommitFile) + " 2>/dev/null\ntrue"
+
+// uninstall removes the node n from host: what the orchestrator put
+// there, and from a control plane the registry and the applied commit
+// as well. It fails if the orchestrator's part does.
+func uninstall(ctx context.Context, orch orchestrator.Orchestrator, host remote, n clusterdir.Node) error {
+	err := orch.Uninstall(ctx, orchestratorHost{host}, modelNode(n))
+	if n.ControlPlane {
+		if _, oerr := run(ctx, host, ownUninstallScript, ""); oerr != nil {
+			err = errors.Join(err, oerr)
+		}
 	}
-	return "(\n" + script + "\n)\ns=$?\n" + registry.ZotUninstallScript + "\nrm -f " + AppliedCommitFile + "\nrmdir " + path.Dir(AppliedCommitFile) + " 2>/dev/null\nexit $s"
+	return err
 }
 
-// install installs k3s on host as node, joining the control plane cp at
-// cpClient with token, or, if node is the control plane, with token as
-// its agent token, beside zot, Traefik's config, cert-manager, its
-// issuer and the console, whose image archive is at console.
-func install(ctx context.Context, env Env, d *clusterdir.Dir, cp clusterdir.Node, host, cpClient remote, node clusterdir.Node, token, console string) error {
-	role := k3s.RoleOf(node.ControlPlane)
-	kn := k3s.Node{Name: node.Name, PrivateAddress: node.PrivateAddress, Interface: node.Interface, PublicAddress: node.PublicAddress}
-	cpAddr := cp.PrivateAddress
-	if role.ControlPlane {
-		cpAddr = node.PrivateAddress
+// add makes host the node, and a control plane the host of the registry
+// and of the console, whose image archive is at console. If it fails,
+// it leaves nothing of them on host.
+func add(ctx context.Context, env Env, orch orchestrator.Orchestrator, host remote, node clusterdir.Node, console string) error {
+	uninstalling := false
+	added, err := install(ctx, env, orch, host, node, &uninstalling)
+	if err == nil && node.ControlPlane {
+		err = installConsole(ctx, env, orch, host, node, console)
 	}
-	files := k3s.Written{Node: kn, Role: role, MemoryMiB: node.MemoryMiB, GOGC: node.GOGC, GOMEMLIMIT: node.GOMEMLIMIT, ControlPlane: cpAddr, Token: token, Registry: registry.Name, RegistryPort: registry.Port, Email: d.Cluster.Email}.Files()
-	for _, f := range files {
-		if err := upload(ctx, host, f.Path, f.Content, 0o600); err != nil {
-			return fmt.Errorf("writing %s: %w", f.Path, err)
+	if err == nil {
+		return nil
+	}
+	undo, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoTimeout)
+	defer cancel()
+	if !uninstalling && (added || node.ControlPlane) {
+		say(env, "Uninstalling...")
+	}
+	if added {
+		if uerr := orch.Uninstall(undo, orchestratorHost{host}, modelNode(node)); uerr != nil {
+			err = errors.Join(err, fmt.Errorf("uninstalling from %s: %w", node.Target, uerr))
 		}
 	}
-	script, err := k3s.InstallScript(d.Cluster.K3s, role)
-	if err != nil {
-		return err
+	if node.ControlPlane {
+		if _, uerr := run(undo, host, ownUninstallScript, ""); uerr != nil {
+			err = errors.Join(err, fmt.Errorf("uninstalling from %s: %w", node.Target, uerr))
+		}
 	}
+	return err
+}
+
+// install has the orchestrator make host the node, and installs the
+// registry on a control plane once the orchestrator starts it. It
+// reports whether the orchestrator added the node, and sets
+// uninstalling if the orchestrator told that it uninstalls.
+func install(ctx context.Context, env Env, orch orchestrator.Orchestrator, host remote, node clusterdir.Node, uninstalling *bool) (added bool, err error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	zot := make(chan error, 1)
-	if role.ControlPlane {
-		say(env, "Installing k3s and zot...")
-		go func() {
-			if _, err := runStoppable(ctx, host, registry.ZotScript(node.Architecture, node.PrivateAddress, k3s.DownloadedScript)); err != nil {
-				zot <- fmt.Errorf("installing zot: %w", err)
+	started := false
+	step := func(s orchestrator.Step) {
+		switch s {
+		case orchestrator.Installing:
+			if node.ControlPlane {
+				say(env, "Installing k3s and zot...")
+			} else {
+				say(env, "Installing k3s...")
+			}
+		case orchestrator.Starting:
+			if !node.ControlPlane {
 				return
 			}
-			zot <- nil
-		}()
-	} else {
-		say(env, "Installing k3s...")
-		zot <- nil
-	}
-	if _, err = runStoppable(ctx, host, script); err != nil {
-		err = fmt.Errorf("installing k3s: %w", err)
-	}
-	if err := errors.Join(err, <-zot); err != nil {
-		return err
-	}
-	say(env, "Waiting for %s to be Ready...", node.Name)
-	wait := k3s.WaitReadyScript(node.Name, node.PrivateAddress)
-	if role.ControlPlane {
-		if _, err = runStoppable(ctx, host, wait); err != nil {
-			return err
+			started = true
+			go func() {
+				_, err := runStoppable(ctx, host, registry.ZotScript(node.Architecture, node.PrivateAddress))
+				if err != nil {
+					err = fmt.Errorf("installing zot: %w", err)
+					cancel(err)
+				}
+				zot <- err
+			}()
+		case orchestrator.WaitingForNode:
+			say(env, "Waiting for %s to be Ready...", node.Name)
+		case orchestrator.Uninstalling:
+			*uninstalling = true
+			say(env, "Uninstalling...")
 		}
-		return installConsole(ctx, env, host, node, console)
 	}
-	// The wait for Ready ends the wait for the start, whose failure ends
-	// both.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	started, ready := make(chan error, 1), make(chan error, 1)
-	go func() {
-		_, err := runStoppable(ctx, host, k3s.StartScript)
-		started <- err
-	}()
-	go func() {
-		_, err := runStoppable(ctx, cpClient, wait)
-		ready <- err
-	}()
-	select {
-	case err := <-ready:
-		return err
-	case err := <-started:
-		if err != nil {
-			cancel()
-			<-ready
-			return fmt.Errorf("starting k3s: %w", err)
+	err = orch.AddNode(ctx, orchestratorHost{host}, modelNode(node), step)
+	added = err == nil
+	if started {
+		if zerr := <-zot; zerr != nil && !errors.Is(err, zerr) {
+			err = errors.Join(err, zerr)
 		}
-		return <-ready
 	}
+	return added, err
 }
+
+// consoleRepository is the console's repository in the cluster's
+// registry, under a name no app can have.
+const consoleRepository = "kube-system/console"
 
 // installConsole pushes the console's image, the archive at console, to
 // the registry on node, the control plane, at host, and runs it.
-func installConsole(ctx context.Context, env Env, host remote, node clusterdir.Node, console string) error {
+func installConsole(ctx context.Context, env Env, orch orchestrator.Orchestrator, host remote, node clusterdir.Node, console string) error {
 	say(env, "Installing the console...")
-	digest, err := registry.Push(ctx, map[string]string{node.Architecture: console}, registryAddr(node), k3s.ConsoleRepository, host.DialTCP, nil)
+	digest, err := registry.Push(ctx, map[string]string{node.Architecture: console}, registryAddr(node), consoleRepository, host.DialTCP, nil)
 	if err != nil {
 		return fmt.Errorf("the console's image: %w", err)
 	}
-	return runConsole(ctx, host, node, digest)
+	return runConsole(ctx, orch, host, node, digest)
 }
 
-// runConsole has k3s on node, the control plane, at host, apply the
-// console's objects with its image of digest, which is in the node's
-// registry, and waits for the console to run it and be ready. It then
-// marks the image as the one that runs.
-func runConsole(ctx context.Context, host remote, node clusterdir.Node, digest string) error {
+// runConsole has the orchestrator run the console from its image of
+// digest, which is in the registry on node, the control plane, at host,
+// on the node's addresses. It then marks the image as the one that
+// runs.
+func runConsole(ctx context.Context, orch orchestrator.Orchestrator, host remote, node clusterdir.Node, digest string) error {
 	addresses := []netip.Addr{node.PrivateAddress}
 	if node.PublicAddress.IsValid() {
 		addresses = []netip.Addr{node.PublicAddress, node.PrivateAddress}
 	}
-	if err := upload(ctx, host, k3s.AutoDeployFile("console"), k3s.Console(registry.Image(k3s.ConsoleRepository, digest), addresses), 0o600); err != nil {
-		return fmt.Errorf("writing the console's objects: %w", err)
+	if err := orch.RunConsole(ctx, registry.Image(consoleRepository, digest), addresses); err != nil {
+		return err
 	}
-	for deadline := time.Now().Add(consoleAppliedTimeout); ; {
-		image, err := run(ctx, host, k3s.ConsoleImageScript, "")
-		if err == nil && strings.TrimSpace(image) == registry.Image(k3s.ConsoleRepository, digest) {
-			break
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("the console's objects weren't applied: %w", cmp.Or(err, fmt.Errorf("the console runs %s", strings.TrimSpace(image))))
-		}
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		case <-time.After(2 * time.Second):
-		}
-	}
-	if _, err := runStoppable(ctx, host, k3s.ConsoleReadyScript); err != nil {
-		return fmt.Errorf("the console isn't ready: %w", err)
-	}
-	if err := registry.Tag(ctx, registryAddr(node), k3s.ConsoleRepository, digest, registry.LiveTag, host.DialTCP); err != nil {
+	if err := registry.Tag(ctx, registryAddr(node), consoleRepository, digest, registry.LiveTag, host.DialTCP); err != nil {
 		return fmt.Errorf("the console's image: %w", err)
 	}
 	return nil
 }
-
-// consoleAppliedTimeout is how long k3s gets to apply the console's
-// objects.
-const consoleAppliedTimeout = 2 * time.Minute
 
 // nodeRemove is mooctl cluster node-remove.
 func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {
@@ -456,12 +414,13 @@ func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {
 	}
 	n, inDir := findNode(nodes, name)
 	lastControlPlane := inDir && n.ControlPlane && len(nodes) == 1
-	known, err := kubeNodeNames(ctx, cpClient)
+	orch := orchestratorOf(env, d.Cluster, cp.PrivateAddress, cpClient)
+	known, err := clusterNodeNames(ctx, orch)
 	if err != nil && !lastControlPlane {
 		return err
 	}
-	inKube := slices.Contains(known, name)
-	if !inDir && !inKube {
+	onCluster := slices.Contains(known, name)
+	if !inDir && !onCluster {
 		return fmt.Errorf("the cluster has no node %s", name)
 	}
 	if lastControlPlane && !cmd.Bool("yes") {
@@ -487,7 +446,7 @@ func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {
 			return fmt.Errorf("%s is the control plane, which goes last; remove %s first", name, strings.Join(others, ", "))
 		}
 		say(env, "Uninstalling...")
-		if _, err := run(ctx, cpClient, uninstallScript(k3s.ControlPlane), ""); err != nil {
+		if err := uninstall(ctx, orch, cpClient, n); err != nil {
 			return fmt.Errorf("uninstalling from %s: %w; run node-remove again", name, err)
 		}
 		recordOn = nil
@@ -503,23 +462,29 @@ func nodeRemove(ctx context.Context, env Env, cmd *cli.Command) error {
 				defer host.Close()
 			}
 		}
-		// A node whose host can't be reached isn't drained: its pods go
-		// with its Node.
-		if inKube && (host != nil || !inDir) {
-			if err := drain(ctx, env, cpClient, name, cmd.Bool("lose-volumes")); err != nil {
-				return err
-			}
-		}
+		var on orchestrator.Host
 		if host != nil {
-			say(env, "Uninstalling...")
-			if _, err := run(ctx, host, uninstallScript(k3s.Agent), ""); err != nil {
-				return fmt.Errorf("uninstalling from %s: %w; run node-remove again", name, err)
+			on = orchestratorHost{host}
+		}
+		var last orchestrator.Step
+		step := func(s orchestrator.Step) {
+			last = s
+			switch s {
+			case orchestrator.Draining:
+				say(env, "Draining %s...", name)
+			case orchestrator.Uninstalling:
+				say(env, "Uninstalling...")
 			}
 		}
-		if inKube {
-			if _, err := run(ctx, cpClient, "k3s kubectl delete node "+sshclient.ShellQuote(name)+" --ignore-not-found --request-timeout=60s", ""); err != nil {
-				return fmt.Errorf("deleting node %s: %w", name, err)
-			}
+		err := orch.RemoveNode(ctx, name, on, orchestrator.RemoveOptions{LoseVolumes: cmd.Bool("lose-volumes"), Unreachable: inDir && host == nil}, step)
+		var held *orchestrator.VolumesError
+		switch {
+		case errors.As(err, &held):
+			return fmt.Errorf("%w; pass --lose-volumes to remove it anyway", err)
+		case err != nil && last == orchestrator.Uninstalling:
+			return fmt.Errorf("%w; run node-remove again", err)
+		case err != nil:
+			return err
 		}
 		switch {
 		case inDir && host == nil:
@@ -547,37 +512,6 @@ func findNode(nodes []clusterdir.Node, name string) (clusterdir.Node, bool) {
 		return clusterdir.Node{}, false
 	}
 	return nodes[i], true
-}
-
-// drain drains the Kubernetes node called name on the control plane cp,
-// refusing, unless loseVolumes, a node that holds local volumes.
-func drain(ctx context.Context, env Env, cp remote, name string, loseVolumes bool) error {
-	q := sshclient.ShellQuote(name)
-	if !loseVolumes {
-		out, err := run(ctx, cp, `k3s kubectl get pv --request-timeout=30s -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeAffinity.required.nodeSelectorTerms[*].matchExpressions[*].values[*]}{"\n"}{end}'`, "")
-		if err != nil {
-			return fmt.Errorf("listing volumes: %w", err)
-		}
-		var held []string
-		for _, line := range strings.Split(out, "\n") {
-			if f := strings.Fields(line); len(f) > 1 && slices.Contains(f[1:], name) {
-				held = append(held, f[0])
-			}
-		}
-		if len(held) > 0 {
-			return fmt.Errorf("%s holds the volumes %s, which go with it; pass --lose-volumes to remove it anyway", name, strings.Join(held, ", "))
-		}
-	}
-	say(env, "Draining %s...", name)
-	if _, err := run(ctx, cp, "k3s kubectl drain "+q+" --ignore-daemonsets --delete-emptydir-data --timeout=180s", ""); err != nil {
-		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), uncordonTimeout)
-		defer cancel()
-		if _, uerr := run(uctx, cp, "k3s kubectl uncordon "+q+" --request-timeout=20s", ""); uerr != nil {
-			err = errors.Join(err, fmt.Errorf("uncordoning %s: %w", name, uerr))
-		}
-		return fmt.Errorf("draining %s: %w", name, err)
-	}
-	return nil
 }
 
 // lastNode is the refusal to remove the cluster's last node, name,
@@ -619,7 +553,7 @@ func removeWithoutControlPlane(ctx context.Context, env Env, d *clusterdir.Dir, 
 	say(env, "Removing %s from %s", name, d.Cluster.Ref)
 	if host, err := dialNode(ctx, env, n); err == nil {
 		say(env, "Uninstalling...")
-		_, err = run(ctx, host, uninstallScript(k3s.RoleOf(n.ControlPlane)), "")
+		err = uninstall(ctx, orchestratorOf(env, d.Cluster, cp.PrivateAddress, nil), host, n)
 		host.Close()
 		if err != nil {
 			return fmt.Errorf("uninstalling from %s: %w; run node-remove again", name, err)

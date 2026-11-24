@@ -1,0 +1,27 @@
+==> /etc/rancher/k3s/config.yaml <==
+flannel-iface: eth1
+node-ip: 10.0.0.4
+node-name: node3
+server: https://10.0.0.2:6443
+token: the-token
+
+==> /etc/rancher/k3s/registries.yaml <==
+mirrors:
+    registry.test:
+        endpoint:
+            - http://10.0.0.2:5001
+
+==> /etc/systemd/system/k3s-agent.service.d/memory.conf <==
+[Service]
+Environment=GOMEMLIMIT=1600MiB
+
+==> /var/lib/rancher/k3s/agent/etc/kubelet.conf.d/10-moostack.conf <==
+apiVersion: kubelet.config.k8s.io/v1beta1
+evictionHard:
+    memory.available: 800Mi
+kind: KubeletConfiguration
+kubeReserved:
+    memory: 250Mi
+systemReserved:
+    memory: 200Mi
+

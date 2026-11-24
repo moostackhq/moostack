@@ -2,9 +2,11 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -377,5 +379,35 @@ func TestClusterRemoveRefusesACommitTheDirectoryLacks(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); err != nil {
 		t.Errorf("the directory: %v", err)
+	}
+}
+
+func TestAClusterRemovalWhoseUninstallFailsKeepsTheDirectory(t *testing.T) {
+	c, home := fakeProd(t)
+	mustRun(t, c, home, "cluster", "node-add", "root@h1")
+	mustRun(t, c, home, "cluster", "node-add", "root@h2")
+	dir := prodDir(t, home).Path
+	c.orch.onUninstall = func(target string) error {
+		if target == "root@h1" {
+			return errors.New("exit 3")
+		}
+		return nil
+	}
+	out, err := typing(t, c, home, []string{"prod"}, "cluster", "remove", "prod")
+	if err == nil || err.Error() != "uninstalling from node1: exit 3; run cluster remove again" {
+		t.Fatalf("remove = %v\n%s", err, out)
+	}
+	if _, err := os.Stat(dir); err != nil || c.hosts["root@h2"].k3s {
+		t.Errorf("the cluster directory: %v; k3s on h2, which came first: %t", err, c.hosts["root@h2"].k3s)
+	}
+	if got := c.orch.made("Uninstall"); !slices.Equal(got, []string{"Uninstall node2", "Uninstall node1"}) {
+		t.Errorf("the orchestrator was asked for %q, want node2's uninstall, then the control plane's", got)
+	}
+	c.orch.onUninstall = nil
+	if out, err := typing(t, c, home, []string{"prod"}, "cluster", "remove", "prod"); err != nil {
+		t.Fatalf("remove again = %v\n%s", err, out)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) || left(c.hosts["root@h1"]) != "" {
+		t.Errorf("run again, the cluster directory: %v, and h1 still has %q", err, left(c.hosts["root@h1"]))
 	}
 }

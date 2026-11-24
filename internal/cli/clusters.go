@@ -15,7 +15,6 @@ import (
 
 	"github.com/moostackhq/moostack/internal/clusterdir"
 	"github.com/moostackhq/moostack/internal/interrupt"
-	"github.com/moostackhq/moostack/internal/k3s"
 )
 
 // clusterList is mooctl cluster list.
@@ -199,13 +198,14 @@ func clusterRemove(ctx context.Context, env Env, cmd *cli.Command) error {
 		return fmt.Errorf("that isn't %s; nothing was removed", ref)
 	}
 
+	orch := orchestratorOf(env, d.Cluster, cp.PrivateAddress, conns[cp.Name])
 	for _, n := range ordered {
 		c, ok := conns[n.Name]
 		if !ok {
 			continue
 		}
 		say(env, "Uninstalling k3s from %s...", n.Name)
-		if _, err := run(ctx, c, uninstallScript(k3s.RoleOf(n.ControlPlane)), ""); err != nil {
+		if err := uninstall(ctx, orch, c, n); err != nil {
 			return fmt.Errorf("uninstalling from %s: %w; run cluster remove again", n.Name, err)
 		}
 	}

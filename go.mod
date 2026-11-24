@@ -6,6 +6,7 @@ require (
 	filippo.io/age v1.3.2
 	github.com/go-logr/logr v1.4.3
 	github.com/google/go-containerregistry v0.22.1
+	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/urfave/cli/v3 v3.14.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sys v0.49.0

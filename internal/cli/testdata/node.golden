@@ -1,0 +1,54 @@
+$ mooctl cluster node-add root@h1
+Adding node1 to prod (control plane, amd64, 1974 MiB, 10.0.0.2)
+Downloading the console...
+Installing k3s and zot...
+Waiting for node1 to be Ready...
+Installing the console...
+Added node1 to prod
+$ mooctl cluster node-add root@h2
+Adding node2 to prod (node, amd64, 1974 MiB, 10.0.0.3)
+Installing k3s...
+Waiting for node2 to be Ready...
+Added node2 to prod
+$ mooctl cluster node-add --name db root@h3
+Adding db to prod (node, arm64, 1974 MiB, 10.0.0.4)
+Installing k3s...
+Waiting for db to be Ready...
+Added db to prod
+Warning: db is the cluster's first arm64 node; deploy its built apps again to run them there.
+$ mooctl cluster node-add root@h4
+Adding node3 to prod (node, amd64, 1974 MiB, 10.0.0.5)
+Installing k3s...
+Uninstalling...
+error: installing k3s: exit 1: install failed
+$ mooctl cluster node-add --name db root@h4
+error: the cluster has a node db already; choose another name with --name
+$ mooctl cluster node-remove node1
+Removing node1 from prod
+error: node1 is the control plane, which goes last; remove db, node2 first
+$ mooctl cluster node-remove node2
+Removing node2 from prod
+Draining node2...
+Uninstalling...
+Removed node2 from prod
+$ mooctl cluster node-remove stray
+Removing stray from prod
+Draining stray...
+Warning: if k3s still runs on stray's host, it registers again: run k3s-agent-uninstall.sh there.
+Removed stray from prod
+$ mooctl cluster node-remove db
+Removing db from prod
+error: db: connecting to root@h3: no route to host
+Pass --unreachable to remove it from the cluster anyway, leaving k3s on it.
+$ mooctl cluster node-remove --unreachable db
+Removing db from prod
+Warning: db can't be reached; if k3s still runs there, it registers again: run k3s-agent-uninstall.sh on it.
+Removed db from prod
+$ mooctl cluster node-remove absent
+error: the cluster has no node absent
+$ mooctl cluster node-remove node1
+error: node1 is the cluster's last node: removing it removes the cluster's k3s and everything running on it; pass --yes to remove it
+$ mooctl cluster node-remove --yes node1
+Removing node1 from prod
+Uninstalling...
+Removed node1 from prod

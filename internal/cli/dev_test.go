@@ -16,7 +16,6 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
 
-	"github.com/moostackhq/moostack/internal/k3s"
 	"github.com/moostackhq/moostack/internal/registry"
 )
 
@@ -76,7 +75,11 @@ func TestDevConsoleDeployRunsTheCheckoutsConsoleOnTheCluster(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	defer syscall.Umask(syscall.Umask(0o077))
 
+	hosts := c.orch.hosts
 	out := mustRun(t, c, home, "dev", "console", "deploy", checkout)
+	if got := c.orch.hosts - hosts; got < 1 {
+		t.Errorf("dev console deploy built %d orchestrators through the control plane, want one at least", got)
+	}
 	for _, want := range []string{"Deploying the console of " + checkout + " to prod\n", "Compiling the console for linux/amd64...", "Deployed the console to prod\nImage: moostack.local/kube-system/console@sha256:"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the output lacks %q:\n%s", want, out)
@@ -90,15 +93,11 @@ func TestDevConsoleDeployRunsTheCheckoutsConsoleOnTheCluster(t *testing.T) {
 	if !slices.Contains(tags, digest) || !slices.Contains(tags, registry.LiveTag) {
 		t.Errorf("the registry's tags are %q, want %s among them", tags, digest)
 	}
-	objects := c.hosts["root@h1"].files[k3s.AutoDeployFile("console")]
-	if !strings.Contains(objects, "image: "+registry.Image(k3s.ConsoleRepository, digest)+"\n") {
-		t.Errorf("the console's objects don't run the new image:\n%s", objects)
+	if want := registry.Image(consoleRepository, digest); c.consoleRuns != want || !slices.Equal(c.consoleAt, []string{"192.0.2.10", "10.0.0.2"}) {
+		t.Errorf("the console runs from %s on %q, want %s on the node's addresses", c.consoleRuns, c.consoleAt, want)
 	}
 	if mode := consoleFileMode(t, c, digest); mode != 0o755 {
 		t.Errorf("the console in the image has the mode %o, want 755, which the image's user can run", mode)
-	}
-	if c.consoleSeen != registry.Image(k3s.ConsoleRepository, digest) {
-		t.Errorf("deploy ended when it had seen the console run %s", c.consoleSeen)
 	}
 	if left, _ := filepath.Glob(filepath.Join(os.Getenv("TMPDIR"), "mooctl-*")); len(left) != 0 {
 		t.Errorf("the build was left in %v", left)
@@ -109,7 +108,7 @@ func TestDevConsoleDeployRunsTheCheckoutsConsoleOnTheCluster(t *testing.T) {
 // amd64 of the index digest in the cluster's registry.
 func consoleFileMode(t *testing.T, c *fakeCluster, digest string) int64 {
 	t.Helper()
-	repo, err := name.NewRepository(c.registry+"/"+k3s.ConsoleRepository, name.Insecure)
+	repo, err := name.NewRepository(c.registry+"/"+consoleRepository, name.Insecure)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +200,7 @@ func TestADevConsoleThatDoesntGetReadyLeavesTheOneThatRunsMarked(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "the console isn't ready") {
 		t.Fatalf("deploy of a console that doesn't get ready: %v\n%s", err, out)
 	}
-	repo, _ := name.NewRepository(c.registry+"/"+k3s.ConsoleRepository, name.Insecure)
+	repo, _ := name.NewRepository(c.registry+"/"+consoleRepository, name.Insecure)
 	live, err := ggcrremote.Head(repo.Tag(registry.LiveTag))
 	if err != nil {
 		t.Fatal(err)

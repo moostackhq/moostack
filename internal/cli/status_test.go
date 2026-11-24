@@ -79,9 +79,8 @@ func TestStatusListsEachKindOfDrift(t *testing.T) {
 	mustRun(t, c, home, "cluster", "node-add", "root@h2")
 	mustRun(t, c, home, "cluster", "node-add", "root@h3")
 	c.nodes["stray"] = fakeKubeNode{ip: "10.0.0.9", arch: "amd64"}
-	c.nodes["node2"] = fakeKubeNode{ip: "10.0.0.8", arch: "arm64"}
+	c.nodes["node2"] = fakeKubeNode{ip: "10.0.0.8", arch: "arm64", controlPlane: true}
 	delete(c.nodes, "node3")
-	c.hosts["root@h2"].server = true
 	c.hosts["root@h1"].files[AppliedCommitFile] = strings.Repeat("ab", 20) + "\n"
 	cluster := filepath.Join(prodDir(t, home).Path, "cluster.yml")
 	data, err := os.ReadFile(cluster)

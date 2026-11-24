@@ -100,7 +100,7 @@ func TestDeployRefusesWhatTheOrchestratorCantRunBeforeAnythingElse(t *testing.T)
 	os.WriteFile(filepath.Join(app, "deploy.yaml"), []byte("cluster: prod\nname: web\ncontainers: {web: {build: {dockerfile: .}, port: 80}}\nsecrets: [NOT_IN_THE_STORE]\n"), 0o644)
 	t.Chdir(app)
 	c.orch.Fail("Check", errors.New(`name: "web" is a name the cluster keeps`))
-	before := len(c.runs)
+	before, setup := len(c.runs), len(c.orch.made(""))
 	var out strings.Builder
 	env := fakeEnvFor(c, home, nil)
 	env.Stdout, env.Stderr, env.Docker = &out, &out, docker
@@ -117,7 +117,7 @@ func TestDeployRefusesWhatTheOrchestratorCantRunBeforeAnythingElse(t *testing.T)
 	if _, err := os.Stat(filepath.Join(dir, "builds")); err == nil {
 		t.Error("a refused deploy built an image")
 	}
-	if calls := c.orch.made(""); !slices.Equal(calls, []string{"Check web"}) {
+	if calls := c.orch.made("")[setup:]; !slices.Equal(calls, []string{"Check web"}) {
 		t.Errorf("the calls to the orchestrator were %q, want Check alone", calls)
 	}
 }
@@ -204,6 +204,7 @@ secrets: [GREETING]
 	t.Chdir(app)
 	c.unissued = "api-tls"
 	c.servicesDown, c.servicesComeUp = true, true
+	setup := len(c.orch.made(""))
 
 	var stdout, stderr bytes.Buffer
 	env := fakeEnvFor(c, home, nil)
@@ -244,7 +245,7 @@ secrets: [GREETING]
 	if got := c.orch.deployed["shop"]; !reflect.DeepEqual(got, want) {
 		t.Errorf("the app deployed was\n%+v, want\n%+v", got, want)
 	}
-	if calls, want := c.orch.made(""), []string{"Check shop", "Nodes", "Deploy shop", "Certificate shop api", "Certificate shop web"}; !slices.Equal(calls, want) {
+	if calls, want := c.orch.made("")[setup:], []string{"Check shop", "Nodes", "Deploy shop", "Certificate shop api", "Certificate shop web"}; !slices.Equal(calls, want) {
 		t.Errorf("the calls to the orchestrator were %q, want %q", calls, want)
 	}
 	if c.orch.hosts != 1 {

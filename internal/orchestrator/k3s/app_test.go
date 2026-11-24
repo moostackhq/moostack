@@ -189,7 +189,7 @@ func TestCheckRefusesWhatTheClusterCantRun(t *testing.T) {
 	} {
 		// Check runs no command and connects to nothing.
 		done := make(chan error, 1)
-		go func() { done <- k3s.Through(nil).Check(c.app) }()
+		go func() { done <- k3s.Through(nil, k3s.Cluster{}).Check(c.app) }()
 		var err error
 		select {
 		case err = <-done:
