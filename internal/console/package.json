@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "scripts": {
+    "build": "tailwindcss --input static/tailwind.css --output static/style.css --minify"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "4.3.5",
+    "daisyui": "5.8.2",
+    "tailwindcss": "4.3.5"
+  }
+}

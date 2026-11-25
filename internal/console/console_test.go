@@ -262,7 +262,7 @@ func TestEveryRouteForbidsFramingAndOtherOrigins(t *testing.T) {
 	} {
 		for _, cookie := range []*http.Cookie{nil, session} {
 			res, _ := send(t, c, request[0], request[1], cookie, nil)
-			if got := res.Header.Get("Content-Security-Policy"); got != "default-src 'self'; form-action 'self'; frame-ancestors 'none'" {
+			if got := res.Header.Get("Content-Security-Policy"); got != "default-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'" {
 				t.Errorf("%s %s: Content-Security-Policy %q", request[0], request[1], got)
 			}
 			if got := res.Header.Get("X-Content-Type-Options"); got != "nosniff" {

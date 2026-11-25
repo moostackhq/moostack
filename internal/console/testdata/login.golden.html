@@ -6,15 +6,15 @@
 <title>Console</title>
 <link rel="stylesheet" href="/console/static/style.css">
 </head>
-<body>
-<header>
-<h1>Console</h1>
+<body class="mx-auto max-w-5xl p-4">
+<header class="flex items-center justify-between">
+<h1 class="text-xl font-bold">Console</h1>
 </header>
 <main>
-<form method="post" action="/console/login" class="login">
+<form method="post" action="/console/login" class="mt-4 flex flex-wrap items-center gap-2">
 <label for="token">Token</label>
-<input id="token" name="token" type="password" autocomplete="off" required autofocus>
-<button>Log in</button>
+<input class="input" id="token" name="token" type="password" autocomplete="off" required autofocus>
+<button class="btn btn-primary">Log in</button>
 </form>
 </main>
 </body>

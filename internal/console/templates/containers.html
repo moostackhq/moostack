@@ -1,23 +1,23 @@
 <!doctype html>
 <html lang="en">
 {{template "head"}}
-<body>
-<header>
-<h1>Console</h1>
+<body class="mx-auto max-w-5xl p-4">
+<header class="flex items-center justify-between">
+<h1 class="text-xl font-bold">Console</h1>
 <form method="post" action="/console/logout">
-<button>Log out</button>
+<button class="btn btn-sm">Log out</button>
 </form>
 </header>
-<main>
+<main class="[&_h2]:mt-8 [&_h2]:font-bold [&_section]:overflow-x-auto">
 {{- if .Problem}}
-<p class="problem">{{.Problem}}</p>
+<p class="alert alert-error mt-4">{{.Problem}}</p>
 {{- else if not .Groups}}
-<p class="empty">No running containers.</p>
+<p class="mt-4 opacity-60">No running containers.</p>
 {{- end}}
 {{- range .Groups}}
 <section>
 <h2>{{if .App}}{{.App}}{{else}}The cluster's own{{end}}</h2>
-<table>
+<table class="table table-sm">
 <thead>
 <tr><th>Replica</th><th>Container</th><th>Image</th></tr>
 </thead>

@@ -14,6 +14,8 @@ import (
 	"github.com/moostackhq/moostack/internal/orchestrator"
 )
 
+//go:generate npm ci
+//go:generate npm run build
 //go:embed templates static
 var files embed.FS
 
@@ -25,7 +27,7 @@ type Console struct {
 	tokens       *tokens
 	sessions     *sessions
 	mux          *http.ServeMux
-	sameOrigin http.Handler
+	sameOrigin   http.Handler
 }
 
 func New(o orchestrator.Orchestrator) *Console {
@@ -41,7 +43,7 @@ func New(o orchestrator.Orchestrator) *Console {
 }
 
 func (c *Console) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; form-action 'self'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	c.sameOrigin.ServeHTTP(w, r)
 }

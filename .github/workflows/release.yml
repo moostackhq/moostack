@@ -23,6 +23,8 @@ jobs:
 
       - name: Test
         run: |
+          go generate ./internal/console
+          git diff --exit-code internal/console/static
           docker run --privileged --rm tonistiigi/binfmt --install arm64
           go vet ./...
           go test -timeout 30m ./...
