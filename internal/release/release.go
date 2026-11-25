@@ -13,8 +13,17 @@ import (
 	"strings"
 )
 
-// URL is where the files of the release built from main are.
-const URL = "https://github.com/moostackhq/moostack/releases/download/edge"
+// releases is where Moostack's releases are, each under its tag.
+const releases = "https://github.com/moostackhq/moostack/releases/download"
+
+// URL is where the files of the release built from commit are, and
+// without a commit those of the newest release built from main.
+func URL(commit string) string {
+	if commit == "" {
+		return releases + "/edge"
+	}
+	return releases + "/edge-" + commit
+}
 
 // Fetch downloads the file name of the release at url into dir, checks
 // it against the release's sha256sums.txt, and returns its path. A file

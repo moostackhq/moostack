@@ -166,7 +166,7 @@ func nodeAdd(ctx context.Context, env Env, cmd *cli.Command) error {
 		}
 		defer os.RemoveAll(dir)
 		client := &http.Client{Timeout: 10 * time.Minute}
-		if console, err = release.Fetch(ctx, client, cmp.Or(env.Release, release.URL), "console-linux-"+node.Architecture+".tar", dir); err != nil {
+		if console, err = release.Fetch(ctx, client, cmp.Or(env.Release, release.URL(commit)), "console-linux-"+node.Architecture+".tar", dir); err != nil {
 			return err
 		}
 	}

@@ -94,8 +94,13 @@ func TestAFileThatIsntTheReleasesIsRefusedAndNotKept(t *testing.T) {
 	}
 }
 
-func TestTheReleaseIsMoostacksEdgeRelease(t *testing.T) {
-	if release.URL != "https://github.com/moostackhq/moostack/releases/download/edge" {
-		t.Errorf("URL is %s", release.URL)
+func TestTheReleaseIsTheOneBuiltFromTheCommit(t *testing.T) {
+	for commit, want := range map[string]string{
+		"": "https://github.com/moostackhq/moostack/releases/download/edge",
+		"861df463416c35c9042a9df97e5ba73b942469bb": "https://github.com/moostackhq/moostack/releases/download/edge-861df463416c35c9042a9df97e5ba73b942469bb",
+	} {
+		if got := release.URL(commit); got != want {
+			t.Errorf("URL(%q) is %s, want %s", commit, got, want)
+		}
 	}
 }

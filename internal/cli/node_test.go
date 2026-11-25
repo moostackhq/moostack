@@ -4,7 +4,10 @@ import (
 	"context"
 	"maps"
 	"net"
+	"net/http"
 	"net/netip"
+	"net/url"
+	"path"
 	"slices"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -534,6 +537,64 @@ func TestTheConsoleOfTheControlPlanesArchitectureIsInstalled(t *testing.T) {
 	}
 }
 
+type roundTrip func(*http.Request) (*http.Response, error)
+
+func (f roundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestNodeAddDownloadsTheConsoleOfTheReleaseBuiltFromMooctlsCommit(t *testing.T) {
+	const github = "https://github.com/moostackhq/moostack/releases/download/"
+	const built = "861df463416c35c9042a9df97e5ba73b942469bb"
+	files := func(release string) []string {
+		return []string{github + release + "/sha256sums.txt", github + release + "/console-linux-amd64.tar"}
+	}
+	for name, c := range map[string]struct {
+		commit string
+		set    bool
+		want   []string
+	}{
+		"built from a commit":                    {commit: built, want: files("edge-" + built)},
+		"built from none":                        {want: files("edge")},
+		"built from a commit, a release URL set": {commit: built, set: true},
+		"built from none, a release URL set":     {set: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake, home := fakeProd(t)
+			served, err := url.Parse(fake.release)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !c.set {
+				fake.release = ""
+			}
+			// Requests to GitHub are answered by the fake release.
+			var asked []string
+			transport := http.DefaultTransport
+			http.DefaultTransport = roundTrip(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Host != "github.com" {
+					return transport.RoundTrip(r)
+				}
+				asked = append(asked, r.URL.String())
+				r = r.Clone(r.Context())
+				r.URL.Scheme, r.URL.Host, r.URL.Path = served.Scheme, served.Host, served.Path+"/"+path.Base(r.URL.Path)
+				return transport.RoundTrip(r)
+			})
+			commit = c.commit
+			t.Cleanup(func() { http.DefaultTransport, commit = transport, "" })
+
+			mustRun(t, fake, home, "cluster", "node-add", "root@h1")
+			if !slices.Equal(asked, c.want) {
+				t.Errorf("node-add downloaded %v from GitHub, want %v", asked, c.want)
+			}
+			if got := fake.downloads.Load(); got != 2 {
+				t.Errorf("node-add downloaded %d files of the release, want 2", got)
+			}
+			if _, digest := consoleImage(t, fake, "amd64"); digest != fake.consoles["amd64"] {
+				t.Errorf("the registry's image is %q, the release's is %s", digest, fake.consoles["amd64"])
+			}
+		})
+	}
+}
+
 func TestAConsoleThatCantBeDownloadedRefusesTheNodeBeforeChangingIt(t *testing.T) {
 	c, home := fakeProd(t)
 	c.release += "/nothing"
@@ -643,7 +704,6 @@ func TestTheFirstNodeOfAnotherArchitectureWarnsOnlyIfTheClusterHasApps(t *testin
 	}
 }
 
-// Adding the control plane fails at each of its steps in turn.
 func TestAControlPlaneWhoseAddFailsAtAnyStepLeavesNothingOnTheHost(t *testing.T) {
 	for step, tc := range map[string]struct {
 		fail func(c *fakeCluster)

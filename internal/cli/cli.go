@@ -26,6 +26,10 @@ import (
 // K3sVersion is the k3s version a new cluster pins.
 const K3sVersion = "v1.37.2+k3s1"
 
+// commit is the commit mooctl was built from. The release build sets
+// it; any other build leaves it empty.
+var commit string
+
 // Env is what mooctl's commands take from the machine they run on.
 type Env struct {
 	// Home is the operator's home directory.
@@ -54,7 +58,8 @@ type Env struct {
 	// empty.
 	Root string
 	// Release is the URL of the release the console is downloaded from,
-	// MOOCTL_RELEASE_URL in the environment; release.URL if empty.
+	// MOOCTL_RELEASE_URL in the environment; release.URL of commit if
+	// empty.
 	Release string
 	// Connect connects to a node by its SSH target, trusting only
 	// hostKey, or, if hostKey is nil, the key the node offers, which it

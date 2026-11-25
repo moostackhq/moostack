@@ -38,7 +38,7 @@ jobs:
             os=${platform%/*}
             arch=${platform#*/}
             dir=$(mktemp -d)
-            GOOS=$os GOARCH=$arch go build -trimpath -ldflags=-s -tags release -o "$dir/mooctl" ./cmd/mooctl
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -X github.com/moostackhq/moostack/internal/cli.commit=$GITHUB_SHA" -tags release -o "$dir/mooctl" ./cmd/mooctl
             cp LICENSE "$dir/"
             tar -C "$dir" -czf "dist/mooctl-$os-$arch.tar.gz" mooctl LICENSE
           done
@@ -58,6 +58,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           notes="mooctl and console built from main at $GITHUB_SHA."
+          draft=$(gh release view "edge-$GITHUB_SHA" --json isDraft --jq .isDraft 2>/dev/null || true)
+          if [ "$draft" = true ]; then
+            gh release delete "edge-$GITHUB_SHA" --yes
+          fi
+          if [ "$draft" != false ]; then
+            gh release create "edge-$GITHUB_SHA" dist/* --prerelease --target "$GITHUB_SHA" --title "edge $GITHUB_SHA" --notes "$notes"
+          fi
           if gh release view edge >/dev/null 2>&1; then
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/edge" -f sha="$GITHUB_SHA" -F force=true
             gh release upload edge dist/* --clobber
