@@ -160,12 +160,14 @@ func toRun(app *deployfile.App, images, secrets map[string]string) model.App {
 	}
 	for _, c := range app.Containers {
 		run := model.Container{
-			Name:     c.Name,
-			Image:    cmp.Or(c.Image, images[c.Name]),
-			Command:  c.Command,
-			Port:     c.Port,
-			Host:     c.Host,
-			Replicas: c.Replicas,
+			Name:      c.Name,
+			Image:     cmp.Or(c.Image, images[c.Name]),
+			Command:   c.Command,
+			Port:      c.Port,
+			Host:      c.Host,
+			Replicas:  c.Replicas,
+			Rolling:   c.Rolling,
+			StopDelay: c.StopDelay,
 		}
 		if len(c.Env) > 0 {
 			run.Env = map[string]model.Value{}
@@ -173,7 +175,35 @@ func toRun(app *deployfile.App, images, secrets map[string]string) model.App {
 				run.Env[variable] = model.Value{Value: v.Value, Secret: v.Secret}
 			}
 		}
+		for _, v := range c.Volumes {
+			run.Volumes = append(run.Volumes, model.Volume{Name: v.Name, Path: v.Path})
+		}
+		if c.PreStart != nil {
+			run.PreStart = new(commandOf(*c.PreStart))
+		}
+		for _, cron := range c.Cron {
+			run.Cron = append(run.Cron, model.Cron{Name: cron.Name, Schedule: cron.Schedule, Command: commandOf(cron.Command)})
+		}
+		if c.Healthcheck != nil {
+			run.Healthcheck = &model.Healthcheck{Path: c.Healthcheck.Path, Command: c.Healthcheck.Command}
+		}
 		out.Containers = append(out.Containers, run)
+	}
+	return out
+}
+
+// commandOf is c as an orchestrator runs it, its user's IDs as numbers.
+func commandOf(c deployfile.Command) model.Command {
+	out := model.Command{Command: c.Command}
+	if c.User == "" {
+		return out
+	}
+	user, group, grouped := strings.Cut(c.User, ":")
+	out.User = &model.User{}
+	out.User.ID, _ = strconv.ParseInt(user, 10, 64)
+	if grouped {
+		id, _ := strconv.ParseInt(group, 10, 64)
+		out.User.Group = &id
 	}
 	return out
 }

@@ -23,6 +23,10 @@ import (
 // FileName is the deploy file's name in the app's directory.
 const FileName = "deploy.yaml"
 
+// defaultStopDelay is the seconds a replica of a container with a port
+// waits before it is stopped, if its file doesn't say.
+const defaultStopDelay = 5
+
 // Version is the latest version of the deploy file's format, which a
 // file that states none is read as.
 const Version = 1
@@ -68,6 +72,50 @@ type Container struct {
 	Replicas int
 	// Env are the container's environment values, by variable.
 	Env map[string]Value
+	// Volumes are the directories of the container that outlive its
+	// replicas, in the order of their names.
+	Volumes []Volume
+	// PreStart is the command that runs before each replica starts; nil
+	// if none does.
+	PreStart *Command
+	// Cron are the commands that run on a schedule, in the order of
+	// their names.
+	Cron []Cron
+	// Healthcheck is what must answer before a replica takes requests;
+	// nil if the file gives none.
+	Healthcheck *Healthcheck
+	// Rolling says a container with Volumes is rolled.
+	Rolling bool
+	// StopDelay is the seconds a replica waits before it is stopped.
+	StopDelay int
+}
+
+// Volume is a directory, at the absolute Path in its container, that
+// outlives the container's replicas.
+type Volume struct {
+	Name, Path string
+}
+
+// Command is a command to run, as User if it isn't empty: a user's ID,
+// or a user's and a group's with a colon between.
+type Command struct {
+	Command []string
+	User    string
+}
+
+// Cron is a command that runs on Schedule, a crontab expression of five
+// fields.
+type Cron struct {
+	Name     string
+	Schedule string
+	Command
+}
+
+// Healthcheck is a check of a replica: a GET of Path on its container's
+// port, or Command run in it. One is set.
+type Healthcheck struct {
+	Path    string
+	Command []string
 }
 
 // Value is an environment value: Value, or the secret called Secret, one
@@ -90,6 +138,12 @@ type build struct {
 	Railpack   string `yaml:"railpack"`
 }
 
+// command is a Command as YAML holds it.
+type command struct {
+	Command []string `yaml:"command"`
+	User    string   `yaml:"user"`
+}
+
 // file is a deploy file as YAML holds it.
 type file struct {
 	Version    yaml.Node `yaml:"version"`
@@ -103,6 +157,18 @@ type file struct {
 		Host     string               `yaml:"host"`
 		Replicas *int                 `yaml:"replicas"`
 		Env      map[string]yaml.Node `yaml:"env"`
+		Volumes  map[string]string    `yaml:"volumes"`
+		PreStart *command             `yaml:"pre_start"`
+		Cron     map[string]*struct {
+			Schedule string `yaml:"schedule"`
+			command  `yaml:",inline"`
+		} `yaml:"cron"`
+		Healthcheck *struct {
+			Path    string   `yaml:"path"`
+			Command []string `yaml:"command"`
+		} `yaml:"healthcheck"`
+		Rolling   *bool `yaml:"rolling"`
+		StopDelay *int  `yaml:"stop_delay"`
 	} `yaml:"containers"`
 	Manifests string    `yaml:"manifests"`
 	Chart     string    `yaml:"chart"`
@@ -113,6 +179,12 @@ type file struct {
 // variableName is what an environment variable's name, and so a
 // secret's, may be.
 var variableName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// userIDs is a user's ID, or a user's and a group's.
+var userIDs = regexp.MustCompile(`^[0-9]{1,9}(:[0-9]{1,9})?$`)
+
+// scheduleField is a field of a crontab expression.
+var scheduleField = regexp.MustCompile(`^[0-9A-Za-z*/,?-]+$`)
 
 // hostName is a DNS name of labels of 1 to 63 characters.
 var hostName = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -258,6 +330,12 @@ func parse(dir string, data []byte) (*App, error) {
 				{"host", c.Host != ""},
 				{"replicas", c.Replicas != nil},
 				{"env", c.Env != nil},
+				{"volumes", c.Volumes != nil},
+				{"pre_start", c.PreStart != nil},
+				{"cron", c.Cron != nil},
+				{"healthcheck", c.Healthcheck != nil},
+				{"rolling", c.Rolling != nil},
+				{"stop_delay", c.StopDelay != nil},
 			} {
 				if field.given {
 					return nil, fmt.Errorf("containers: %s: %s: a container beside manifests or a chart is only built", name, field.name)
@@ -314,6 +392,73 @@ func parse(dir string, data []byte) (*App, error) {
 		if out.Env, err = readEnv(c.Env, app.Secrets); err != nil {
 			return nil, fmt.Errorf("containers: %s: env: %w", name, err)
 		}
+		for _, volume := range slices.Sorted(maps.Keys(c.Volumes)) {
+			path := c.Volumes[volume]
+			if err := CheckName(volume); err != nil {
+				return nil, fmt.Errorf("containers: %s: volumes: %w", name, err)
+			}
+			if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
+				return nil, fmt.Errorf("containers: %s: volumes: %s: give the directory's absolute path in the container", name, volume)
+			}
+			if i := slices.IndexFunc(out.Volumes, func(v Volume) bool { return v.Path == path }); i >= 0 {
+				return nil, fmt.Errorf("containers: %s: volumes: %s: %s is %s's already", name, volume, path, out.Volumes[i].Name)
+			}
+			out.Volumes = append(out.Volumes, Volume{Name: volume, Path: path})
+		}
+		if len(out.Volumes) > 0 && out.Replicas > 1 {
+			return nil, fmt.Errorf("containers: %s: replicas: a container with volumes runs as one replica", name)
+		}
+		if c.Rolling != nil {
+			if len(out.Volumes) == 0 {
+				return nil, fmt.Errorf("containers: %s: rolling: only a container with volumes takes it", name)
+			}
+			out.Rolling = *c.Rolling
+		}
+		if c.PreStart != nil {
+			if out.PreStart, err = readCommand(*c.PreStart); err != nil {
+				return nil, fmt.Errorf("containers: %s: pre_start: %w", name, err)
+			}
+		}
+		for _, cron := range slices.Sorted(maps.Keys(c.Cron)) {
+			entry := c.Cron[cron]
+			if err := CheckName(cron); err != nil {
+				return nil, fmt.Errorf("containers: %s: cron: %w", name, err)
+			}
+			if entry == nil {
+				return nil, fmt.Errorf("containers: %s: cron: %s: give its schedule and its command", name, cron)
+			}
+			fields := strings.Fields(entry.Schedule)
+			if len(fields) != 5 || slices.ContainsFunc(fields, func(f string) bool { return !scheduleField.MatchString(f) }) {
+				return nil, fmt.Errorf("containers: %s: cron: %s: schedule: give a crontab expression of five fields, such as \"*/5 * * * *\"", name, cron)
+			}
+			run, err := readCommand(entry.command)
+			if err != nil {
+				return nil, fmt.Errorf("containers: %s: cron: %s: %w", name, cron, err)
+			}
+			out.Cron = append(out.Cron, Cron{Name: cron, Schedule: strings.Join(fields, " "), Command: *run})
+		}
+		if h := c.Healthcheck; h != nil {
+			switch {
+			case (h.Path == "") == (h.Command == nil):
+				return nil, fmt.Errorf("containers: %s: healthcheck: give one of path and command", name)
+			case h.Path != "" && !strings.HasPrefix(h.Path, "/"):
+				return nil, fmt.Errorf("containers: %s: healthcheck: path: %q doesn't start with a slash", name, h.Path)
+			case h.Path != "" && out.Port == 0:
+				return nil, fmt.Errorf("containers: %s: healthcheck: path: give the port the container serves HTTP on too", name)
+			case h.Command != nil && (len(h.Command) == 0 || h.Command[0] == ""):
+				return nil, fmt.Errorf("containers: %s: healthcheck: command: give the program to run, and its arguments", name)
+			}
+			out.Healthcheck = &Healthcheck{Path: h.Path, Command: h.Command}
+		}
+		if out.Port != 0 {
+			out.StopDelay = defaultStopDelay
+		}
+		if c.StopDelay != nil {
+			if *c.StopDelay < 0 {
+				return nil, fmt.Errorf("containers: %s: stop_delay: can't be negative", name)
+			}
+			out.StopDelay = *c.StopDelay
+		}
 		app.Containers = append(app.Containers, out)
 	}
 	switch {
@@ -334,6 +479,18 @@ func parse(dir string, data []byte) (*App, error) {
 		app.Chart = d
 	}
 	return app, nil
+}
+
+// readCommand is the command c: a program and its arguments, and a
+// user that is IDs if it is given.
+func readCommand(c command) (*Command, error) {
+	if len(c.Command) == 0 || c.Command[0] == "" {
+		return nil, errors.New("command: give the program to run, and its arguments")
+	}
+	if c.User != "" && !userIDs.MatchString(c.User) {
+		return nil, fmt.Errorf("user: %q isn't a user's ID, or a user's and a group's as in \"33:33\"", c.User)
+	}
+	return &Command{Command: c.Command, User: c.User}, nil
 }
 
 // readEnv is the environment values that env holds, each a scalar or

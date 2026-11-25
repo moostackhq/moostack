@@ -33,6 +33,8 @@ import (
 var imageVar = regexp.MustCompile(`\$\{image:([^}]*)\}`)
 
 const (
+	// claimKind is how the record names a PersistentVolumeClaim.
+	claimKind = "PersistentVolumeClaim"
 	// appLabel is the label that marks what is an app's with the app's
 	// name.
 	appLabel = "moostack.dev/app"
@@ -42,6 +44,19 @@ const (
 	// secretsAnnotation is the pod annotation that holds the hash of the
 	// secrets its container reads.
 	secretsAnnotation = "moostack.dev/secrets"
+	// preStart is the name of the init container that runs a
+	// container's command before the start.
+	preStart = "pre-start"
+	// cronLabel is the label that marks the pods of a container's
+	// scheduled command with the command's name.
+	cronLabel = "moostack.dev/cron"
+	// volumeRequest is the storage a volume's claim asks for.
+	volumeRequest = "1Gi"
+	// gracePeriod is the seconds a replica has to stop in, after its
+	// stop delay.
+	gracePeriod = 30
+	// maxCronJob is the longest name a CronJob can have.
+	maxCronJob = 52
 	// chartNamespace is where an app's HelmChart goes, for k3s's Helm
 	// controller.
 	chartNamespace = "kube-system"
@@ -67,6 +82,14 @@ func secretOf(app string) string { return app }
 // certificate of the container called container.
 func tlsSecret(container string) string { return container + "-tls" }
 
+// claimOf is the name of the PersistentVolumeClaim of the volume
+// called volume of the container called container.
+func claimOf(container, volume string) string { return container + "-" + volume }
+
+// cronJobOf is the name of the CronJob of the scheduled command called
+// cron of the container called container.
+func cronJobOf(container, cron string) string { return container + "-" + cron }
+
 // chartName is the name of the HelmChart of the app called app.
 func chartName(app string) string { return "app-" + app }
 
@@ -81,7 +104,11 @@ func chartJob(app string) string { return "helm-install-" + chartName(app) }
 // name, a container whose
 // certificate's Secret would be named as the app's, a container with
 // an environment value that isn't a variable's name or that names a
-// secret the app doesn't have, and an app whose manifests can't be read,
+// secret the app doesn't have, a volume or a scheduled command whose
+// name isn't a DNS label that starts with a letter, two whose objects
+// would be named alike, a container named preStart that has a command
+// before the start, a scheduled command whose CronJob's name would
+// be longer than maxCronJob, and an app whose manifests can't be read,
 // name an image the app doesn't have or checkApplied refuses, one whose
 // chart can't be packed, and one with no containers, manifests or chart.
 func (b *Backend) Check(app model.App) error {
@@ -102,7 +129,33 @@ func checkNames(app model.App) error {
 	if app.Chart != "" && len(app.Name) > maxChartApp {
 		return fmt.Errorf("name: %q is longer than %d characters, the most an app with a chart can have", app.Name, maxChartApp)
 	}
+	var claims, cronJobs []string
 	for i, c := range app.Containers {
+		for _, v := range c.Volumes {
+			if problems := validation.IsDNS1035Label(v.Name); len(problems) > 0 {
+				return fmt.Errorf("containers: %s: volumes: %q: %s", c.Name, v.Name, strings.Join(problems, "; "))
+			}
+			if slices.Contains(claims, claimOf(c.Name, v.Name)) {
+				return fmt.Errorf("containers: %s: volumes: %s: another volume is %s on the cluster too; rename one", c.Name, v.Name, claimOf(c.Name, v.Name))
+			}
+			claims = append(claims, claimOf(c.Name, v.Name))
+		}
+		for _, cron := range c.Cron {
+			name := cronJobOf(c.Name, cron.Name)
+			if problems := validation.IsDNS1035Label(cron.Name); len(problems) > 0 {
+				return fmt.Errorf("containers: %s: cron: %q: %s", c.Name, cron.Name, strings.Join(problems, "; "))
+			}
+			if len(name) > maxCronJob {
+				return fmt.Errorf("containers: %s: cron: %s: %s is longer than %d characters; shorten a name", c.Name, cron.Name, name, maxCronJob)
+			}
+			if slices.Contains(cronJobs, name) {
+				return fmt.Errorf("containers: %s: cron: %s: another scheduled command is %s on the cluster too; rename one", c.Name, cron.Name, name)
+			}
+			cronJobs = append(cronJobs, name)
+		}
+		if c.PreStart != nil && c.Name == preStart {
+			return fmt.Errorf("containers: %s: its command before the start is named so on the cluster; name the container otherwise", c.Name)
+		}
 		if slices.ContainsFunc(app.Containers[:i], func(other model.Container) bool { return other.Name == c.Name }) {
 			return fmt.Errorf("containers: %s is the name of two containers", c.Name)
 		}
@@ -236,46 +289,122 @@ func env(app model.App, c model.Container) []any {
 	return out
 }
 
-// containerObjects are the objects of the container c: its Deployment,
-// its Service if it has a port, and its Ingress if it has a host.
+// containerObjects are the objects of the container c: the
+// PersistentVolumeClaims of its volumes, its Deployment, the CronJobs
+// of its scheduled commands, its Service if it has a port, and its
+// Ingress if it has a host.
 func containerObjects(app model.App, c model.Container) []any {
 	labels := labels(app)
 	labels[containerLabel] = c.Name
-	meta := func() map[string]any {
-		return map[string]any{"name": c.Name, "namespace": namespaceOf(app.Name), "labels": labels}
+	named := func(name string) map[string]any {
+		return map[string]any{"name": name, "namespace": namespaceOf(app.Name), "labels": labels}
 	}
-	container := map[string]any{"name": c.Name, "image": c.Image}
+	meta := func() map[string]any { return named(c.Name) }
+	var docs, mounts, volumes []any
+	for _, v := range c.Volumes {
+		docs = append(docs, map[string]any{
+			"apiVersion": "v1",
+			"kind":       "PersistentVolumeClaim",
+			"metadata":   named(claimOf(c.Name, v.Name)),
+			"spec": map[string]any{
+				"accessModes": []string{"ReadWriteOnce"},
+				"resources":   map[string]any{"requests": map[string]any{"storage": volumeRequest}},
+			},
+		})
+		mounts = append(mounts, map[string]any{"name": v.Name, "mountPath": v.Path})
+		volumes = append(volumes, map[string]any{"name": v.Name, "persistentVolumeClaim": map[string]any{"claimName": claimOf(c.Name, v.Name)}})
+	}
+	// runs is a container of c's image, with its environment values and
+	// its volumes.
+	runs := func(name string) map[string]any {
+		out := map[string]any{"name": name, "image": c.Image}
+		if e := env(app, c); len(e) > 0 {
+			out["env"] = e
+		}
+		if len(mounts) > 0 {
+			out["volumeMounts"] = mounts
+		}
+		return out
+	}
+	// command is a container that runs run.
+	command := func(name string, run model.Command) map[string]any {
+		out := runs(name)
+		out["command"] = run.Command
+		if run.User != nil {
+			user := map[string]any{"runAsUser": run.User.ID}
+			if run.User.Group != nil {
+				user["runAsGroup"] = *run.User.Group
+			}
+			out["securityContext"] = user
+		}
+		return out
+	}
+	container := runs(c.Name)
 	if len(c.Command) > 0 {
 		container["command"] = c.Command
 	}
 	if c.Port != 0 {
 		container["ports"] = []any{map[string]any{"containerPort": c.Port}}
-		container["readinessProbe"] = map[string]any{
-			"tcpSocket":     map[string]any{"port": c.Port},
-			"periodSeconds": 2,
-		}
 	}
-	if e := env(app, c); len(e) > 0 {
-		container["env"] = e
+	if probe := readiness(c); probe != nil {
+		probe["periodSeconds"] = 2
+		container["readinessProbe"] = probe
+	}
+	pod := map[string]any{"containers": []any{container}}
+	if c.StopDelay > 0 {
+		container["lifecycle"] = map[string]any{"preStop": map[string]any{"sleep": map[string]any{"seconds": c.StopDelay}}}
+		pod["terminationGracePeriodSeconds"] = c.StopDelay + gracePeriod
+	}
+	if c.PreStart != nil {
+		pod["initContainers"] = []any{command(preStart, *c.PreStart)}
+	}
+	if len(volumes) > 0 {
+		pod["volumes"] = volumes
 	}
 	podMeta := map[string]any{"labels": labels}
 	if hash := secretsHash(app, c); hash != "" {
 		podMeta["annotations"] = map[string]string{secretsAnnotation: hash}
 	}
-	docs := []any{map[string]any{
+	strategy := map[string]any{"rollingUpdate": map[string]any{"maxUnavailable": 0, "maxSurge": 1}}
+	if len(c.Volumes) > 0 && !c.Rolling {
+		strategy = map[string]any{"type": "Recreate"}
+	}
+	docs = append(docs, map[string]any{
 		"apiVersion": "apps/v1",
 		"kind":       "Deployment",
 		"metadata":   meta(),
 		"spec": map[string]any{
 			"replicas": c.Replicas,
 			"selector": map[string]any{"matchLabels": labels},
-			"strategy": map[string]any{"rollingUpdate": map[string]any{"maxUnavailable": 0, "maxSurge": 1}},
+			"strategy": strategy,
 			"template": map[string]any{
 				"metadata": podMeta,
-				"spec":     map[string]any{"containers": []any{container}},
+				"spec":     pod,
 			},
 		},
-	}}
+	})
+	for _, cron := range c.Cron {
+		run := map[string]any{"restartPolicy": "Never", "containers": []any{command(cron.Name, cron.Command)}}
+		if len(volumes) > 0 {
+			run["volumes"] = volumes
+		}
+		ran := maps.Clone(labels)
+		delete(ran, containerLabel)
+		ran[cronLabel] = cron.Name
+		docs = append(docs, map[string]any{
+			"apiVersion": "batch/v1",
+			"kind":       "CronJob",
+			"metadata":   named(cronJobOf(c.Name, cron.Name)),
+			"spec": map[string]any{
+				"schedule":          cron.Schedule,
+				"concurrencyPolicy": "Forbid",
+				"jobTemplate": map[string]any{"spec": map[string]any{"template": map[string]any{
+					"metadata": map[string]any{"labels": ran},
+					"spec":     run,
+				}}},
+			},
+		})
+	}
 	if c.Port == 0 {
 		return docs
 	}
@@ -310,6 +439,26 @@ func containerObjects(app model.App, c model.Container) []any {
 			}},
 		},
 	})
+}
+
+// readiness is the check a replica of c passes before it takes
+// requests: its health check, or else its port accepting a connection,
+// and nil for a container with neither. A GET carries the container's
+// host as its Host header.
+func readiness(c model.Container) map[string]any {
+	switch h := c.Healthcheck; {
+	case h != nil && h.Path != "":
+		get := map[string]any{"path": h.Path, "port": c.Port}
+		if c.Host != "" {
+			get["httpHeaders"] = []any{map[string]any{"name": "Host", "value": c.Host}}
+		}
+		return map[string]any{"httpGet": get}
+	case h != nil:
+		return map[string]any{"exec": map[string]any{"command": h.Command}}
+	case c.Port != 0:
+		return map[string]any{"tcpSocket": map[string]any{"port": c.Port}}
+	}
+	return nil
 }
 
 // readManifests are the manifests in app's directory of them and its

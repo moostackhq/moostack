@@ -92,6 +92,104 @@ secrets: [GREETING, DB_URL]
 	}
 }
 
+// drupal is the deploy file of Drupal with MariaDB.
+const drupal = `version: 1
+name: drupal
+cluster: playground
+secrets:
+  - DB_PASSWORD
+  - HASH_SALT
+  - ADMIN_PASSWORD
+containers:
+  web:
+    build:
+      dockerfile: .
+    port: 80
+    host: &host drupal.example.com
+    rolling: true
+    healthcheck:
+      path: /user/login
+    env:
+      DRUPAL_HOST: *host
+      DB_PASSWORD: {secret: DB_PASSWORD}
+      HASH_SALT: {secret: HASH_SALT}
+      ADMIN_PASSWORD: {secret: ADMIN_PASSWORD}
+    volumes:
+      files: /opt/drupal/web/sites/default/files
+    pre_start:
+      command: [drupal-install]
+      user: "33:33"
+    cron:
+      drupal:
+        schedule: "*/5  * * * *"
+        command: [drush, cron]
+        user: 33
+  db:
+    image: mariadb:11.4
+    port: 3306
+    stop_delay: 0
+    healthcheck:
+      command: [healthcheck.sh, --connect, --innodb_initialized]
+    env:
+      MARIADB_DATABASE: drupal
+      MARIADB_USER: drupal
+      MARIADB_PASSWORD: {secret: DB_PASSWORD}
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
+    volumes:
+      data: /var/lib/mysql
+      logs: /var/log/mysql
+`
+
+func TestReadDrupal(t *testing.T) {
+	dir := appDir(t, drupal)
+	app, err := deployfile.Read(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []deployfile.Container{
+		{
+			Name: "db", Image: "mariadb:11.4", Port: 3306, Replicas: 1,
+			Env: map[string]deployfile.Value{
+				"MARIADB_DATABASE": {Value: "drupal"}, "MARIADB_USER": {Value: "drupal"},
+				"MARIADB_PASSWORD": {Secret: "DB_PASSWORD"}, "MARIADB_RANDOM_ROOT_PASSWORD": {Value: "1"},
+			},
+			Volumes:     []deployfile.Volume{{Name: "data", Path: "/var/lib/mysql"}, {Name: "logs", Path: "/var/log/mysql"}},
+			Healthcheck: &deployfile.Healthcheck{Command: []string{"healthcheck.sh", "--connect", "--innodb_initialized"}},
+		},
+		{
+			Name: "web", Build: &deployfile.Build{Dockerfile: dir}, Port: 80, Host: "drupal.example.com", Replicas: 1,
+			Env: map[string]deployfile.Value{
+				"DRUPAL_HOST": {Value: "drupal.example.com"}, "DB_PASSWORD": {Secret: "DB_PASSWORD"},
+				"HASH_SALT": {Secret: "HASH_SALT"}, "ADMIN_PASSWORD": {Secret: "ADMIN_PASSWORD"},
+			},
+			Volumes:     []deployfile.Volume{{Name: "files", Path: "/opt/drupal/web/sites/default/files"}},
+			PreStart:    &deployfile.Command{Command: []string{"drupal-install"}, User: "33:33"},
+			Cron:        []deployfile.Cron{{Name: "drupal", Schedule: "*/5 * * * *", Command: deployfile.Command{Command: []string{"drush", "cron"}, User: "33"}}},
+			Healthcheck: &deployfile.Healthcheck{Path: "/user/login"},
+			Rolling:     true,
+			StopDelay:   5,
+		},
+	}
+	if !reflect.DeepEqual(app.Containers, want) {
+		t.Errorf("containers =\n%+v, want\n%+v", app.Containers, want)
+	}
+}
+
+func TestAStopDelayIsFiveSecondsWithAPortAndNoneWithoutUnlessGiven(t *testing.T) {
+	for container, want := range map[string]int{
+		"{image: i, port: 80}":                5,
+		"{image: i}":                          0,
+		"{image: i, port: 80, stop_delay: 0}": 0,
+		"{image: i, port: 80, stop_delay: 9}": 9,
+		"{image: i, stop_delay: 3}":           3,
+	} {
+		app, err := deployfile.Read(appDir(t, "name: shop\ncontainers: {web: "+container+"}\n"))
+		if err != nil || app.Containers[0].StopDelay != want {
+			t.Errorf("%s: %v, a stop delay of %d, want %d", container, err, app.Containers[0].StopDelay, want)
+		}
+	}
+}
+
 func TestReadManifestsAndChart(t *testing.T) {
 	dir := appDir(t, "name: web\nmanifests: deploy\ncontainers: {web: {build: {railpack: .}}, jobs: {build: {dockerfile: .}}}\nsecrets: [TOKEN]\n")
 	app, err := deployfile.Read(dir)
@@ -190,6 +288,49 @@ func TestReadRefuses(t *testing.T) {
 		"env: a secret's list":  {web + ", env: {A: {secret: [B]}}}}\nsecrets: [B]\n", "containers: web: env: A: give a value, or {secret: NAME}"},
 		"env: an unlisted one":  {web + ", env: {A: {secret: B}}}}\nsecrets: [C]\n", "containers: web: env: A: the secret B isn't in secrets"},
 		"env: no secrets":       {web + ", env: {A: {secret: B}}}}\n", "containers: web: env: A: the secret B isn't in secrets"},
+		"only built: volumes":   {only + ", volumes: {a: /a}}}\nchart: chart\n", "containers: web: volumes: a container beside manifests or a chart is only built"},
+		"only built: pre_start": {only + ", pre_start: {command: [a]}}}\nchart: chart\n", "containers: web: pre_start: a container beside manifests or a chart is only built"},
+		"only built: cron":      {only + ", cron: {a: {schedule: '* * * * *', command: [a]}}}}\nchart: chart\n", "containers: web: cron: a container beside manifests or a chart is only built"},
+		"only built: a check":   {only + ", healthcheck: {command: [a]}}}\nchart: chart\n", "containers: web: healthcheck: a container beside manifests or a chart is only built"},
+		"only built: rolling":   {only + ", rolling: false}}\nchart: chart\n", "containers: web: rolling: a container beside manifests or a chart is only built"},
+		"only built: the delay": {only + ", stop_delay: 0}}\nchart: chart\n", "containers: web: stop_delay: a container beside manifests or a chart is only built"},
+		"volume: its name":      {web + ", volumes: {Data: /data}}}\n", "containers: web: volumes:"},
+		"volume: relative":      {web + ", volumes: {data: data}}}\n", "containers: web: volumes: data: give the directory's absolute path in the container"},
+		"volume: the root":      {web + ", volumes: {data: /}}}\n", "containers: web: volumes: data: give the directory's absolute path in the container"},
+		"volume: not clean":     {web + ", volumes: {data: /a/../b}}}\n", "containers: web: volumes: data: give the directory's absolute path in the container"},
+		"volume: a slash after": {web + ", volumes: {data: /a/}}}\n", "containers: web: volumes: data: give the directory's absolute path in the container"},
+		"volume: no path":       {web + ", volumes: {data: }}}\n", "containers: web: volumes: data: give the directory's absolute path in the container"},
+		"volume: one path":      {web + ", volumes: {a: /data, b: /data}}}\n", "containers: web: volumes: b: /data is a's already"},
+		"volume: a size":        {web + ", volumes: {data: {path: /data, size: 5Gi}}}}\n", "cannot unmarshal !!map into string"},
+		"volume: two replicas":  {web + ", volumes: {data: /data}, replicas: 2}}\n", "containers: web: replicas: a container with volumes runs as one replica"},
+		"rolling: no volumes":   {web + ", rolling: true}}\n", "containers: web: rolling: only a container with volumes takes it"},
+		"rolling: false, none":  {web + ", rolling: false}}\n", "containers: web: rolling: only a container with volumes takes it"},
+		"rolling: not a bool":   {web + ", volumes: {data: /data}, rolling: sometimes}}\n", "cannot unmarshal !!str `sometimes` into bool"},
+		"pre_start: a list":     {web + ", pre_start: [a]}}\n", "cannot unmarshal !!seq into deployfile.command"},
+		"pre_start: no command": {web + ", pre_start: {user: '33'}}}\n", "containers: web: pre_start: command: give the program to run, and its arguments"},
+		"pre_start: empty":      {web + ", pre_start: {command: []}}}\n", "containers: web: pre_start: command: give the program to run, and its arguments"},
+		"pre_start: a name":     {web + ", pre_start: {command: [a], user: www-data}}}\n", `containers: web: pre_start: user: "www-data" isn't a user's ID`},
+		"pre_start: two colons": {web + ", pre_start: {command: [a], user: '33:33:33'}}}\n", "containers: web: pre_start: user:"},
+		"pre_start: negative":   {web + ", pre_start: {command: [a], user: -1}}}\n", "containers: web: pre_start: user:"},
+		"pre_start: a field":    {web + ", pre_start: {command: [a], timeout: 5}}}\n", "timeout"},
+		"cron: its name":        {web + ", cron: {Nightly: {schedule: '0 3 * * *', command: [a]}}}}\n", "containers: web: cron:"},
+		"cron: empty":           {web + ", cron: {nightly: }}}\n", "containers: web: cron: nightly: give its schedule and its command"},
+		"cron: no schedule":     {web + ", cron: {nightly: {command: [a]}}}}\n", "containers: web: cron: nightly: schedule: give a crontab expression of five fields"},
+		"cron: four fields":     {web + ", cron: {nightly: {schedule: '0 3 * *', command: [a]}}}}\n", "containers: web: cron: nightly: schedule: give a crontab expression of five fields"},
+		"cron: six fields":      {web + ", cron: {nightly: {schedule: '0 0 3 * * *', command: [a]}}}}\n", "containers: web: cron: nightly: schedule: give a crontab expression of five fields"},
+		"cron: a macro":         {web + ", cron: {nightly: {schedule: '@daily', command: [a]}}}}\n", "containers: web: cron: nightly: schedule: give a crontab expression of five fields"},
+		"cron: a field's sign":  {web + ", cron: {nightly: {schedule: '0 3 * * $', command: [a]}}}}\n", "containers: web: cron: nightly: schedule: give a crontab expression of five fields"},
+		"cron: no command":      {web + ", cron: {nightly: {schedule: '0 3 * * *'}}}}\n", "containers: web: cron: nightly: command: give the program to run, and its arguments"},
+		"cron: a user's name":   {web + ", cron: {nightly: {schedule: '0 3 * * *', command: [a], user: root}}}}\n", "containers: web: cron: nightly: user:"},
+		"cron: a field":         {web + ", cron: {nightly: {schedule: '0 3 * * *', command: [a], timezone: UTC}}}}\n", "timezone"},
+		"check: a bare path":    {web + ", healthcheck: /up}}\n", "cannot unmarshal !!str `/up` into struct"},
+		"check: neither":        {web + ", healthcheck: {}}}\n", "containers: web: healthcheck: give one of path and command"},
+		"check: both":           {web + ", healthcheck: {path: /up, command: [a]}}}\n", "containers: web: healthcheck: give one of path and command"},
+		"check: no slash":       {web + ", healthcheck: {path: up}}}\n", `containers: web: healthcheck: path: "up" doesn't start with a slash`},
+		"check: no port":        {"name: shop\ncontainers: {web: {image: i, healthcheck: {path: /up}}}\n", "containers: web: healthcheck: path: give the port the container serves HTTP on too"},
+		"check: empty command":  {web + ", healthcheck: {command: []}}}\n", "containers: web: healthcheck: command: give the program to run, and its arguments"},
+		"check: a field":        {web + ", healthcheck: {path: /up, interval: 5}}}\n", "interval"},
+		"stop_delay: negative":  {web + ", stop_delay: -1}}\n", "containers: web: stop_delay: can't be negative"},
 		"env: not a map":        {web + ", env: [A]}}\n", "env"},
 		"the old objects key":   {"name: web\nobjects: {chart: chart}\n", "objects"},
 		"no containers":         {"name: shop\ncontainers: {}\n", "containers: give at least one"},
@@ -264,6 +405,9 @@ func TestReadTakes(t *testing.T) {
 		"two hosts":                                                 "name: shop\ncontainers: {api: {image: a, port: 80, host: a.example.com}, web: {image: b, port: 80, host: b.example.com}}\n",
 		"replicas of zero as one":                                   "name: shop\ncontainers: {web: {image: nginx, replicas: 0}}\n",
 		"a listed secret that no container names":                   "name: shop\ncontainers: {web: {image: nginx}}\nsecrets: [A]\n",
+		"a command as the check, without a port":                    "name: shop\ncontainers: {web: {image: nginx, healthcheck: {command: [a]}}}\n",
+		"rolling: false with volumes":                               "name: shop\ncontainers: {web: {image: nginx, volumes: {a: /a}, rolling: false}}\n",
+		"one replica with volumes":                                  "name: shop\ncontainers: {web: {image: nginx, volumes: {a: /a}, replicas: 1}}\n",
 		"an empty env":                                              "name: shop\ncontainers: {web: {image: nginx, env: {}}}\n",
 	} {
 		t.Run(name, func(t *testing.T) {

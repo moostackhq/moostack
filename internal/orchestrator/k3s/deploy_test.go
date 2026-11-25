@@ -477,6 +477,48 @@ func TestADeployDeletesWhatTheLastAppliedAndThisOneDoesnt(t *testing.T) {
 	}
 }
 
+func TestADeployLeavesAVolumeTheAppNoLongerHasAndDeletesItsOtherObjects(t *testing.T) {
+	name := unique("volumes")
+	b := deployer(t)
+	app := model.App{Name: name, Containers: []model.Container{{
+		Name: "db", Image: "example.test/db:1", Replicas: 1,
+		Volumes: []model.Volume{{Name: "data", Path: "/data"}},
+		Cron:    []model.Cron{{Name: "tidy", Schedule: "0 3 * * *", Command: model.Command{Command: []string{"tidy"}, User: &model.User{ID: 33}}}},
+	}}}
+	deploy(t, b, app)
+	ctx := context.Background()
+	db, err := admin.AppsV1().Deployments(name).Get(ctx, "db", metav1.GetOptions{})
+	if err != nil || db.Spec.Strategy.Type != "Recreate" || db.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName != "db-data" {
+		t.Errorf("db's Deployment: %v, %+v, want it recreated, with its volume's claim", err, db.Spec)
+	}
+	job, err := admin.BatchV1().CronJobs(name).Get(ctx, "db-tidy", metav1.GetOptions{})
+	if err != nil || job.Spec.Schedule != "0 3 * * *" || *job.Spec.JobTemplate.Spec.Template.Spec.Containers[0].SecurityContext.RunAsUser != 33 {
+		t.Errorf("the CronJob of db's scheduled command: %v, %+v", err, job.Spec)
+	}
+	want := []string{"CronJob.batch/db-tidy", "Deployment.apps/db", "PersistentVolumeClaim/db-data"}
+	if got := record(t, name); !slices.Equal(got, want) {
+		t.Errorf("the record lists %q, want %q", got, want)
+	}
+
+	app.Containers[0].Volumes, app.Containers[0].Cron = nil, nil
+	deploy(t, b, app)
+	if claim, err := admin.CoreV1().PersistentVolumeClaims(name).Get(ctx, "db-data", metav1.GetOptions{}); err != nil || claim.DeletionTimestamp != nil {
+		t.Errorf("the claim of a volume the app no longer has: %v, deleted at %v, want it left", err, claim.DeletionTimestamp)
+	}
+	if _, err := admin.BatchV1().CronJobs(name).Get(ctx, "db-tidy", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the CronJob of a scheduled command the app no longer has: %v, want it deleted", err)
+	}
+	if got, want := record(t, name), []string{"Deployment.apps/db"}; !slices.Equal(got, want) {
+		t.Errorf("the record lists %q, want %q", got, want)
+	}
+
+	app.Containers[0].Volumes = []model.Volume{{Name: "data", Path: "/data"}}
+	deploy(t, b, app)
+	if claim, err := admin.CoreV1().PersistentVolumeClaims(name).Get(ctx, "db-data", metav1.GetOptions{}); err != nil || claim.DeletionTimestamp != nil {
+		t.Errorf("the claim of a volume the app has again: %v, deleted at %v", err, claim.DeletionTimestamp)
+	}
+}
+
 func TestADeployTakesOverWhatAnotherManagerSet(t *testing.T) {
 	name := unique("forced")
 	b := deployer(t)

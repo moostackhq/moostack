@@ -130,11 +130,26 @@ func TestDeployChecksTheAppAsItWillRunBeforeItIsBuilt(t *testing.T) {
 	env := fakeEnvFor(c, home, &bytes.Buffer{})
 	env.Orchestrator = func(orchestrator.Host) orchestrator.Orchestrator { return checking{c.orch, checked} }
 	for file, want := range map[string]model.App{
-		"name: shop\ncontainers:\n  api: {build: {dockerfile: .}, port: 3000, host: api.example.com, replicas: 2}\n  cache: {image: \"valkey/valkey:8\", command: [valkey, --save], env: {LEVEL: info, PASSWORD: {secret: B}}}\nsecrets: [B, A]\n": {
+		"name: shop\ncontainers:\n  api: {build: {dockerfile: .}, port: 3000, host: api.example.com, replicas: 2}\n  cache: {image: \"valkey/valkey:8\", command: [valkey, --save], env: {LEVEL: info, PASSWORD: {secret: B}}}\n" +
+			"  db:\n    image: mariadb\n    port: 3306\n    stop_delay: 0\n    volumes: {data: /var/lib/mysql}\n    healthcheck: {command: [healthcheck.sh]}\n" +
+			"  web:\n    image: drupal\n    port: 80\n    volumes: {files: /files}\n    rolling: true\n    healthcheck: {path: /up}\n" +
+			"    pre_start: {command: [install], user: \"33:34\"}\n    cron: {tidy: {schedule: \"0 3 * * *\", command: [drush, cron], user: 33}, mail: {schedule: \"* * * * *\", command: [mail]}}\n" +
+			"secrets: [B, A]\n": {
 			Name: "shop",
 			Containers: []model.Container{
-				{Name: "api", Image: "moostack.local/shop/api", Port: 3000, Host: "api.example.com", Replicas: 2},
+				{Name: "api", Image: "moostack.local/shop/api", Port: 3000, Host: "api.example.com", Replicas: 2, StopDelay: 5},
 				{Name: "cache", Image: "valkey/valkey:8", Command: []string{"valkey", "--save"}, Replicas: 1, Env: map[string]model.Value{"LEVEL": {Value: "info"}, "PASSWORD": {Secret: "B"}}},
+				{Name: "db", Image: "mariadb", Port: 3306, Replicas: 1, Volumes: []model.Volume{{Name: "data", Path: "/var/lib/mysql"}}, Healthcheck: &model.Healthcheck{Command: []string{"healthcheck.sh"}}},
+				{
+					Name: "web", Image: "drupal", Port: 80, Replicas: 1, StopDelay: 5, Rolling: true,
+					Volumes:     []model.Volume{{Name: "files", Path: "/files"}},
+					Healthcheck: &model.Healthcheck{Path: "/up"},
+					PreStart:    &model.Command{Command: []string{"install"}, User: &model.User{ID: 33, Group: new(int64(34))}},
+					Cron: []model.Cron{
+						{Name: "mail", Schedule: "* * * * *", Command: model.Command{Command: []string{"mail"}}},
+						{Name: "tidy", Schedule: "0 3 * * *", Command: model.Command{Command: []string{"drush", "cron"}, User: &model.User{ID: 33}}},
+					},
+				},
 			},
 			Secrets: map[string]string{"A": "", "B": ""},
 		},
@@ -244,10 +259,10 @@ secrets: [GREETING]
 	want := model.App{
 		Name: "shop",
 		Containers: []model.Container{
-			{Name: "api", Image: ref("api"), Port: 3000, Host: "api.example.com", Replicas: 1},
-			{Name: "cache", Image: "valkey/valkey:8", Port: 6379, Replicas: 1},
+			{Name: "api", Image: ref("api"), Port: 3000, Host: "api.example.com", Replicas: 1, StopDelay: 5},
+			{Name: "cache", Image: "valkey/valkey:8", Port: 6379, Replicas: 1, StopDelay: 5},
 			{Name: "jobs", Image: ref("jobs"), Command: []string{"bin/jobs"}, Replicas: 3},
-			{Name: "web", Image: ref("jobs"), Port: 8080, Host: "shop.example.com", Replicas: 1, Env: map[string]model.Value{
+			{Name: "web", Image: ref("jobs"), Port: 8080, Host: "shop.example.com", Replicas: 1, StopDelay: 5, Env: map[string]model.Value{
 				"GREETING": {Secret: "GREETING"}, "HELLO": {Secret: "GREETING"}, "HOST": {Value: "shop.example.com"}, "WORKERS": {Value: "4"},
 			}},
 		},

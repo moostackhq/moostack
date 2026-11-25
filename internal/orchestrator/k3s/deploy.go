@@ -48,7 +48,8 @@ const (
 // applies app's objects server side: its namespace and HelmChart, then
 // the objects of its namespace, which it writes to the record before
 // it applies them. It deletes the HelmChart of an app without a chart,
-// and the recorded objects app no longer has. It refuses, with nothing
+// and the recorded objects app no longer has, but for its
+// PersistentVolumeClaims, which it leaves. It refuses, with nothing
 // applied, an object of app's manifests whose kind isn't kept in a
 // namespace or that the cluster doesn't have, an app whose namespace
 // is there and isn't an app's, and one whose namespace is being
@@ -213,7 +214,7 @@ func (a *api) apply(ctx context.Context, app model.App, cluster, own []*unstruct
 		}
 	}
 	for _, entry := range before {
-		if has(planned, entry) {
+		if has(planned, entry) || strings.HasPrefix(entry, claimKind+"/") {
 			continue
 		}
 		if err := a.deleteRecorded(ctx, ns, entry); err != nil {
