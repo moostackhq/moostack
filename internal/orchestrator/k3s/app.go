@@ -15,6 +15,7 @@ import (
 	"os"
 	stdpath "path"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"unicode"
@@ -27,6 +28,10 @@ import (
 	"github.com/moostackhq/moostack/internal/model"
 )
 
+// imageVar is what manifests name a built image with: ${image:web} is
+// the image built under the name web.
+var imageVar = regexp.MustCompile(`\$\{image:([^}]*)\}`)
+
 const (
 	// appLabel is the label that marks what is an app's with the app's
 	// name.
@@ -35,10 +40,8 @@ const (
 	// pods with its name.
 	containerLabel = "moostack.dev/container"
 	// secretsAnnotation is the pod annotation that holds the hash of the
-	// app's secrets.
+	// secrets its container reads.
 	secretsAnnotation = "moostack.dev/secrets"
-	// imageVar is what manifests name the built image with.
-	imageVar = "${IMAGE}"
 	// chartNamespace is where an app's HelmChart goes, for k3s's Helm
 	// controller.
 	chartNamespace = "kube-system"
@@ -76,9 +79,11 @@ func chartJob(app string) string { return "helm-install-" + chartName(app) }
 // chart whose name is longer than maxChartApp, a container whose name
 // isn't a DNS label that starts with a letter, two containers of one
 // name, a container whose
-// certificate's Secret would be named as the app's, and an app whose
-// manifests can't be read or checkApplied refuses, one whose chart
-// can't be packed, and one with no containers, manifests or chart.
+// certificate's Secret would be named as the app's, a container with
+// an environment value that isn't a variable's name or that names a
+// secret the app doesn't have, and an app whose manifests can't be read,
+// name an image the app doesn't have or checkApplied refuses, one whose
+// chart can't be packed, and one with no containers, manifests or chart.
 func (b *Backend) Check(app model.App) error {
 	_, err := objectsOf(app)
 	return err
@@ -106,6 +111,14 @@ func checkNames(app model.App) error {
 		}
 		if c.Host != "" && tlsSecret(c.Name) == secretOf(app.Name) && len(app.Secrets) > 0 {
 			return fmt.Errorf("containers: %s: host: its certificate's Secret would be named as the app's, %s; rename one", c.Name, app.Name)
+		}
+		for variable, v := range c.Env {
+			if problems := validation.IsEnvVarName(variable); len(problems) > 0 {
+				return fmt.Errorf("containers: %s: env: %q: %s", c.Name, variable, strings.Join(problems, "; "))
+			}
+			if _, ok := app.Secrets[v.Secret]; v.Secret != "" && !ok {
+				return fmt.Errorf("containers: %s: env: %s: the app has no secret %s", c.Name, variable, v.Secret)
+			}
 		}
 	}
 	return nil
@@ -186,13 +199,41 @@ func secret(app model.App) any {
 	}
 }
 
-// secretsHash is the SHA-256 of the app's secrets, names and values.
-func secretsHash(app model.App) string {
+// secretsHash is the SHA-256 of the secrets of app that c reads, names
+// and values, and empty if c reads none.
+func secretsHash(app model.App, c model.Container) string {
+	var names []string
+	for _, v := range c.Env {
+		if v.Secret != "" && !slices.Contains(names, v.Secret) {
+			names = append(names, v.Secret)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	slices.Sort(names)
 	h := sha256.New()
-	for _, name := range slices.Sorted(maps.Keys(app.Secrets)) {
+	for _, name := range names {
 		fmt.Fprintf(h, "%s=%q\n", name, app.Secrets[name])
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// env is c's environment values in the order of their variables, each
+// secret read from the app's Secret.
+func env(app model.App, c model.Container) []any {
+	var out []any
+	for _, variable := range slices.Sorted(maps.Keys(c.Env)) {
+		v := c.Env[variable]
+		if v.Secret == "" {
+			out = append(out, map[string]any{"name": variable, "value": v.Value})
+			continue
+		}
+		out = append(out, map[string]any{"name": variable, "valueFrom": map[string]any{
+			"secretKeyRef": map[string]any{"name": secretOf(app.Name), "key": v.Secret},
+		}})
+	}
+	return out
 }
 
 // containerObjects are the objects of the container c: its Deployment,
@@ -214,10 +255,12 @@ func containerObjects(app model.App, c model.Container) []any {
 			"periodSeconds": 2,
 		}
 	}
+	if e := env(app, c); len(e) > 0 {
+		container["env"] = e
+	}
 	podMeta := map[string]any{"labels": labels}
-	if len(app.Secrets) > 0 {
-		container["envFrom"] = []any{map[string]any{"secretRef": map[string]any{"name": secretOf(app.Name)}}}
-		podMeta["annotations"] = map[string]string{secretsAnnotation: secretsHash(app)}
+	if hash := secretsHash(app, c); hash != "" {
+		podMeta["annotations"] = map[string]string{secretsAnnotation: hash}
 	}
 	docs := []any{map[string]any{
 		"apiVersion": "apps/v1",
@@ -270,8 +313,8 @@ func containerObjects(app model.App, c model.Container) []any {
 }
 
 // readManifests are the manifests in app's directory of them and its
-// subdirectories, in the order of their paths, with imageVar replaced
-// by the app's image and each object labelled as the app's.
+// subdirectories, in the order of their paths, with each imageVar
+// replaced by the image it names and each object labelled as the app's.
 func readManifests(app model.App) (string, error) {
 	dir := app.Manifests
 	var paths []string
@@ -301,10 +344,14 @@ func readManifests(app model.App) (string, error) {
 			return "", err
 		}
 		text := string(data)
-		if strings.Contains(text, imageVar) && app.Image == "" {
-			return "", fmt.Errorf("%s names %s, but the app has no build", p, imageVar)
+		for _, m := range imageVar.FindAllStringSubmatch(text, -1) {
+			if app.Images[m[1]] == "" {
+				return "", fmt.Errorf("%s names %s, but the app builds no %s", p, m[0], m[1])
+			}
 		}
-		text = strings.ReplaceAll(text, imageVar, app.Image)
+		text = imageVar.ReplaceAllStringFunc(text, func(v string) string {
+			return app.Images[imageVar.FindStringSubmatch(v)[1]]
+		})
 		dec := yaml.NewDecoder(strings.NewReader(text))
 		for {
 			var doc yaml.Node
@@ -435,7 +482,7 @@ func value(m *yaml.Node, key string) *yaml.Node {
 }
 
 // chart is the HelmChart that installs app's chart into the app's
-// namespace, with the app's image as its value image.
+// namespace, with the app's images as its value images, by name.
 func chart(app model.App) (any, error) {
 	content, err := packChart(app.Chart)
 	if err != nil {
@@ -445,8 +492,12 @@ func chart(app model.App) (any, error) {
 		"chartContent":    content,
 		"targetNamespace": namespaceOf(app.Name),
 	}
-	if app.Image != "" {
-		spec["valuesContent"] = "image: " + app.Image + "\n"
+	if len(app.Images) > 0 {
+		values, err := yaml.Marshal(map[string]any{"images": app.Images})
+		if err != nil {
+			return nil, err
+		}
+		spec["valuesContent"] = string(values)
 	}
 	return map[string]any{
 		"apiVersion": "helm.cattle.io/v1",

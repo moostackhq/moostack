@@ -377,7 +377,7 @@ func TestTheFakeOrdersContainersOfOneReplicaByName(t *testing.T) {
 func TestTheFakesAppHasEachImageOnceItsOwnFirstAndOneReplicaOfAContainerThatDoesntSay(t *testing.T) {
 	ctx := context.Background()
 	f := &orchestratortest.Fake{}
-	app := model.App{Name: "shop", Manifests: "deploy", Image: "example.test/shop:1", Containers: []model.Container{
+	app := model.App{Name: "shop", Manifests: "deploy", Images: map[string]string{"shop": "example.test/shop:1"}, Containers: []model.Container{
 		{Name: "web", Image: "example.test/web:1", Host: "shop.example.test"},
 		{Name: "admin", Image: "example.test/web:1", Host: "admin.example.test", Replicas: 2},
 		{Name: "worker", Image: "example.test/worker:1"},

@@ -359,7 +359,7 @@ func shop(name string) model.App {
 	return model.App{
 		Name: name,
 		Containers: []model.Container{
-			{Name: "web", Image: "example.test/web:1", Port: 8080, Host: name + ".example.test", Replicas: 2},
+			{Name: "web", Image: "example.test/web:1", Port: 8080, Host: name + ".example.test", Replicas: 2, Env: map[string]model.Value{"HELLO": {Secret: "GREETING"}, "LEVEL": {Value: "info"}}},
 			{Name: "worker", Image: "example.test/worker:1", Command: []string{"work"}, Replicas: 1},
 		},
 		Secrets: map[string]string{"GREETING": "hi"},
@@ -438,7 +438,8 @@ func TestADeployAppliesTheAppsObjectsAndRecordsThem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c := web.Spec.Template.Spec.Containers[0]; *web.Spec.Replicas != 2 || c.Image != "example.test/web:1" || c.Ports[0].ContainerPort != 8080 || c.EnvFrom[0].SecretRef.Name != name {
+	if c := web.Spec.Template.Spec.Containers[0]; *web.Spec.Replicas != 2 || c.Image != "example.test/web:1" || c.Ports[0].ContainerPort != 8080 ||
+		len(c.Env) != 2 || c.Env[0].Name != "HELLO" || c.Env[0].ValueFrom.SecretKeyRef.Name != name || c.Env[0].ValueFrom.SecretKeyRef.Key != "GREETING" || c.Env[1] != (corev1.EnvVar{Name: "LEVEL", Value: "info"}) {
 		t.Errorf("web's Deployment has %d replicas of %+v", *web.Spec.Replicas, c)
 	}
 	if !slices.ContainsFunc(web.ManagedFields, func(f metav1.ManagedFieldsEntry) bool {
@@ -831,7 +832,7 @@ func TestAnAppsWorkloadThatIsntRolledIsRefusedToWaitFor(t *testing.T) {
 // ConfigMap with the value.
 func chartOf(t *testing.T, name, value string) model.App {
 	t.Helper()
-	return model.App{Name: name, Image: "example.test/" + name + ":1", Chart: files(t, t.TempDir()+"/chart", map[string]string{
+	return model.App{Name: name, Images: map[string]string{"web": "example.test/" + name + ":1"}, Chart: files(t, t.TempDir()+"/chart", map[string]string{
 		"Chart.yaml":         "apiVersion: v2\nname: web\nversion: 0.1.0\n",
 		"templates/cm.yaml":  "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: c}\ndata: {value: " + value + "}\n",
 		"templates/NOTES.md": "x",
@@ -871,7 +872,7 @@ func TestADeployOfAChartWaitsForItsInstallAndAnUnchangedChartForNoNewOne(t *test
 		t.Fatal(err)
 	}
 	spec := chart.Object["spec"].(map[string]any)
-	if chart.GetLabels()[appLabel] != name || spec["targetNamespace"] != name || spec["valuesContent"] != "image: example.test/"+name+":1\n" || spec["chartContent"] == "" {
+	if chart.GetLabels()[appLabel] != name || spec["targetNamespace"] != name || spec["valuesContent"] != "images:\n    web: example.test/"+name+":1\n" || spec["chartContent"] == "" {
 		t.Errorf("the HelmChart: labels %v, spec %v", chart.GetLabels(), spec)
 	}
 	if got := record(t, name); len(got) != 0 {

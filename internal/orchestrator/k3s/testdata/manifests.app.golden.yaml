@@ -27,4 +27,4 @@ spec:
     selector: {matchLabels: {app: web}}
     template:
         metadata: {labels: {app: web}}
-        spec: {containers: [{name: web, image: "moostack.local/web@sha256:2222"}]}
+        spec: {containers: [{name: web, image: "moostack.local/web@sha256:2222"}, {name: jobs, image: "moostack.local/web/jobs@sha256:4444"}]}

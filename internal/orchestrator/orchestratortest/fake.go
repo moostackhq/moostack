@@ -184,8 +184,8 @@ func (f *Fake) Apps(ctx context.Context) ([]model.AppState, error) {
 	for _, name := range slices.Sorted(maps.Keys(f.apps)) {
 		a := f.apps[name]
 		s := model.AppState{Name: name}
-		if a.Image != "" {
-			s.Images = append(s.Images, a.Image)
+		for _, built := range slices.Sorted(maps.Keys(a.Images)) {
+			s.Images = append(s.Images, a.Images[built])
 		}
 		for _, c := range a.Containers {
 			s.Want += replicas(c)

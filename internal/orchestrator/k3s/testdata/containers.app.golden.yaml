@@ -31,16 +31,14 @@ spec:
             maxUnavailable: 0
     template:
         metadata:
-            annotations:
-                moostack.dev/secrets: 3440f03b2523f4d57f833c5ad8710495b1f8ebcfbc7c3f6e856be1f2d87afb59
             labels:
                 moostack.dev/app: shop
                 moostack.dev/container: cache
         spec:
             containers:
-                - envFrom:
-                    - secretRef:
-                        name: shop
+                - env:
+                    - name: MAXMEMORY
+                      value: 64mb
                   image: valkey/valkey:8
                   name: cache
                   ports:
@@ -86,8 +84,6 @@ spec:
             maxUnavailable: 0
     template:
         metadata:
-            annotations:
-                moostack.dev/secrets: 3440f03b2523f4d57f833c5ad8710495b1f8ebcfbc7c3f6e856be1f2d87afb59
             labels:
                 moostack.dev/app: shop
                 moostack.dev/container: jobs
@@ -97,9 +93,6 @@ spec:
                     - bin/jobs
                     - --queue
                     - mail
-                  envFrom:
-                    - secretRef:
-                        name: shop
                   image: moostack.local/shop/jobs@sha256:1111
                   name: jobs
 ---
@@ -130,9 +123,21 @@ spec:
                 moostack.dev/container: web
         spec:
             containers:
-                - envFrom:
-                    - secretRef:
-                        name: shop
+                - env:
+                    - name: EMPTY
+                      value: ""
+                    - name: GREETING
+                      valueFrom:
+                        secretKeyRef:
+                            key: GREETING
+                            name: shop
+                    - name: KEY
+                      valueFrom:
+                        secretKeyRef:
+                            key: API_KEY
+                            name: shop
+                    - name: LEVEL
+                      value: info
                   image: moostack.local/shop/jobs@sha256:1111
                   name: web
                   ports:

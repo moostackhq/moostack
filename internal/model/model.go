@@ -10,9 +10,10 @@ type App struct {
 	// Manifests and Chart are directories.
 	Manifests string
 	Chart     string
-	// Image is the image built for the manifests or the chart.
-	Image string
-	// Secrets are values, by variable.
+	// Images are the images built for the manifests or the chart, by
+	// the name each is built under.
+	Images map[string]string
+	// Secrets are the app's secrets' values, by name.
 	Secrets map[string]string
 }
 
@@ -24,6 +25,15 @@ type Container struct {
 	Port     int
 	Host     string
 	Replicas int
+	// Env are the container's environment values, by variable.
+	Env map[string]Value
+}
+
+// Value is an environment value: Value, or the one of the app's
+// Secrets called Secret.
+type Value struct {
+	Value  string
+	Secret string
 }
 
 // AppState is an app as the cluster runs it.

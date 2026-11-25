@@ -97,11 +97,11 @@ func deploy(ctx context.Context, env Env, cmd *cli.Command) error {
 	defer release()
 	orch := orchestratorThrough(env, cpClient)
 
-	image, images, err := buildAll(ctx, env, d, app, cp, cpClient, orch)
+	images, err := buildAll(ctx, env, d, app, cp, cpClient, orch)
 	if err != nil {
 		return err
 	}
-	err = orch.Deploy(ctx, toRun(app, image, images, secrets), func(step orchestrator.Step) {
+	err = orch.Deploy(ctx, toRun(app, images, secrets), func(step orchestrator.Step) {
 		switch step {
 		case orchestrator.WaitingForCluster:
 			say(env, "Waiting for cert-manager and Traefik...")
@@ -114,13 +114,10 @@ func deploy(ctx context.Context, env Env, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	if err := keepRunning(ctx, cp, cpClient, image, images); err != nil {
+	if err := keepRunning(ctx, cp, cpClient, images); err != nil {
 		return err
 	}
 	fmt.Fprintf(env.Stdout, "Deployed %s to %s\n", app.Name, d.Cluster.Ref)
-	if image != "" {
-		fmt.Fprintf(env.Stdout, "Image: %s\n", image)
-	}
 	var printed []string
 	for _, c := range app.Containers {
 		if ref, ok := images[c.Name]; ok && !slices.Contains(printed, ref) {
@@ -143,26 +140,40 @@ func deploy(ctx context.Context, env Env, cmd *cli.Command) error {
 	return nil
 }
 
-// toRun is app as an orchestrator runs it: with image, the one built for
-// its manifests or chart, images, those built for its containers, by
-// container name, and secrets, the values of its secrets by name.
-func toRun(app *deployfile.App, image string, images, secrets map[string]string) model.App {
-	out := model.App{Name: app.Name, Manifests: app.Manifests, Chart: app.Chart, Image: image}
+// toRun is app as an orchestrator runs it: with images, those built for
+// its containers, by container name, and secrets, the values of its
+// secrets by name. The containers of an app with manifests or a chart
+// are its images.
+func toRun(app *deployfile.App, images, secrets map[string]string) model.App {
+	out := model.App{Name: app.Name, Manifests: app.Manifests, Chart: app.Chart}
+	if len(app.Secrets) > 0 {
+		out.Secrets = map[string]string{}
+		for _, name := range app.Secrets {
+			out.Secrets[name] = secrets[name]
+		}
+	}
+	if app.Manifests != "" || app.Chart != "" {
+		if len(images) > 0 {
+			out.Images = images
+		}
+		return out
+	}
 	for _, c := range app.Containers {
-		out.Containers = append(out.Containers, model.Container{
+		run := model.Container{
 			Name:     c.Name,
 			Image:    cmp.Or(c.Image, images[c.Name]),
 			Command:  c.Command,
 			Port:     c.Port,
 			Host:     c.Host,
 			Replicas: c.Replicas,
-		})
-	}
-	if len(app.Secrets) > 0 {
-		out.Secrets = map[string]string{}
-		for _, name := range app.Secrets {
-			out.Secrets[name] = secrets[name]
 		}
+		if len(c.Env) > 0 {
+			run.Env = map[string]model.Value{}
+			for variable, v := range c.Env {
+				run.Env[variable] = model.Value{Value: v.Value, Secret: v.Secret}
+			}
+		}
+		out.Containers = append(out.Containers, run)
 	}
 	return out
 }
@@ -171,60 +182,51 @@ func toRun(app *deployfile.App, image string, images, secrets map[string]string)
 // or read: each image to build is its repository in the cluster's
 // registry, and each secret is empty.
 func unbuilt(app *deployfile.App) model.App {
-	image, images := "", map[string]string{}
-	if app.Build != nil {
-		image = registry.Name + "/" + app.Name
-	}
+	images := map[string]string{}
 	for _, c := range app.Containers {
 		if c.Build != nil {
 			images[c.Name] = registry.Name + "/" + app.Name + "/" + c.Name
 		}
 	}
-	return toRun(app, image, images, nil)
+	return toRun(app, images, nil)
 }
 
-// buildAll builds and pushes app's images: the one of its manifests or
-// chart, which it returns, and those of its containers, which it returns
-// by container name. Containers with the same build share one image.
-func buildAll(ctx context.Context, env Env, d *clusterdir.Dir, app *deployfile.App, cp clusterdir.Node, cpClient remote, orch orchestrator.Orchestrator) (string, map[string]string, error) {
+// buildAll builds and pushes the images of app's containers, which it
+// returns by container name. Containers with the same build share one
+// image.
+func buildAll(ctx context.Context, env Env, d *clusterdir.Dir, app *deployfile.App, cp clusterdir.Node, cpClient remote, orch orchestrator.Orchestrator) (map[string]string, error) {
 	type job struct {
 		repo, label string
 		build       deployfile.Build
 	}
 	var jobs []job
-	if app.Build != nil {
-		jobs = append(jobs, job{app.Name, app.Name, *app.Build})
-	}
 	for _, c := range app.Containers {
 		if c.Build != nil && !slices.ContainsFunc(jobs, func(j job) bool { return j.build == *c.Build }) {
 			jobs = append(jobs, job{app.Name + "/" + c.Name, c.Name, *c.Build})
 		}
 	}
 	if len(jobs) == 0 {
-		return "", nil, nil
+		return nil, nil
 	}
 	arches, err := architectures(ctx, d, orch)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	built := map[deployfile.Build]string{}
 	for _, j := range jobs {
 		ref, err := buildAndPush(ctx, env, j.repo, j.label, j.build, arches, cp, cpClient)
 		if err != nil {
-			return "", nil, err
+			return nil, err
 		}
 		built[j.build] = ref
 	}
-	image, images := "", map[string]string{}
-	if app.Build != nil {
-		image = built[*app.Build]
-	}
+	images := map[string]string{}
 	for _, c := range app.Containers {
 		if c.Build != nil {
 			images[c.Name] = built[*c.Build]
 		}
 	}
-	return image, images, nil
+	return images, nil
 }
 
 // architectures are the architectures of the cluster's nodes: those
@@ -365,15 +367,12 @@ func pushBar(complete, total int64) string {
 	return fmt.Sprintf("[%s%s] %d/%d MB", strings.Repeat("#", filled), strings.Repeat("-", width-filled), (complete+megabyte/2)/megabyte, (total+megabyte/2)/megabyte)
 }
 
-// keepRunning marks the images built for a deploy that is ready, image
-// and images, as the ones that run, in zot on the control plane cp.
-func keepRunning(ctx context.Context, cp clusterdir.Node, cpClient remote, image string, images map[string]string) error {
-	refs := []string{image}
-	for _, name := range slices.Sorted(maps.Keys(images)) {
-		refs = append(refs, images[name])
-	}
+// keepRunning marks the images built for a deploy that is ready,
+// images, as the ones that run, in zot on the control plane cp.
+func keepRunning(ctx context.Context, cp clusterdir.Node, cpClient remote, images map[string]string) error {
 	var marked []string
-	for _, ref := range refs {
+	for _, name := range slices.Sorted(maps.Keys(images)) {
+		ref := images[name]
 		repo, digest, ok := strings.Cut(strings.TrimPrefix(ref, registry.Name+"/"), "@sha256:")
 		if !ok || slices.Contains(marked, ref) {
 			continue

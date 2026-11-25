@@ -1,8 +1,12 @@
 package deployfile_test
 
 import (
+	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -32,14 +36,22 @@ func appDir(t *testing.T, content string) string {
 }
 
 func TestReadContainers(t *testing.T) {
-	dir := appDir(t, `name: shop
+	dir := appDir(t, `version: 1
+name: shop
 cluster: acme/prod
 containers:
   web:
     build: {dockerfile: .}
     port: 8080
-    host: shop.example.com
+    host: &host shop.example.com
     replicas: 2
+    env:
+      HOST: *host
+      WORKERS: 4
+      DEBUG: true
+      EMPTY: ""
+      DB_URL: {secret: DB_URL}
+      DATABASE: {secret: DB_URL}
   jobs:
     build: {railpack: .}
     command: [bin/jobs, --queue, mail]
@@ -52,7 +64,7 @@ secrets: [GREETING, DB_URL]
 	if err != nil {
 		t.Fatal(err)
 	}
-	if app.Cluster != "acme/prod" || app.Name != "shop" || app.Build != nil || app.Manifests != "" || app.Chart != "" || app.Dir != dir {
+	if app.Cluster != "acme/prod" || app.Name != "shop" || app.Manifests != "" || app.Chart != "" || app.Dir != dir {
 		t.Errorf("app = %+v", app)
 	}
 	if strings.Join(app.Secrets, ",") != "GREETING,DB_URL" {
@@ -71,15 +83,23 @@ secrets: [GREETING, DB_URL]
 	if web.Name != "web" || web.Build == nil || web.Build.Dockerfile != dir || web.Port != 8080 || web.Host != "shop.example.com" || web.Replicas != 2 {
 		t.Errorf("web = %+v", web)
 	}
+	env := map[string]deployfile.Value{
+		"HOST": {Value: "shop.example.com"}, "WORKERS": {Value: "4"}, "DEBUG": {Value: "true"}, "EMPTY": {},
+		"DB_URL": {Secret: "DB_URL"}, "DATABASE": {Secret: "DB_URL"},
+	}
+	if !maps.Equal(web.Env, env) || cache.Env != nil {
+		t.Errorf("env = %+v and %+v, want %+v and none", web.Env, cache.Env, env)
+	}
 }
 
 func TestReadManifestsAndChart(t *testing.T) {
-	dir := appDir(t, "name: web\nbuild: {railpack: .}\nmanifests: deploy\n")
+	dir := appDir(t, "name: web\nmanifests: deploy\ncontainers: {web: {build: {railpack: .}}, jobs: {build: {dockerfile: .}}}\nsecrets: [TOKEN]\n")
 	app, err := deployfile.Read(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if app.Cluster != "" || app.Build.Railpack != dir || app.Manifests != filepath.Join(dir, "deploy") || app.Containers != nil {
+	want := []deployfile.Container{{Name: "jobs", Build: &deployfile.Build{Dockerfile: dir}}, {Name: "web", Build: &deployfile.Build{Railpack: dir}}}
+	if app.Cluster != "" || app.Manifests != filepath.Join(dir, "deploy") || !reflect.DeepEqual(app.Containers, want) || !slices.Equal(app.Secrets, []string{"TOKEN"}) {
 		t.Errorf("app = %+v", app)
 	}
 
@@ -88,29 +108,89 @@ func TestReadManifestsAndChart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if app.Build != nil || app.Chart != filepath.Join(dir, "chart") || app.Containers != nil {
+	if app.Chart != filepath.Join(dir, "chart") || app.Containers != nil {
 		t.Errorf("app = %+v", app)
 	}
 
-	dir = appDir(t, "name: web\nbuild: {dockerfile: .}\nchart: chart\n")
-	if app, err = deployfile.Read(dir); err != nil || app.Build.Dockerfile != dir {
+	dir = appDir(t, "name: web\nchart: chart\ncontainers: {web: {build: {dockerfile: .}}}\n")
+	if app, err = deployfile.Read(dir); err != nil || len(app.Containers) != 1 || app.Containers[0].Build.Dockerfile != dir {
 		t.Errorf("a chart with a build: %+v, %v", app, err)
+	}
+}
+
+func TestAFileWithoutAVersionIsReadAsTheLatest(t *testing.T) {
+	const rest = "name: web\nchart: chart\n"
+	stated, err := deployfile.Read(appDir(t, fmt.Sprintf("version: %d\n", deployfile.Version)+rest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	without, err := deployfile.Read(appDir(t, rest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stated.Dir, stated.Chart, without.Dir, without.Chart = "", "", "", ""
+	if !reflect.DeepEqual(stated, without) {
+		t.Errorf("with the version %+v, without %+v", stated, without)
+	}
+}
+
+func TestAVersionThatIsntTheLatestIsRefusedBeforeAnythingElse(t *testing.T) {
+	for version, want := range map[string]string{
+		"2":      "version: 2 isn't a version this mooctl reads",
+		"0":      "version: 0 isn't a version this mooctl reads",
+		"-1":     "version: -1 isn't a version this mooctl reads",
+		`"1"`:    "version: give a whole number, such as 1",
+		"1.0":    "version: give a whole number, such as 1",
+		"one":    "version: give a whole number, such as 1",
+		"[1]":    "version: give a whole number, such as 1",
+		"{a: 1}": "version: give a whole number, such as 1",
+	} {
+		dir := appDir(t, "name: Not A Name\nservices: {of: another version}\nversion: "+version+"\n")
+		if _, err := deployfile.Read(dir); err == nil || !strings.HasSuffix(err.Error(), ": "+want) {
+			t.Errorf("Read of version %s: %v, want %q", version, err, want)
+		}
+		if _, _, err := deployfile.ReadRef(dir); err == nil || !strings.HasSuffix(err.Error(), ": "+want) {
+			t.Errorf("ReadRef of version %s: %v, want %q", version, err, want)
+		}
 	}
 }
 
 func TestReadRefuses(t *testing.T) {
 	const web = "name: shop\ncontainers: {web: {build: {dockerfile: .}, port: 80"
+	const only = "name: shop\ncontainers: {web: {build: {dockerfile: .}"
 	for name, tc := range map[string]struct{ content, want string }{
 		"no name":               {"chart: chart\n", "name:"},
 		"bad name":              {"name: Web\nchart: chart\n", "name:"},
 		"bad cluster":           {"cluster: a/b/c\nname: web\nchart: chart\n", "cluster:"},
-		"two builds":            {"name: web\nbuild: {dockerfile: ., railpack: .}\nchart: chart\n", "build: give one of dockerfile and railpack"},
-		"empty build":           {"name: web\nbuild: {}\nchart: chart\n", "build: give one of dockerfile and railpack"},
-		"no Dockerfile":         {"name: web\nbuild: {dockerfile: deploy}\nchart: chart\n", "has no Dockerfile"},
-		"none of the three":     {"name: web\n", "give one of containers, manifests and chart"},
-		"chart and manifests":   {"name: web\nchart: chart\nmanifests: deploy\n", "give one of containers, manifests and chart"},
-		"containers and chart":  {web + "}}\nchart: chart\n", "give one of containers, manifests and chart"},
-		"containers, manifests": {web + "}}\nmanifests: deploy\n", "give one of containers, manifests and chart"},
+		"a chart's build":       {"name: web\nbuild: {dockerfile: .}\nchart: chart\n", "build: each container gives its own"},
+		"an empty build":        {"name: web\nbuild: {}\nchart: chart\n", "build: each container gives its own"},
+		"manifests' build":      {"name: web\nbuild: {railpack: .}\nmanifests: deploy\n", "build: each container gives its own"},
+		"none of the three":     {"name: web\n", "give containers, manifests or a chart"},
+		"only secrets":          {"name: web\nsecrets: [A]\n", "give containers, manifests or a chart"},
+		"chart and manifests":   {"name: web\nchart: chart\nmanifests: deploy\n", "give one of manifests and chart"},
+		"all three":             {only + "}}\nchart: chart\nmanifests: deploy\n", "give one of manifests and chart"},
+		"no containers, chart":  {"name: shop\ncontainers: {}\nchart: chart\n", "containers: give at least one"},
+		"only built: empty":     {"name: shop\nchart: chart\ncontainers: {web: }\n", "containers: web: give its build"},
+		"only built: no build":  {"name: shop\nmanifests: deploy\ncontainers: {web: {}}\n", "containers: web: give its build"},
+		"only built: image":     {"name: shop\nchart: chart\ncontainers: {web: {image: nginx}}\n", "containers: web: give its build"},
+		"only built: and image": {only + ", image: nginx}}\nchart: chart\n", "containers: web: image: a container beside manifests or a chart is only built"},
+		"only built: command":   {only + ", command: [a]}}\nmanifests: deploy\n", "containers: web: command: a container beside manifests or a chart is only built"},
+		"only built: port":      {only + ", port: 80}}\nmanifests: deploy\n", "containers: web: port: a container beside manifests or a chart is only built"},
+		"only built: host":      {only + ", host: a.example.com}}\nchart: chart\n", "containers: web: host: a container beside manifests or a chart is only built"},
+		"only built: replicas":  {only + ", replicas: 1}}\nchart: chart\n", "containers: web: replicas: a container beside manifests or a chart is only built"},
+		"only built: env":       {only + ", env: {A: b}}}\nchart: chart\n", "containers: web: env: a container beside manifests or a chart is only built"},
+		"only built: builds":    {"name: shop\nchart: chart\ncontainers: {web: {build: {}}}\n", "containers: web: build: give one of dockerfile and railpack"},
+		"only built: its name":  {"name: shop\nchart: chart\ncontainers: {Web: {build: {dockerfile: .}}}\n", "containers:"},
+		"env: a name":           {web + ", env: {A-B: c}}}\n", `containers: web: env: "A-B" isn't a name an environment variable can have`},
+		"env: no value":         {web + ", env: {A: }}}\n", "containers: web: env: A: give a value, or {secret: NAME}"},
+		"env: a list":           {web + ", env: {A: [b]}}}\n", "containers: web: env: A: give a value, or {secret: NAME}"},
+		"env: another key":      {web + ", env: {A: {value: b}}}}\n", "containers: web: env: A: give a value, or {secret: NAME}"},
+		"env: two keys":         {web + ", env: {A: {secret: B, name: C}}}}\nsecrets: [B]\n", "containers: web: env: A: give a value, or {secret: NAME}"},
+		"env: an empty secret":  {web + ", env: {A: {secret: ''}}}}\n", "containers: web: env: A: give a value, or {secret: NAME}"},
+		"env: a secret's list":  {web + ", env: {A: {secret: [B]}}}}\nsecrets: [B]\n", "containers: web: env: A: give a value, or {secret: NAME}"},
+		"env: an unlisted one":  {web + ", env: {A: {secret: B}}}}\nsecrets: [C]\n", "containers: web: env: A: the secret B isn't in secrets"},
+		"env: no secrets":       {web + ", env: {A: {secret: B}}}}\n", "containers: web: env: A: the secret B isn't in secrets"},
+		"env: not a map":        {web + ", env: [A]}}\n", "env"},
 		"the old objects key":   {"name: web\nobjects: {chart: chart}\n", "objects"},
 		"no containers":         {"name: shop\ncontainers: {}\n", "containers: give at least one"},
 		"a top-level build":     {web + "}}\nbuild: {dockerfile: .}\n", "build: each container gives its own"},
@@ -183,6 +263,8 @@ func TestReadTakes(t *testing.T) {
 		"a container without a port":                                "name: shop\ncontainers: {jobs: {image: nginx}}\n",
 		"two hosts":                                                 "name: shop\ncontainers: {api: {image: a, port: 80, host: a.example.com}, web: {image: b, port: 80, host: b.example.com}}\n",
 		"replicas of zero as one":                                   "name: shop\ncontainers: {web: {image: nginx, replicas: 0}}\n",
+		"a listed secret that no container names":                   "name: shop\ncontainers: {web: {image: nginx}}\nsecrets: [A]\n",
+		"an empty env":                                              "name: shop\ncontainers: {web: {image: nginx, env: {}}}\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			app, err := deployfile.Read(appDir(t, content))

@@ -130,16 +130,21 @@ func TestDeployChecksTheAppAsItWillRunBeforeItIsBuilt(t *testing.T) {
 	env := fakeEnvFor(c, home, &bytes.Buffer{})
 	env.Orchestrator = func(orchestrator.Host) orchestrator.Orchestrator { return checking{c.orch, checked} }
 	for file, want := range map[string]model.App{
-		"name: shop\ncontainers:\n  api: {build: {dockerfile: .}, port: 3000, host: api.example.com, replicas: 2}\n  cache: {image: \"valkey/valkey:8\", command: [valkey, --save]}\nsecrets: [B, A]\n": {
+		"name: shop\ncontainers:\n  api: {build: {dockerfile: .}, port: 3000, host: api.example.com, replicas: 2}\n  cache: {image: \"valkey/valkey:8\", command: [valkey, --save], env: {LEVEL: info, PASSWORD: {secret: B}}}\nsecrets: [B, A]\n": {
 			Name: "shop",
 			Containers: []model.Container{
 				{Name: "api", Image: "moostack.local/shop/api", Port: 3000, Host: "api.example.com", Replicas: 2},
-				{Name: "cache", Image: "valkey/valkey:8", Command: []string{"valkey", "--save"}, Replicas: 1},
+				{Name: "cache", Image: "valkey/valkey:8", Command: []string{"valkey", "--save"}, Replicas: 1, Env: map[string]model.Value{"LEVEL": {Value: "info"}, "PASSWORD": {Secret: "B"}}},
 			},
 			Secrets: map[string]string{"A": "", "B": ""},
 		},
-		"name: shop\nmanifests: k8s\nbuild: {dockerfile: .}\n": {Name: "shop", Manifests: "k8s", Image: "moostack.local/shop"},
-		"name: shop\nchart: k8s\n":                             {Name: "shop", Chart: "k8s"},
+		"version: 1\nname: shop\nmanifests: k8s\ncontainers: {web: {build: {dockerfile: .}}}\nsecrets: [A]\n": {
+			Name: "shop", Manifests: "k8s", Images: map[string]string{"web": "moostack.local/shop/web"}, Secrets: map[string]string{"A": ""},
+		},
+		"name: shop\nchart: k8s\ncontainers: {api: {build: {dockerfile: .}}, web: {build: {dockerfile: .}}}\n": {
+			Name: "shop", Chart: "k8s", Images: map[string]string{"api": "moostack.local/shop/api", "web": "moostack.local/shop/web"},
+		},
+		"name: shop\nchart: k8s\n": {Name: "shop", Chart: "k8s"},
 	} {
 		app := t.TempDir()
 		os.MkdirAll(filepath.Join(app, "k8s"), 0o755)
@@ -198,7 +203,11 @@ containers:
   api: {build: {dockerfile: api}, port: 3000, host: api.example.com}
   cache: {image: "valkey/valkey:8", port: 6379}
   jobs: {build: {dockerfile: .}, command: [bin/jobs], replicas: 3}
-  web: {build: {dockerfile: .}, port: 8080, host: shop.example.com}
+  web:
+    build: {dockerfile: .}
+    port: 8080
+    host: &host shop.example.com
+    env: {GREETING: {secret: GREETING}, HELLO: {secret: GREETING}, HOST: *host, WORKERS: 4}
 secrets: [GREETING]
 `), 0o644)
 	t.Chdir(app)
@@ -238,7 +247,9 @@ secrets: [GREETING]
 			{Name: "api", Image: ref("api"), Port: 3000, Host: "api.example.com", Replicas: 1},
 			{Name: "cache", Image: "valkey/valkey:8", Port: 6379, Replicas: 1},
 			{Name: "jobs", Image: ref("jobs"), Command: []string{"bin/jobs"}, Replicas: 3},
-			{Name: "web", Image: ref("jobs"), Port: 8080, Host: "shop.example.com", Replicas: 1},
+			{Name: "web", Image: ref("jobs"), Port: 8080, Host: "shop.example.com", Replicas: 1, Env: map[string]model.Value{
+				"GREETING": {Secret: "GREETING"}, "HELLO": {Secret: "GREETING"}, "HOST": {Value: "shop.example.com"}, "WORKERS": {Value: "4"},
+			}},
 		},
 		Secrets: map[string]string{"GREETING": "hello"},
 	}

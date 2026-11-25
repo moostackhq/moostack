@@ -59,7 +59,7 @@ func webChart(t *testing.T) string {
 
 func TestTheObjectsOfAnAppAreTheGoldenOnes(t *testing.T) {
 	manifests := files(t, t.TempDir(), map[string]string{
-		"b/deploy.yaml": "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web}\nspec:\n  selector: {matchLabels: {app: web}}\n  template:\n    metadata: {labels: {app: web}}\n    spec: {containers: [{name: web, image: \"${IMAGE}\"}]}\n",
+		"b/deploy.yaml": "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web}\nspec:\n  selector: {matchLabels: {app: web}}\n  template:\n    metadata: {labels: {app: web}}\n    spec: {containers: [{name: web, image: \"${image:web}\"}, {name: jobs, image: \"${image:jobs}\"}]}\n",
 		"a.yml":         "---\napiVersion: v1\nkind: ConfigMap\nmetadata: {name: config, labels: {tier: web}}\ndata:\n  date: 2024-01-02\n  octal: 0755\n  word: on\n---\n---\n{\"apiVersion\": \"v1\", \"kind\": \"Secret\", \"metadata\": {\"name\": \"s\", \"labels\": null}}\n",
 		"notes.txt":     "not a manifest",
 	})
@@ -68,15 +68,17 @@ func TestTheObjectsOfAnAppAreTheGoldenOnes(t *testing.T) {
 		"containers": {
 			Name: "shop",
 			Containers: []model.Container{
-				{Name: "cache", Image: "valkey/valkey:8", Port: 6379, Replicas: 1},
+				{Name: "cache", Image: "valkey/valkey:8", Port: 6379, Replicas: 1, Env: map[string]model.Value{"MAXMEMORY": {Value: "64mb"}}},
 				{Name: "jobs", Image: "moostack.local/shop/jobs@sha256:1111", Command: []string{"bin/jobs", "--queue", "mail"}, Replicas: 3},
-				{Name: "web", Image: "moostack.local/shop/jobs@sha256:1111", Port: 8080, Host: "shop.example.com", Replicas: 2},
+				{Name: "web", Image: "moostack.local/shop/jobs@sha256:1111", Port: 8080, Host: "shop.example.com", Replicas: 2, Env: map[string]model.Value{
+					"KEY": {Secret: "API_KEY"}, "GREETING": {Secret: "GREETING"}, "LEVEL": {Value: "info"}, "EMPTY": {},
+				}},
 			},
 			Secrets: map[string]string{"GREETING": "hi", "API_KEY": "s3cr3t: \"x\"\n"},
 		},
 		"plain":          {Name: "plain", Containers: []model.Container{{Name: "worker", Image: "example.test/worker:1", Replicas: 1}}},
-		"manifests":      {Name: "web", Manifests: manifests, Image: "moostack.local/web@sha256:2222", Secrets: map[string]string{"TOKEN": "t"}},
-		"chart":          {Name: "web", Chart: chart, Image: "moostack.local/web@sha256:3333"},
+		"manifests":      {Name: "web", Manifests: manifests, Images: map[string]string{"web": "moostack.local/web@sha256:2222", "jobs": "moostack.local/web/jobs@sha256:4444"}, Secrets: map[string]string{"TOKEN": "t"}},
+		"chart":          {Name: "web", Chart: chart, Images: map[string]string{"web": "moostack.local/web@sha256:3333", "jobs": "moostack.local/web/jobs@sha256:4444"}},
 		"chart-no-image": {Name: "web", Chart: chart},
 	} {
 		cluster, own, err := k3s.Objects(app)
@@ -110,7 +112,7 @@ func TestCheckRefusesWhatTheClusterCantRun(t *testing.T) {
 	noObjects := files(t, t.TempDir(), map[string]string{"a.yaml": "---\n---\n"})
 	noMetadata := files(t, t.TempDir(), map[string]string{"a.yaml": "apiVersion: v1\nkind: ConfigMap\n"})
 	notYAML := files(t, t.TempDir(), map[string]string{"a.yaml": "a: [\n"})
-	withImage := files(t, t.TempDir(), map[string]string{"a.yaml": "apiVersion: v1\nkind: Pod\nmetadata: {name: p}\nimage: ${IMAGE}\n"})
+	withImage := files(t, t.TempDir(), map[string]string{"a.yaml": "apiVersion: v1\nkind: Pod\nmetadata: {name: p}\nimage: ${image:web}\n"})
 	looping := files(t, filepath.Join(t.TempDir(), "web"), map[string]string{"Chart.yaml": "apiVersion: v2\nname: web\nversion: 0.1.0\n", "templates/a.yaml": ""})
 	if err := os.Symlink("..", filepath.Join(looping, "templates", "up")); err != nil {
 		t.Fatal(err)
@@ -150,8 +152,12 @@ func TestCheckRefusesWhatTheClusterCantRun(t *testing.T) {
 		"an object without metadata":                      {model.App{Name: "shop", Manifests: noMetadata}, filepath.Join(noMetadata, "a.yaml") + ": an object has no metadata"},
 		"manifests that aren't YAML":                      {model.App{Name: "shop", Manifests: notYAML}, filepath.Join(notYAML, "a.yaml") + ": yaml: "},
 		"manifests that aren't there":                     {model.App{Name: "shop", Manifests: filepath.Join(noObjects, "absent")}, "no such file or directory"},
-		"the image named without a build":                 {model.App{Name: "shop", Manifests: withImage}, filepath.Join(withImage, "a.yaml") + " names ${IMAGE}, but the app has no build"},
-		"the image named with a build":                    {model.App{Name: "shop", Manifests: withImage, Image: "example.test/shop"}, ""},
+		"the image named without a build":                 {model.App{Name: "shop", Manifests: withImage}, filepath.Join(withImage, "a.yaml") + " names ${image:web}, but the app builds no web"},
+		"an image named that another name is built under": {model.App{Name: "shop", Manifests: withImage, Images: map[string]string{"api": "example.test/shop"}}, filepath.Join(withImage, "a.yaml") + " names ${image:web}, but the app builds no web"},
+		"an environment variable with an equals sign":     {model.App{Name: "shop", Containers: []model.Container{{Name: "web", Image: "i", Env: map[string]model.Value{"A=B": {Value: "1"}}}}}, `containers: web: env: "A=B": `},
+		"a secret the app doesn't have":                   {model.App{Name: "shop", Containers: []model.Container{{Name: "web", Image: "i", Env: map[string]model.Value{"A": {Secret: "B"}}}}, Secrets: map[string]string{"C": "1"}}, "containers: web: env: A: the app has no secret B"},
+		"a secret the app has":                            {model.App{Name: "shop", Containers: []model.Container{{Name: "web", Image: "i", Env: map[string]model.Value{"A": {Secret: "B"}}}}, Secrets: map[string]string{"B": ""}}, ""},
+		"the image named with a build":                    {model.App{Name: "shop", Manifests: withImage, Images: map[string]string{"web": "example.test/shop"}}, ""},
 		"a chart that isn't there":                        {model.App{Name: "shop", Chart: filepath.Join(noObjects, "absent")}, "no such file or directory"},
 		"a chart that links back to itself":               {model.App{Name: "shop", Chart: looping}, "links back to"},
 		"an object in another namespace":                  {model.App{Name: "shop", Manifests: files(t, t.TempDir(), map[string]string{"a.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: c, namespace: other}\n"})}, "an object is in namespace other, not the app's"},
@@ -590,4 +596,45 @@ func FuzzTheManifestsOfAnApp(f *testing.F) {
 			t.Errorf("manifests without an object were taken:\n%s", own)
 		}
 	})
+}
+
+func TestAContainersPodsChangeWithASecretItReadsAndWithNoOther(t *testing.T) {
+	templates := func(secrets map[string]string) map[string]string {
+		_, own, err := k3s.Objects(model.App{Name: "shop", Secrets: secrets, Containers: []model.Container{
+			{Name: "db", Image: "i", Env: map[string]model.Value{"PASSWORD": {Secret: "DB"}}},
+			{Name: "plain", Image: "i", Env: map[string]model.Value{"LEVEL": {Value: "info"}}},
+			{Name: "web", Image: "i", Env: map[string]model.Value{"DB_PASSWORD": {Secret: "DB"}, "SALT": {Secret: "SALT"}}},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]string{}
+		for _, o := range decode(t, own) {
+			if o.GetKind() == "Deployment" {
+				template, _, _ := unstructured.NestedMap(o.Object, "spec", "template")
+				out[o.GetName()] = fmt.Sprint(template)
+			}
+		}
+		return out
+	}
+	before := templates(map[string]string{"DB": "a", "SALT": "b", "UNREAD": "c"})
+	for name, tc := range map[string]struct {
+		secrets map[string]string
+		changed []string
+	}{
+		"one that two read":  {map[string]string{"DB": "A", "SALT": "b", "UNREAD": "c"}, []string{"db", "web"}},
+		"one that one reads": {map[string]string{"DB": "a", "SALT": "B", "UNREAD": "c"}, []string{"web"}},
+		"one that none read": {map[string]string{"DB": "a", "SALT": "b", "UNREAD": "C"}, nil},
+	} {
+		var changed []string
+		for container, template := range templates(tc.secrets) {
+			if template != before[container] {
+				changed = append(changed, container)
+			}
+		}
+		slices.Sort(changed)
+		if !slices.Equal(changed, tc.changed) {
+			t.Errorf("a change of %s changed the pods of %q, want %q", name, changed, tc.changed)
+		}
+	}
 }
