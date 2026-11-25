@@ -3,6 +3,8 @@ package gitrepo_test
 import (
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -253,6 +255,34 @@ func TestAFetchFromARemoteThatNeverAnswersEnds(t *testing.T) {
 		t.Errorf("Update = %v", err)
 	}
 	if took := time.Since(start); took > 15*time.Second {
+		t.Errorf("it took %v", took)
+	}
+}
+
+func TestAFetchFromARemoteThatAsksForALoginFailsWithoutAsking(t *testing.T) {
+	a, _ := setup(t)
+	asks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="git"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer asks.Close()
+	exec.Command("git", "-C", a.Dir, "remote", "set-url", "origin", asks.URL+"/c.git").Run()
+	defer gitrepo.SetFetchTimeout(10 * time.Second)()
+	waits := filepath.Join(t.TempDir(), "askpass")
+	if err := os.WriteFile(waits, []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"GIT_ASKPASS", "SSH_ASKPASS"} {
+		t.Setenv(name, waits)
+	}
+	exec.Command("git", "config", "--global", "core.askPass", waits).Run()
+	t.Setenv("GIT_TERMINAL_PROMPT", "1")
+	start := time.Now()
+	err := a.Update(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "terminal prompts disabled") {
+		t.Errorf("Update = %v, want git's refusal to ask on the terminal", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
 		t.Errorf("it took %v", took)
 	}
 }

@@ -37,28 +37,35 @@ func (r Repo) git(ctx context.Context, args ...string) (string, error) {
 // repository or index than the directory's own.
 var repoEnv = []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES"}
 
-// settings keep the operator's hooks, signing and global excludes out of
-// every git command mooctl runs.
+// settings keep the operator's hooks, signing, global excludes and
+// program that asks for a password out of every git command mooctl runs.
 var settings = []string{
 	"-c", "core.hooksPath=/dev/null",
 	"-c", "commit.gpgSign=false",
 	"-c", "push.gpgSign=false",
 	"-c", "merge.verifySignatures=false",
 	"-c", "core.excludesFile=/dev/null",
+	"-c", "core.askPass=",
 }
 
+// askEnv are the environment variables that name a program git asks for
+// a user name or a password with.
+var askEnv = []string{"GIT_ASKPASS", "SSH_ASKPASS"}
+
 // command is git with args in dir, with settings, without the
-// environment variables of repoEnv, in a process group of its own, which
-// the terminal's signals don't reach and which is killed once ctx ends.
+// environment variables of repoEnv and askEnv, in a process group of its
+// own, which the terminal's signals don't reach and which is killed once
+// ctx ends. It fails where git would ask for a user name or a password.
 func command(ctx context.Context, dir string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", append(slices.Clone(settings), args...)...)
 	cmd.Dir = dir
 	for _, kv := range os.Environ() {
 		name, _, _ := strings.Cut(kv, "=")
-		if !slices.Contains(repoEnv, name) {
+		if !slices.Contains(repoEnv, name) && !slices.Contains(askEnv, name) {
 			cmd.Env = append(cmd.Env, kv)
 		}
 	}
+	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = 5 * time.Second
