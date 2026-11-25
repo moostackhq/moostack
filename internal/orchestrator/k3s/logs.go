@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/moostackhq/moostack/internal/orchestrator"
@@ -87,6 +89,60 @@ func (b *Backend) logs(ctx context.Context, app string, o orchestrator.LogOption
 	}
 	wg.Wait()
 	return out.result()
+}
+
+// ContainerLogs writes the log of the container id names, as Running
+// names it: its last o.Tail lines, or all of them if o.Tail is negative,
+// and with o.Follow those that come until the log ends. An ID that isn't
+// a namespace, a pod and a container, a pod there isn't, and a
+// container the pod doesn't have or hasn't started are ErrNoContainer.
+// It fails if the log breaks off, and with w's error once a write
+// fails. If ctx ends otherwise than by its deadline, it fails with
+// ctx's cause.
+func (b *Backend) ContainerLogs(ctx context.Context, id string, o orchestrator.LogOptions, w io.Writer) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	return causeIfEnded(ctx, b.containerLogs(ctx, id, o, w))
+}
+
+func (b *Backend) containerLogs(ctx context.Context, id string, o orchestrator.LogOptions, w io.Writer) error {
+	part := strings.Split(id, "/")
+	if len(part) != 3 || slices.Contains(part, "") {
+		return orchestrator.ErrNoContainer
+	}
+	a, err := b.connect(ctx)
+	if err != nil {
+		return err
+	}
+	opts := &corev1.PodLogOptions{Container: part[2], Follow: o.Follow}
+	if o.Tail >= 0 {
+		tail := int64(o.Tail)
+		opts.TailLines = &tail
+	}
+	stream, err := a.streams.CoreV1().Pods(part[0]).GetLogs(part[1], opts).Stream(ctx)
+	if apierrors.IsNotFound(err) || apierrors.IsBadRequest(err) {
+		return orchestrator.ErrNoContainer
+	}
+	if err != nil {
+		return fmt.Errorf("reading the log of %s: %w", id, err)
+	}
+	defer stream.Close()
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := stream.Read(buf)
+		if n > 0 {
+			if _, err := w.Write(buf[:n]); err != nil {
+				return err
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("reading the log of %s: %w", id, err)
+		}
+	}
 }
 
 // containerLog is the log of a container of a pod.

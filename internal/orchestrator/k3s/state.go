@@ -99,7 +99,8 @@ func (b *Backend) apps(ctx context.Context) ([]model.AppState, error) {
 }
 
 // Running returns the containers of every pod that are running, init
-// and ephemeral ones as well. A container's replica is its pod, its app
+// and ephemeral ones as well. A container's instance is its pod, its ID
+// the pod's namespace and name and its own name, its app
 // the one appLabel on the pod names, and its image the one the pod asks
 // for. It reads the pods a page at a time and keeps only the
 // containers. If ctx ends otherwise than by its deadline, it fails with
@@ -156,6 +157,8 @@ func runningIn(pod corev1.Pod) []model.Running {
 			Instance:  pod.Name,
 			Container: s.Name,
 			Image:     images[s.Name],
+			ID:        pod.Namespace + "/" + pod.Name + "/" + s.Name,
+			Started:   s.State.Running.StartedAt.Time,
 		})
 	}
 	return running

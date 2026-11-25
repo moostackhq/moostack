@@ -16,10 +16,15 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/moostackhq/moostack/internal/model"
 	"github.com/moostackhq/moostack/internal/orchestrator"
 )
+
+// Started is when the console and the containers of apps started on a
+// Fake.
+var Started = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
 // Fake is an Orchestrator that keeps a cluster's apps and nodes in
 // memory. Every app is ready as soon as it is deployed. A call on an
@@ -31,6 +36,9 @@ type Fake struct {
 	// Logged is what Logs writes, by app, in place of a line for each
 	// running container. Set it before the first call.
 	Logged map[string]string
+	// ContainerLogged is what ContainerLogs writes, by the container's
+	// ID, in place of its line. Set it before the first call.
+	ContainerLogged map[string]string
 	// Volumes are the volumes nodes hold, by node. Set it before the
 	// first call.
 	Volumes map[string][]string
@@ -175,6 +183,35 @@ func (f *Fake) logs(ctx context.Context, app string) (string, error) {
 	return text.String(), nil
 }
 
+// ContainerLogs writes ContainerLogged's text for the container, or
+// else its line, as "web-1 web: running". It writes without holding the
+// fake.
+func (f *Fake) ContainerLogs(ctx context.Context, id string, _ orchestrator.LogOptions, w io.Writer) error {
+	text, err := f.containerLogs(ctx, id)
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(w, text)
+	return err
+}
+
+func (f *Fake) containerLogs(ctx context.Context, id string) (string, error) {
+	defer f.mu.Unlock()
+	if err := f.begin(ctx, "ContainerLogs"); err != nil {
+		return "", err
+	}
+	for _, r := range f.running() {
+		if r.ID != id {
+			continue
+		}
+		if text, ok := f.ContainerLogged[id]; ok {
+			return text, nil
+		}
+		return fmt.Sprintf("%s %s: running\n", r.Instance, r.Container), nil
+	}
+	return "", orchestrator.ErrNoContainer
+}
+
 func (f *Fake) Apps(ctx context.Context) ([]model.AppState, error) {
 	defer f.mu.Unlock()
 	if err := f.begin(ctx, "Apps"); err != nil {
@@ -204,7 +241,8 @@ func (f *Fake) Apps(ctx context.Context) ([]model.AppState, error) {
 
 // Running has Own, the console once it runs, and each replica of each
 // app's containers, the replicas of a container web named web-1, web-2
-// and so on.
+// and so on. A container without an ID has its app, instance and name
+// as one, as "shop/web-1/web".
 func (f *Fake) Running(ctx context.Context) ([]model.Running, error) {
 	defer f.mu.Unlock()
 	if err := f.begin(ctx, "Running"); err != nil {
@@ -216,13 +254,18 @@ func (f *Fake) Running(ctx context.Context) ([]model.Running, error) {
 func (f *Fake) running() []model.Running {
 	running := slices.Clone(f.Own)
 	if f.console != "" {
-		running = append(running, model.Running{Instance: "console-1", Container: "console", Image: f.console})
+		running = append(running, model.Running{Instance: "console-1", Container: "console", Image: f.console, Started: Started})
 	}
 	for name, a := range f.apps {
 		for _, c := range a.Containers {
 			for i := range replicas(c) {
-				running = append(running, model.Running{App: name, Instance: fmt.Sprintf("%s-%d", c.Name, i+1), Container: c.Name, Image: c.Image})
+				running = append(running, model.Running{App: name, Instance: fmt.Sprintf("%s-%d", c.Name, i+1), Container: c.Name, Image: c.Image, Started: Started})
 			}
+		}
+	}
+	for i, r := range running {
+		if r.ID == "" {
+			running[i].ID = r.App + "/" + r.Instance + "/" + r.Container
 		}
 	}
 	slices.SortFunc(running, func(a, b model.Running) int {

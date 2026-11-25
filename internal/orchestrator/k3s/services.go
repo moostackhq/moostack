@@ -244,6 +244,9 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [list]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

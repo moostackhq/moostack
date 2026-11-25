@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/moostackhq/moostack/internal/model"
 	"github.com/moostackhq/moostack/internal/orchestrator"
@@ -60,6 +61,9 @@ func calls(ctx context.Context) map[string]func(f *orchestratortest.Fake) error 
 		"Remove":      func(f *orchestratortest.Fake) error { return f.Remove(ctx, "shop") },
 		"Logs": func(f *orchestratortest.Fake) error {
 			return f.Logs(ctx, "shop", orchestrator.LogOptions{}, &bytes.Buffer{})
+		},
+		"ContainerLogs": func(f *orchestratortest.Fake) error {
+			return f.ContainerLogs(ctx, "shop/web-1/web", orchestrator.LogOptions{}, &bytes.Buffer{})
 		},
 		"Apps":    func(f *orchestratortest.Fake) error { _, err := f.Apps(ctx); return err },
 		"Running": func(f *orchestratortest.Fake) error { _, err := f.Running(ctx); return err },
@@ -297,8 +301,12 @@ func TestFailPanicsForWhatIsNoMethodThatFails(t *testing.T) {
 
 func TestTheFakeListsItsOwnContainersAndWritesTheLogsSet(t *testing.T) {
 	ctx := context.Background()
-	own := model.Running{Instance: "dns-1", Container: "dns", Image: "example.test/dns:1"}
-	f := &orchestratortest.Fake{Own: []model.Running{own}, Logged: map[string]string{"shop": "web-1 web: started\n"}}
+	own := model.Running{ID: "sys/dns-1/dns", Instance: "dns-1", Container: "dns", Image: "example.test/dns:1", Started: time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)}
+	f := &orchestratortest.Fake{
+		Own:             []model.Running{own},
+		Logged:          map[string]string{"shop": "web-1 web: started\n"},
+		ContainerLogged: map[string]string{"shop/web-2/web": "started\nlistening\n"},
+	}
 	if err := f.Deploy(ctx, model.App{Name: "shop", Containers: []model.Container{{Name: "web", Image: "example.test/web:1", Replicas: 2}}}, func(orchestrator.Step) {}); err != nil {
 		t.Fatal(err)
 	}
@@ -308,8 +316,8 @@ func TestTheFakeListsItsOwnContainersAndWritesTheLogsSet(t *testing.T) {
 	}
 	want := []model.Running{
 		own,
-		{App: "shop", Instance: "web-1", Container: "web", Image: "example.test/web:1"},
-		{App: "shop", Instance: "web-2", Container: "web", Image: "example.test/web:1"},
+		{App: "shop", Instance: "web-1", Container: "web", Image: "example.test/web:1", ID: "shop/web-1/web", Started: orchestratortest.Started},
+		{App: "shop", Instance: "web-2", Container: "web", Image: "example.test/web:1", ID: "shop/web-2/web", Started: orchestratortest.Started},
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
@@ -323,6 +331,24 @@ func TestTheFakeListsItsOwnContainersAndWritesTheLogsSet(t *testing.T) {
 	}
 	if len(f.Own) != 1 || f.Own[0] != own {
 		t.Errorf("Running changed Own: %+v", f.Own)
+	}
+	for id, want := range map[string]string{
+		"shop/web-2/web": "started\nlistening\n",
+		"shop/web-1/web": "web-1 web: running\n",
+		"sys/dns-1/dns":  "dns-1 dns: running\n",
+	} {
+		var w bytes.Buffer
+		if err := f.ContainerLogs(ctx, id, orchestrator.LogOptions{}, &w); err != nil || w.String() != want {
+			t.Errorf("ContainerLogs of %s wrote %q, %v, want %q", id, w.String(), err, want)
+		}
+	}
+}
+
+func TestTheFakeHasNoLogsOfAContainerThatDoesntRun(t *testing.T) {
+	f := &orchestratortest.Fake{ContainerLogged: map[string]string{"shop/web-1/web": "started\n"}}
+	var w bytes.Buffer
+	if err := f.ContainerLogs(context.Background(), "shop/web-1/web", orchestrator.LogOptions{}, &w); !errors.Is(err, orchestrator.ErrNoContainer) || w.Len() != 0 {
+		t.Errorf("ContainerLogs of a container that doesn't run wrote %q, %v, want nothing and ErrNoContainer", w.String(), err)
 	}
 }
 
@@ -361,16 +387,16 @@ func TestTheFakeOrdersContainersOfOneReplicaByName(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []model.Running{
-		{Instance: "dns-1", Container: "z"},
-		{Instance: "proxy-1", Container: "sidecar"},
-		{Instance: "proxy-1", Container: "web"},
-		{Instance: "proxy-2", Container: "a"},
+		{Instance: "dns-1", Container: "z", ID: "/dns-1/z"},
+		{Instance: "proxy-1", Container: "sidecar", ID: "/proxy-1/sidecar"},
+		{Instance: "proxy-1", Container: "web", ID: "/proxy-1/web"},
+		{Instance: "proxy-2", Container: "a", ID: "/proxy-2/a"},
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
 	}
-	if f.Own[0].Instance != "proxy-2" || f.Own[3].Instance != "dns-1" {
-		t.Errorf("Running ordered Own itself: %+v", f.Own)
+	if f.Own[0].Instance != "proxy-2" || f.Own[3].Instance != "dns-1" || f.Own[0].ID != "" {
+		t.Errorf("Running changed Own itself: %+v", f.Own)
 	}
 }
 

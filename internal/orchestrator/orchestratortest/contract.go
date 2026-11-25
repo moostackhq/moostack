@@ -262,13 +262,14 @@ func Contract(t *testing.T, cluster func(t *testing.T) Cluster) {
 		_, nodes := o.Nodes(ctx)
 		_, token := o.ConsoleToken(ctx)
 		for method, err := range map[string]error{
-			"Certificate":  o.Certificate(ctx, there, "web"),
-			"Logs":         o.Logs(ctx, there, orchestrator.LogOptions{}, &bytes.Buffer{}),
-			"Apps":         apps,
-			"Running":      all,
-			"Nodes":        nodes,
-			"RunConsole":   o.RunConsole(ctx, "example.test/console:1", nil),
-			"ConsoleToken": token,
+			"Certificate":   o.Certificate(ctx, there, "web"),
+			"Logs":          o.Logs(ctx, there, orchestrator.LogOptions{}, &bytes.Buffer{}),
+			"ContainerLogs": o.ContainerLogs(ctx, running(t, o, there)[0].ID, orchestrator.LogOptions{}, &bytes.Buffer{}),
+			"Apps":          apps,
+			"Running":       all,
+			"Nodes":         nodes,
+			"RunConsole":    o.RunConsole(ctx, "example.test/console:1", nil),
+			"ConsoleToken":  token,
 		} {
 			if err == nil {
 				t.Errorf("%s on an ended context succeeded", method)
@@ -336,6 +337,51 @@ func Contract(t *testing.T, cluster func(t *testing.T) Cluster) {
 		deploy(t, o, shop(name))
 		if err := o.Logs(within(t), name, orchestrator.LogOptions{Tail: 10}, &bytes.Buffer{}); err != nil {
 			t.Errorf("Logs: %v", err)
+		}
+	})
+
+	t.Run("each running container has an ID of its own and a start, and its logs are read by the ID", func(t *testing.T) {
+		o := cluster(t).Orchestrator
+		name := unique("container")
+		deploy(t, o, shop(name))
+		all, err := o.Running(within(t))
+		if err != nil {
+			t.Fatalf("Running: %v", err)
+		}
+		seen := map[string]bool{}
+		for _, r := range all {
+			if r.ID == "" || seen[r.ID] {
+				t.Errorf("Running has %+v, a container without an ID of its own", r)
+			}
+			seen[r.ID] = true
+		}
+		mine := running(t, o, name)
+		if len(mine) != 3 {
+			t.Fatalf("%d containers of %s run, want 3", len(mine), name)
+		}
+		for _, r := range mine {
+			if r.Started.IsZero() || r.Started.After(time.Now().Add(time.Minute)) {
+				t.Errorf("%s started at %v, want a time that has passed", r.ID, r.Started)
+			}
+			if err := o.ContainerLogs(within(t), r.ID, orchestrator.LogOptions{Tail: 10}, &bytes.Buffer{}); err != nil {
+				t.Errorf("ContainerLogs of %s: %v", r.ID, err)
+			}
+		}
+	})
+
+	t.Run("there are no logs of a container that doesn't run", func(t *testing.T) {
+		o := cluster(t).Orchestrator
+		name := unique("gone")
+		deploy(t, o, shop(name))
+		id := running(t, o, name)[0].ID
+		if err := o.Remove(within(t), name); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+		for _, id := range []string{id, "", "no-such-container", unique("a") + "/b/c"} {
+			var w bytes.Buffer
+			if err := o.ContainerLogs(within(t), id, orchestrator.LogOptions{Tail: 10}, &w); !errors.Is(err, orchestrator.ErrNoContainer) || w.Len() != 0 {
+				t.Errorf("ContainerLogs of %q wrote %q, %v, want nothing and ErrNoContainer", id, w.String(), err)
+			}
 		}
 	})
 

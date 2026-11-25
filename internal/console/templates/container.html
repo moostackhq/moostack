@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+{{template "head"}}
+<body>
+{{template "navbar"}}
+<main class="mx-auto max-w-5xl p-4">
+<nav class="breadcrumbs text-sm" aria-label="Breadcrumb">
+<ul>
+<li><a href="/console/">Containers</a></li>
+<li>{{.Container.Container}}</li>
+</ul>
+</nav>
+<h2 class="text-lg font-bold">{{.Container.Container}}</h2>
+<table class="table">
+<tbody>
+<tr><th scope="row">Instance</th><td>{{.Container.Instance}}</td></tr>
+<tr><th scope="row">Image</th><td>{{.Container.Image}}</td></tr>
+<tr><th scope="row">Started</th><td><time datetime="{{.Container.Started.UTC.Format "2006-01-02T15:04:05Z"}}">{{.Container.Started.UTC.Format "2006-01-02 15:04:05 UTC"}}</time></td></tr>
+</tbody>
+</table>
+<h3 class="mt-6 font-bold">Logs</h3>
+{{- if .Problem}}
+<p role="alert" class="alert alert-error mt-2">{{.Problem}}</p>
+{{- else if .Logs}}
+<pre tabindex="0" class="bg-base-200 rounded-box mt-2 overflow-x-auto p-4 text-sm">{{.Logs}}</pre>
+{{- else}}
+<p class="mt-2">No logs.</p>
+{{- end}}
+</main>
+</body>
+</html>

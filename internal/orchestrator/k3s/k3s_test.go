@@ -275,8 +275,8 @@ func pod(t *testing.T, namespace, name, app string, containers ...container) {
 	createPod(t, p, corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: status(containers)})
 }
 
-// runningOf is what the backend lists as running, cut to the replicas
-// whose names start with prefix.
+// runningOf is what the backend lists as running, cut to the instances
+// whose names start with prefix, without their IDs and starts.
 func runningOf(t *testing.T, prefix string) []model.Running {
 	t.Helper()
 	all, err := backend(t).Running(context.Background())
@@ -286,6 +286,7 @@ func runningOf(t *testing.T, prefix string) []model.Running {
 	var own []model.Running
 	for _, r := range all {
 		if strings.HasPrefix(r.Instance, prefix) {
+			r.ID, r.Started = "", time.Time{}
 			own = append(own, r)
 		}
 	}
@@ -298,6 +299,29 @@ func TestARunningContainerIsListedWithItsAppInstanceNameAndImage(t *testing.T) {
 	want := []model.Running{{App: app, Instance: app + "-web-1", Container: "web", Image: "example.test/web:1"}}
 	if got := runningOf(t, app); !slices.Equal(got, want) {
 		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestARunningContainersIDIsItsNamespacePodAndNameAndItsStartTheOneItsStatusHas(t *testing.T) {
+	ns := unique("ids")
+	before := time.Now().Add(-2 * time.Second)
+	pod(t, ns, "web-1", ns, container{name: "web", image: "example.test/web:1", state: running}, container{name: "proxy", image: "example.test/proxy:1", state: running})
+	all, err := backend(t).Running(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, r := range all {
+		if r.App != ns {
+			continue
+		}
+		ids = append(ids, r.ID)
+		if r.Started.Before(before) || r.Started.After(time.Now().Add(2*time.Second)) {
+			t.Errorf("%s started at %v, want the time the test gave it, about %v", r.ID, r.Started, before)
+		}
+	}
+	if want := []string{ns + "/web-1/proxy", ns + "/web-1/web"}; !slices.Equal(ids, want) {
+		t.Errorf("the IDs are %q, want %q", ids, want)
 	}
 }
 
@@ -512,6 +536,7 @@ func TestPodsBeyondOnePageAreListed(t *testing.T) {
 	var got []model.Running
 	for _, r := range all {
 		if strings.HasPrefix(r.Instance, ns) {
+			r.ID, r.Started = "", time.Time{}
 			got = append(got, r)
 		}
 	}
@@ -613,8 +638,8 @@ func TestTheConsolesPageShowsTheCluster(t *testing.T) {
 		t.Fatalf("status %d, want 200:\n%s", res.StatusCode, body)
 	}
 	for _, want := range []string{
-		"<h2>" + app + "</h2>", "<tr><td>" + app + "-web-1</td><td>web</td><td>example.test/web:1</td></tr>",
-		"<h2>The cluster's own</h2>", "<tr><td>" + app + "-dns-1</td><td>dns</td><td>example.test/dns:1</td></tr>",
+		">" + app + "</th>", ">web</a></td><td>" + app + "-web-1</td><td>example.test/web:1</td></tr>",
+		">System</th>", ">dns</a></td><td>" + app + "-dns-1</td><td>example.test/dns:1</td></tr>",
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("the page lacks %s:\n%s", want, body)

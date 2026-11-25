@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Console</title>
+<link rel="stylesheet" href="/console/static/style.css">
+</head>
+<body>
+<header class="navbar bg-base-200 px-4">
+<h1 class="flex-1 text-xl font-bold">Console</h1>
+<form method="post" action="/console/logout">
+<button class="btn btn-ghost">Log out</button>
+</form>
+</header>
+<main class="mx-auto max-w-5xl p-4">
+<nav class="breadcrumbs text-sm" aria-label="Breadcrumb">
+<ul>
+<li><a href="/console/">Containers</a></li>
+<li>coredns</li>
+</ul>
+</nav>
+<h2 class="text-lg font-bold">coredns</h2>
+<table class="table">
+<tbody>
+<tr><th scope="row">Instance</th><td>coredns-7b98449c4-x2x9v</td></tr>
+<tr><th scope="row">Image</th><td>rancher/mirrored-coredns-coredns:1.12.0</td></tr>
+<tr><th scope="row">Started</th><td><time datetime="2026-01-01T08:30:00Z">2026-01-01 08:30:00 UTC</time></td></tr>
+</tbody>
+</table>
+<h3 class="mt-6 font-bold">Logs</h3>
+<pre tabindex="0" class="bg-base-200 rounded-box mt-2 overflow-x-auto p-4 text-sm">.:53
+[INFO] plugin/reload: Running configuration
+CoreDNS-1.12.0
+</pre>
+</main>
+</body>
+</html>

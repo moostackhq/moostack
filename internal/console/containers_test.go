@@ -60,9 +60,9 @@ func TestEachAppHasOneGroupAndTheClustersOwnContainersOne(t *testing.T) {
 	}
 }
 
-func TestARowIsTheContainerThenItsInstanceThenItsImage(t *testing.T) {
-	_, body := page(t, &orchestratortest.Fake{Own: []model.Running{{Instance: "dns-1", Container: "dns", Image: "example.test/dns:1"}}})
-	for _, row := range []string{"<tr><th>Container</th><th>Instance</th><th>Image</th></tr>", "<tr><td>dns</td><td>dns-1</td><td>example.test/dns:1</td></tr>"} {
+func TestARowIsTheContainerLinkedToItsPageThenItsInstanceThenItsImage(t *testing.T) {
+	_, body := page(t, &orchestratortest.Fake{Own: []model.Running{{ID: "sys/dns 1?&dns", Instance: "dns-1", Container: "dns", Image: "example.test/dns:1"}}})
+	for _, row := range []string{"<tr><th>Container</th><th>Instance</th><th>Image</th></tr>", `<tr><td><a class="link" href="/console/container?id=sys%2fdns%201%3f%26dns">dns</a></td><td>dns-1</td><td>example.test/dns:1</td></tr>`} {
 		if !strings.Contains(body, row) {
 			t.Errorf("the page has no row %s:\n%s", row, body)
 		}

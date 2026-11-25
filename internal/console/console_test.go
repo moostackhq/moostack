@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/moostackhq/moostack/internal/console"
 	"github.com/moostackhq/moostack/internal/model"
@@ -27,7 +28,7 @@ var update = flag.Bool("update", false, "rewrite the golden files")
 // cluster runs the apps blog and shop, and a container of its own.
 var cluster = func() *orchestratortest.Fake {
 	f := &orchestratortest.Fake{Own: []model.Running{
-		{Instance: "coredns-7b98449c4-x2x9v", Container: "coredns", Image: "rancher/mirrored-coredns-coredns:1.12.0"},
+		{Instance: "coredns-7b98449c4-x2x9v", Container: "coredns", Image: "rancher/mirrored-coredns-coredns:1.12.0", Started: time.Date(2026, 1, 1, 9, 30, 0, 0, time.FixedZone("CET", 3600))},
 	}}
 	for _, app := range []model.App{
 		{Name: "shop", Containers: []model.Container{

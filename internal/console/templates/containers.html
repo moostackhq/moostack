@@ -2,12 +2,7 @@
 <html lang="en">
 {{template "head"}}
 <body>
-<header class="navbar bg-base-200 px-4">
-<h1 class="flex-1 text-xl font-bold">Console</h1>
-<form method="post" action="/console/logout">
-<button class="btn btn-ghost">Log out</button>
-</form>
-</header>
+{{template "navbar"}}
 <main class="mx-auto max-w-5xl p-4">
 {{- if .Problem}}
 <p role="alert" class="alert alert-error">{{.Problem}}</p>
@@ -24,7 +19,7 @@
 <tbody>
 <tr><th colspan="3" scope="rowgroup" class="bg-base-200">{{if .App}}{{.App}}{{else}}System{{end}}</th></tr>
 {{- range .Containers}}
-<tr><td>{{.Container}}</td><td>{{.Instance}}</td><td>{{.Image}}</td></tr>
+<tr><td><a class="link" href="/console/container?id={{.ID}}">{{.Container}}</a></td><td>{{.Instance}}</td><td>{{.Image}}</td></tr>
 {{- end}}
 </tbody>
 {{- end}}

@@ -34,6 +34,7 @@ func New(o orchestrator.Orchestrator) *Console {
 	c := &Console{orchestrator: o, tokens: newTokens(), sessions: newSessions(), mux: http.NewServeMux()}
 	c.mux.Handle("GET /console", http.RedirectHandler("/console/", http.StatusPermanentRedirect))
 	c.mux.HandleFunc("GET /console/{$}", c.handleContainers)
+	c.mux.HandleFunc("GET /console/container", c.handleContainer)
 	c.mux.HandleFunc("GET /console/login", c.handleLoginPage)
 	c.mux.HandleFunc("POST /console/login", c.handleLogin)
 	c.mux.HandleFunc("POST /console/logout", c.handleLogout)

@@ -615,3 +615,160 @@ func TestALogFollowedThroughAHostGoesOnPastTheTimeARequestHas(t *testing.T) {
 		t.Errorf("Logs: %v", err)
 	}
 }
+
+func TestContainerLogsWritesTheLastLinesOfTheContainerAsItWroteThem(t *testing.T) {
+	name := unique("one")
+	appOfPods(t, name, []string{"web-a", "web-b"}, "web", "proxy")
+	b, kubelet := logging(t, map[string]containerLog{
+		"web-a/web":   {text: "a1\na2\nno line end"},
+		"web-a/proxy": {text: "p1\n"},
+		"web-b/web":   {text: "b1\n"},
+	})
+	for _, c := range []struct {
+		tail      int
+		want      string
+		requested string
+	}{
+		{2, "a2\nno line end", "web-a/web tail=2 follow=false"},
+		{0, "", "web-a/web tail=0 follow=false"},
+		{-1, "a1\na2\nno line end", "web-a/web follow=false"},
+	} {
+		kubelet.requests = nil
+		var w bytes.Buffer
+		if err := b.ContainerLogs(within(t, time.Minute), name+"/web-a/web", orchestrator.LogOptions{Tail: c.tail}, &w); err != nil || w.String() != c.want {
+			t.Errorf("ContainerLogs with the tail %d wrote %q, %v, want %q", c.tail, w.String(), err, c.want)
+		}
+		if got := kubelet.asked(); !slices.Equal(got, []string{c.requested}) {
+			t.Errorf("with the tail %d the logs asked for were %q, want %q", c.tail, got, c.requested)
+		}
+	}
+}
+
+func TestContainerLogsOfAContainerThatDoesntRunIsErrNoContainer(t *testing.T) {
+	name := unique("norun")
+	appOfPods(t, name, []string{"web-a"}, "web", "init")
+	b, kubelet := logging(t, map[string]containerLog{
+		"web-a/web":  {text: "a1\n"},
+		"web-a/init": {refusal: `container "init" in pod "web-a" is waiting to start: PodInitializing`},
+	})
+	for what, id := range map[string]string{
+		"no ID":                        "",
+		"a name alone":                 "web-a",
+		"no container":                 name + "/web-a",
+		"a part too many":              name + "/web-a/web/x",
+		"an empty pod":                 name + "//web",
+		"an empty namespace":           "/web-a/web",
+		"a pod there isn't":            name + "/web-z/web",
+		"a namespace there isn't":      unique("nowhere") + "/web-a/web",
+		"a container that hasn't run":  name + "/web-a/init",
+		"a container the pod has none": name + "/web-a/sidecar",
+	} {
+		var w bytes.Buffer
+		if err := b.ContainerLogs(within(t, time.Minute), id, orchestrator.LogOptions{Tail: 5}, &w); !errors.Is(err, orchestrator.ErrNoContainer) || w.Len() != 0 {
+			t.Errorf("ContainerLogs of %s wrote %q, %v, want nothing and ErrNoContainer", what, w.String(), err)
+		}
+	}
+	for _, asked := range kubelet.asked() {
+		if !strings.HasPrefix(asked, "web-") {
+			t.Errorf("an ID that names no pod was asked for: %q", asked)
+		}
+	}
+}
+
+func TestContainerLogsFollowedWritesWhatComesUntilTheLogEnds(t *testing.T) {
+	name := unique("onefollowed")
+	appOfPods(t, name, []string{"web-a"}, "web")
+	r, to := io.Pipe()
+	b, kubelet := logging(t, map[string]containerLog{"web-a/web": {text: "old\nlast\n", follows: r}})
+	w := make(lineWriter, 16)
+	done := make(chan error, 1)
+	go func() {
+		done <- b.ContainerLogs(within(t, time.Minute), name+"/web-a/web", orchestrator.LogOptions{Tail: 1, Follow: true}, w)
+	}()
+	if got, want := w.next(t), "last\n"; got != want {
+		t.Errorf("the first write was %q, want %q", got, want)
+	}
+	blocked(t, done, 2*time.Second, "with the log still followed")
+	io.WriteString(to, "new\n")
+	if got, want := w.next(t), "new\n"; got != want {
+		t.Errorf("the write after a new line was %q, want %q", got, want)
+	}
+	to.Close()
+	if err := returned(t, done); err != nil {
+		t.Errorf("ContainerLogs: %v", err)
+	}
+	if got, want := kubelet.asked(), []string{"web-a/web tail=1 follow=true"}; !slices.Equal(got, want) {
+		t.Errorf("the logs asked for were %q, want %q", got, want)
+	}
+}
+
+func TestContainerLogsFailsIfTheLogBreaksOffAndWritesWhatItReadOfIt(t *testing.T) {
+	name := unique("onebroken")
+	appOfPods(t, name, []string{"web-a"}, "web")
+	b, _ := logging(t, map[string]containerLog{"web-a/web": {then: broken{strings.NewReader("a1\na2")}}})
+	var w bytes.Buffer
+	err := b.ContainerLogs(within(t, time.Minute), name+"/web-a/web", orchestrator.LogOptions{Tail: 5}, &w)
+	if want := "reading the log of " + name + "/web-a/web: the connection is lost"; err == nil || err.Error() != want {
+		t.Errorf("ContainerLogs: %v, want %q", err, want)
+	}
+	if w.String() != "a1\na2" {
+		t.Errorf("ContainerLogs wrote %q, want what it read", w.String())
+	}
+}
+
+func TestContainerLogsFailsWithTheWritersErrorOnceItCantWrite(t *testing.T) {
+	name := unique("oneunwritten")
+	appOfPods(t, name, []string{"web-a"}, "web")
+	r, to := io.Pipe()
+	defer to.Close()
+	b, _ := logging(t, map[string]containerLog{"web-a/web": {text: "a1\na2\n", follows: r}})
+	for _, follow := range []bool{false, true} {
+		w := &failingWriter{}
+		done := make(chan error, 1)
+		go func() {
+			done <- b.ContainerLogs(within(t, time.Minute), name+"/web-a/web", orchestrator.LogOptions{Tail: 5, Follow: follow}, w)
+		}()
+		if err := returned(t, done); err == nil || err.Error() != "the pipe is closed" {
+			t.Errorf("ContainerLogs to a writer that fails, following %t: %v, want the writer's error", follow, err)
+		}
+		if w.writes != 1 {
+			t.Errorf("ContainerLogs wrote %d times to a writer that failed, following %t", w.writes, follow)
+		}
+	}
+}
+
+func TestContainerLogsOnAnEndedContextFailsWithItsCauseAndAsksForNothing(t *testing.T) {
+	name := unique("oneended")
+	appOfPods(t, name, []string{"web-a"}, "web")
+	b, kubelet := logging(t, map[string]containerLog{"web-a/web": {text: "a\n"}})
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cause := errors.New("interrupted")
+	cancel(cause)
+	var w bytes.Buffer
+	if err := b.ContainerLogs(ctx, name+"/web-a/web", orchestrator.LogOptions{Tail: 1}, &w); !errors.Is(err, cause) {
+		t.Errorf("ContainerLogs on an ended context: %v, want its cause", err)
+	}
+	if w.Len() != 0 || len(kubelet.asked()) != 0 {
+		t.Errorf("ContainerLogs on an ended context wrote %q and asked for %q", w.String(), kubelet.asked())
+	}
+}
+
+func TestContainerLogsFollowedEndsWithItsContextsCause(t *testing.T) {
+	name := unique("onestopped")
+	appOfPods(t, name, []string{"web-a"}, "web")
+	r, to := io.Pipe()
+	defer to.Close()
+	b, _ := logging(t, map[string]containerLog{"web-a/web": {text: "a\n", follows: r}})
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cause := errors.New("interrupted")
+	w := make(lineWriter, 16)
+	done := make(chan error, 1)
+	go func() {
+		done <- b.ContainerLogs(ctx, name+"/web-a/web", orchestrator.LogOptions{Tail: 1, Follow: true}, w)
+	}()
+	w.next(t)
+	cancel(cause)
+	if err := returned(t, done); !errors.Is(err, cause) {
+		t.Errorf("ContainerLogs whose context ended: %v, want its cause", err)
+	}
+}

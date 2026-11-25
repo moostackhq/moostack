@@ -38,6 +38,11 @@ type Orchestrator interface {
 	// Running are the cluster's running containers, ordered by app,
 	// then instance, then container.
 	Running(ctx context.Context) ([]model.Running, error)
+	// ContainerLogs writes the last lines of the running container
+	// that Running gave id to w, as the container wrote them.
+	// ErrNoContainer if no such container runs. If a write to w
+	// fails, it fails with that error.
+	ContainerLogs(ctx context.Context, id string, o LogOptions, w io.Writer) error
 
 	// Preflight reads what host is, and refuses one that can't be the
 	// node asked for.
@@ -73,6 +78,10 @@ var ErrNoApp = errors.New("no such app")
 
 // ErrNoReplicas is the error of Logs for an app that has no replicas.
 var ErrNoReplicas = errors.New("the app has no replicas")
+
+// ErrNoContainer is the error of ContainerLogs for an ID no running
+// container has.
+var ErrNoContainer = errors.New("no such running container")
 
 // Step is a step of an operation, which a backend tells the command as
 // it starts it.

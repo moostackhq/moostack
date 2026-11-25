@@ -1,7 +1,10 @@
 // Package model holds the types every port speaks.
 package model
 
-import "net/netip"
+import (
+	"net/netip"
+	"time"
+)
 
 // App is an app to run: its containers, or its own manifests or chart.
 type App struct {
@@ -97,6 +100,9 @@ type AppState struct {
 // Running is a running container. App is empty for the cluster's own.
 type Running struct {
 	App, Instance, Container, Image string
+	// ID names the container to the orchestrator that listed it.
+	ID      string
+	Started time.Time
 }
 
 // Node is a node of a cluster, as the cluster directory holds it.

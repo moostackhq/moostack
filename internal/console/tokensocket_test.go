@@ -106,7 +106,7 @@ func TestATokenFromTheSocketLogsABrowserInOverHTTPS(t *testing.T) {
 		t.Errorf("without a session /console/ ends at %s, want the login page", at)
 	}
 	token := requestToken(t, socket)
-	if at, body := visit(browser.PostForm(https.URL+"/console/login", url.Values{"token": {token}})); at != "/console/" || !strings.Contains(body, "<td>coredns</td>") {
+	if at, body := visit(browser.PostForm(https.URL+"/console/login", url.Values{"token": {token}})); at != "/console/" || !strings.Contains(body, ">coredns</a></td>") {
 		t.Errorf("the login ends at %s, want the containers page:\n%s", at, body)
 	}
 	if at, _ := visit(browser.Get(https.URL + "/console/")); at != "/console/" {
