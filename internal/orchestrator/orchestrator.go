@@ -36,7 +36,7 @@ type Orchestrator interface {
 	// Apps are the cluster's apps, ordered by name.
 	Apps(ctx context.Context) ([]model.AppState, error)
 	// Running are the cluster's running containers, ordered by app,
-	// then replica, then container.
+	// then instance, then container.
 	Running(ctx context.Context) ([]model.Running, error)
 
 	// Preflight reads what host is, and refuses one that can't be the

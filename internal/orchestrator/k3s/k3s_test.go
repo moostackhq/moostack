@@ -285,17 +285,17 @@ func runningOf(t *testing.T, prefix string) []model.Running {
 	}
 	var own []model.Running
 	for _, r := range all {
-		if strings.HasPrefix(r.Replica, prefix) {
+		if strings.HasPrefix(r.Instance, prefix) {
 			own = append(own, r)
 		}
 	}
 	return own
 }
 
-func TestARunningContainerIsListedWithItsAppReplicaNameAndImage(t *testing.T) {
+func TestARunningContainerIsListedWithItsAppInstanceNameAndImage(t *testing.T) {
 	app := unique("shop")
 	pod(t, app, app+"-web-1", app, container{name: "web", image: "example.test/web:1", state: running})
-	want := []model.Running{{App: app, Replica: app + "-web-1", Container: "web", Image: "example.test/web:1"}}
+	want := []model.Running{{App: app, Instance: app + "-web-1", Container: "web", Image: "example.test/web:1"}}
 	if got := runningOf(t, app); !slices.Equal(got, want) {
 		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
 	}
@@ -312,8 +312,8 @@ func TestAContainerOfAPodWithoutAnAppsLabelIsTheClustersOwn(t *testing.T) {
 	}
 	pod(t, labelled, id+"-job", "", container{name: "job", image: "example.test/job:1", state: running})
 	want := []model.Running{
-		{Replica: id + "-dns", Container: "dns", Image: "example.test/dns:1"},
-		{Replica: id + "-job", Container: "job", Image: "example.test/job:1"},
+		{Instance: id + "-dns", Container: "dns", Image: "example.test/dns:1"},
+		{Instance: id + "-job", Container: "job", Image: "example.test/job:1"},
 	}
 	if got := runningOf(t, id); !slices.Equal(got, want) {
 		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
@@ -328,7 +328,7 @@ func TestAPodLabelledWithNoAppsNameIsTheClustersOwn(t *testing.T) {
 		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "example.test/web:1"}}},
 	}
 	createPod(t, p, corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: status([]container{{name: "web", state: running}})})
-	want := []model.Running{{Replica: id, Container: "web", Image: "example.test/web:1"}}
+	want := []model.Running{{Instance: id, Container: "web", Image: "example.test/web:1"}}
 	if got := runningOf(t, id); !slices.Equal(got, want) {
 		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
 	}
@@ -346,8 +346,8 @@ func TestARunningContainerThePodDoesntAskForIsListedWithoutAnImage(t *testing.T)
 		{name: "other", state: running},
 	})})
 	want := []model.Running{
-		{Replica: id, Container: "other"},
-		{Replica: id, Container: "web", Image: "example.test/web:1"},
+		{Instance: id, Container: "other"},
+		{Instance: id, Container: "web", Image: "example.test/web:1"},
 	}
 	if got := runningOf(t, id); !slices.Equal(got, want) {
 		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
@@ -369,7 +369,7 @@ func TestWaitingAndTerminatedContainersAreLeftOut(t *testing.T) {
 	)
 	pod(t, id, id+"-pending", id, container{name: "pulling", image: "example.test/pulling:1", state: waiting})
 	pod(t, id+"-idle", id+"-finished", "", container{name: "job", image: "example.test/job:1", state: terminated})
-	want := []model.Running{{App: id, Replica: id + "-mixed", Container: "up", Image: "example.test/up:1"}}
+	want := []model.Running{{App: id, Instance: id + "-mixed", Container: "up", Image: "example.test/up:1"}}
 	if got := runningOf(t, id); !slices.Equal(got, want) {
 		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
 	}
@@ -388,12 +388,12 @@ func TestContainersAreOrderedByAppThenReplicaThenContainer(t *testing.T) {
 	pod(t, id+"-ns-z", id+"-z", "", one)
 	pod(t, id+"-ns-c", id+"-c", id+"-a", one)
 	want := []model.Running{
-		{App: "", Replica: id + "-z", Container: "c", Image: "example.test/c:1"},
-		{App: id + "-a", Replica: id + "-c", Container: "c", Image: "example.test/c:1"},
-		{App: id + "-m", Replica: id + "-a2", Container: "c", Image: "example.test/c:1"},
-		{App: id + "-m", Replica: id + "-b", Container: "a", Image: "example.test/a:1"},
-		{App: id + "-m", Replica: id + "-b", Container: "z", Image: "example.test/z:1"},
-		{App: id + "-z", Replica: id + "-a", Container: "c", Image: "example.test/c:1"},
+		{App: "", Instance: id + "-z", Container: "c", Image: "example.test/c:1"},
+		{App: id + "-a", Instance: id + "-c", Container: "c", Image: "example.test/c:1"},
+		{App: id + "-m", Instance: id + "-a2", Container: "c", Image: "example.test/c:1"},
+		{App: id + "-m", Instance: id + "-b", Container: "a", Image: "example.test/a:1"},
+		{App: id + "-m", Instance: id + "-b", Container: "z", Image: "example.test/z:1"},
+		{App: id + "-z", Instance: id + "-a", Container: "c", Image: "example.test/c:1"},
 	}
 	if got := runningOf(t, id); !slices.Equal(got, want) {
 		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
@@ -447,9 +447,9 @@ func TestRunningInitAndEphemeralContainersAreListed(t *testing.T) {
 	}
 
 	want := []model.Running{
-		{App: ns, Replica: ns, Container: "app", Image: "example.test/app:1"},
-		{App: ns, Replica: ns, Container: "debug", Image: "example.test/debug:1"},
-		{App: ns, Replica: ns, Container: "proxy", Image: "example.test/proxy:1"},
+		{App: ns, Instance: ns, Container: "app", Image: "example.test/app:1"},
+		{App: ns, Instance: ns, Container: "debug", Image: "example.test/debug:1"},
+		{App: ns, Instance: ns, Container: "proxy", Image: "example.test/proxy:1"},
 	}
 	if got := runningOf(t, ns); !slices.Equal(got, want) {
 		t.Errorf("Running in %s:\n got %+v\nwant %+v", ns, got, want)
@@ -469,7 +469,7 @@ func TestPodsBeyondOnePageAreListed(t *testing.T) {
 	slots := make(chan struct{}, 16)
 	for i := range count {
 		name := fmt.Sprintf("%s-%03d", ns, i)
-		want[i] = model.Running{Replica: name, Container: "app", Image: "example.test/app:1"}
+		want[i] = model.Running{Instance: name, Container: "app", Image: "example.test/app:1"}
 		wg.Go(func() {
 			slots <- struct{}{}
 			defer func() { <-slots }()
@@ -511,7 +511,7 @@ func TestPodsBeyondOnePageAreListed(t *testing.T) {
 	}
 	var got []model.Running
 	for _, r := range all {
-		if strings.HasPrefix(r.Replica, ns) {
+		if strings.HasPrefix(r.Instance, ns) {
 			got = append(got, r)
 		}
 	}

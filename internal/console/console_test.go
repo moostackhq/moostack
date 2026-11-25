@@ -27,7 +27,7 @@ var update = flag.Bool("update", false, "rewrite the golden files")
 // cluster runs the apps blog and shop, and a container of its own.
 var cluster = func() *orchestratortest.Fake {
 	f := &orchestratortest.Fake{Own: []model.Running{
-		{Replica: "coredns-7b98449c4-x2x9v", Container: "coredns", Image: "rancher/mirrored-coredns-coredns:1.12.0"},
+		{Instance: "coredns-7b98449c4-x2x9v", Container: "coredns", Image: "rancher/mirrored-coredns-coredns:1.12.0"},
 	}}
 	for _, app := range []model.App{
 		{Name: "shop", Containers: []model.Container{

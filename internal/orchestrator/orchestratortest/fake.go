@@ -166,7 +166,7 @@ func (f *Fake) logs(ctx context.Context, app string) (string, error) {
 	var text strings.Builder
 	for _, r := range f.running() {
 		if r.App == app {
-			fmt.Fprintf(&text, "%s %s: running\n", r.Replica, r.Container)
+			fmt.Fprintf(&text, "%s %s: running\n", r.Instance, r.Container)
 		}
 	}
 	if text.Len() == 0 {
@@ -216,17 +216,17 @@ func (f *Fake) Running(ctx context.Context) ([]model.Running, error) {
 func (f *Fake) running() []model.Running {
 	running := slices.Clone(f.Own)
 	if f.console != "" {
-		running = append(running, model.Running{Replica: "console-1", Container: "console", Image: f.console})
+		running = append(running, model.Running{Instance: "console-1", Container: "console", Image: f.console})
 	}
 	for name, a := range f.apps {
 		for _, c := range a.Containers {
 			for i := range replicas(c) {
-				running = append(running, model.Running{App: name, Replica: fmt.Sprintf("%s-%d", c.Name, i+1), Container: c.Name, Image: c.Image})
+				running = append(running, model.Running{App: name, Instance: fmt.Sprintf("%s-%d", c.Name, i+1), Container: c.Name, Image: c.Image})
 			}
 		}
 	}
 	slices.SortFunc(running, func(a, b model.Running) int {
-		return cmp.Or(cmp.Compare(a.App, b.App), cmp.Compare(a.Replica, b.Replica), cmp.Compare(a.Container, b.Container))
+		return cmp.Or(cmp.Compare(a.App, b.App), cmp.Compare(a.Instance, b.Instance), cmp.Compare(a.Container, b.Container))
 	})
 	return running
 }

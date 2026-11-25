@@ -130,7 +130,7 @@ func (b *Backend) running(ctx context.Context) ([]model.Running, error) {
 		opts.Continue = pods.Continue
 	}
 	slices.SortFunc(running, func(a, b model.Running) int {
-		return cmp.Or(cmp.Compare(a.App, b.App), cmp.Compare(a.Replica, b.Replica), cmp.Compare(a.Container, b.Container))
+		return cmp.Or(cmp.Compare(a.App, b.App), cmp.Compare(a.Instance, b.Instance), cmp.Compare(a.Container, b.Container))
 	})
 	return running, nil
 }
@@ -153,7 +153,7 @@ func runningIn(pod corev1.Pod) []model.Running {
 		}
 		running = append(running, model.Running{
 			App:       pod.Labels[appLabel],
-			Replica:   pod.Name,
+			Instance:  pod.Name,
 			Container: s.Name,
 			Image:     images[s.Name],
 		})

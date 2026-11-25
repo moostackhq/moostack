@@ -96,7 +96,7 @@ type AppState struct {
 
 // Running is a running container. App is empty for the cluster's own.
 type Running struct {
-	App, Replica, Container, Image string
+	App, Instance, Container, Image string
 }
 
 // Node is a node of a cluster, as the cluster directory holds it.

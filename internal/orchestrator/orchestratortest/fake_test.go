@@ -187,7 +187,7 @@ func TestADeployOfTheFakeWhoseContextEndsAtItsFirstStepFailsAndDeploysNothing(t 
 // apps and nodes of their own beside readers.
 func TestCallsOfTheFakeAtOnceLeaveWhatSomeOrderOfThemWould(t *testing.T) {
 	ctx := context.Background()
-	f := &orchestratortest.Fake{Own: []model.Running{{Replica: "dns-1", Container: "dns", Image: "example.test/dns:1"}}}
+	f := &orchestratortest.Fake{Own: []model.Running{{Instance: "dns-1", Container: "dns", Image: "example.test/dns:1"}}}
 	const writers, rounds = 8, 50
 	var wg sync.WaitGroup
 	for w := range writers {
@@ -297,7 +297,7 @@ func TestFailPanicsForWhatIsNoMethodThatFails(t *testing.T) {
 
 func TestTheFakeListsItsOwnContainersAndWritesTheLogsSet(t *testing.T) {
 	ctx := context.Background()
-	own := model.Running{Replica: "dns-1", Container: "dns", Image: "example.test/dns:1"}
+	own := model.Running{Instance: "dns-1", Container: "dns", Image: "example.test/dns:1"}
 	f := &orchestratortest.Fake{Own: []model.Running{own}, Logged: map[string]string{"shop": "web-1 web: started\n"}}
 	if err := f.Deploy(ctx, model.App{Name: "shop", Containers: []model.Container{{Name: "web", Image: "example.test/web:1", Replicas: 2}}}, func(orchestrator.Step) {}); err != nil {
 		t.Fatal(err)
@@ -308,8 +308,8 @@ func TestTheFakeListsItsOwnContainersAndWritesTheLogsSet(t *testing.T) {
 	}
 	want := []model.Running{
 		own,
-		{App: "shop", Replica: "web-1", Container: "web", Image: "example.test/web:1"},
-		{App: "shop", Replica: "web-2", Container: "web", Image: "example.test/web:1"},
+		{App: "shop", Instance: "web-1", Container: "web", Image: "example.test/web:1"},
+		{App: "shop", Instance: "web-2", Container: "web", Image: "example.test/web:1"},
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
@@ -351,25 +351,25 @@ func TestTheFakeWritesALineForEachRunningContainerOfTheApp(t *testing.T) {
 
 func TestTheFakeOrdersContainersOfOneReplicaByName(t *testing.T) {
 	f := &orchestratortest.Fake{Own: []model.Running{
-		{Replica: "proxy-2", Container: "a"},
-		{Replica: "proxy-1", Container: "web"},
-		{Replica: "proxy-1", Container: "sidecar"},
-		{Replica: "dns-1", Container: "z"},
+		{Instance: "proxy-2", Container: "a"},
+		{Instance: "proxy-1", Container: "web"},
+		{Instance: "proxy-1", Container: "sidecar"},
+		{Instance: "dns-1", Container: "z"},
 	}}
 	got, err := f.Running(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []model.Running{
-		{Replica: "dns-1", Container: "z"},
-		{Replica: "proxy-1", Container: "sidecar"},
-		{Replica: "proxy-1", Container: "web"},
-		{Replica: "proxy-2", Container: "a"},
+		{Instance: "dns-1", Container: "z"},
+		{Instance: "proxy-1", Container: "sidecar"},
+		{Instance: "proxy-1", Container: "web"},
+		{Instance: "proxy-2", Container: "a"},
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("Running:\n got %+v\nwant %+v", got, want)
 	}
-	if f.Own[0].Replica != "proxy-2" || f.Own[3].Replica != "dns-1" {
+	if f.Own[0].Instance != "proxy-2" || f.Own[3].Instance != "dns-1" {
 		t.Errorf("Running ordered Own itself: %+v", f.Own)
 	}
 }

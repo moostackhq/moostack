@@ -92,10 +92,10 @@ func Contract(t *testing.T, cluster func(t *testing.T) Cluster) {
 		var out []string
 		seen := map[string]bool{}
 		for _, r := range running(t, o, app) {
-			if r.Replica == "" || seen[r.Replica+"/"+r.Container] {
+			if r.Instance == "" || seen[r.Instance+"/"+r.Container] {
 				t.Errorf("Running has %+v, a container without a replica of its own", r)
 			}
-			seen[r.Replica+"/"+r.Container] = true
+			seen[r.Instance+"/"+r.Container] = true
 			out = append(out, r.Container+" "+r.Image)
 		}
 		slices.Sort(out)
@@ -363,7 +363,7 @@ func Contract(t *testing.T, cluster func(t *testing.T) Cluster) {
 		}
 	})
 
-	t.Run("running containers are ordered by app, then replica, then container", func(t *testing.T) {
+	t.Run("running containers are ordered by app, then instance, then container", func(t *testing.T) {
 		o := cluster(t).Orchestrator
 		id := unique("sorted")
 		for _, letter := range letters {
@@ -378,7 +378,7 @@ func Contract(t *testing.T, cluster func(t *testing.T) Cluster) {
 			t.Fatalf("%d containers of the 8 apps run, want 24", len(own))
 		}
 		ordered := slices.IsSortedFunc(all, func(a, b model.Running) int {
-			return cmp.Or(strings.Compare(a.App, b.App), strings.Compare(a.Replica, b.Replica), strings.Compare(a.Container, b.Container))
+			return cmp.Or(strings.Compare(a.App, b.App), strings.Compare(a.Instance, b.Instance), strings.Compare(a.Container, b.Container))
 		})
 		if !ordered {
 			t.Errorf("Running isn't ordered: %+v", all)

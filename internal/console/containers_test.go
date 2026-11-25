@@ -48,38 +48,47 @@ func TestAClusterWithNothingRunningSaysSo(t *testing.T) {
 	}
 }
 
-func TestEachAppHasOneSectionAndTheClustersOwnContainersOne(t *testing.T) {
+func TestEachAppHasOneGroupAndTheClustersOwnContainersOne(t *testing.T) {
 	_, body := page(t, cluster)
-	if got := strings.Count(body, "<section>"); got != 3 {
-		t.Errorf("%d sections for 2 apps and the cluster's own containers:\n%s", got, body)
+	if got := strings.Count(body, "<tbody>"); got != 3 {
+		t.Errorf("%d groups for 2 apps and the cluster's own containers:\n%s", got, body)
 	}
-	for _, heading := range []string{"<h2>blog</h2>", "<h2>shop</h2>", "<h2>The cluster's own</h2>"} {
+	for _, heading := range []string{">blog</th>", ">shop</th>", ">System</th>"} {
 		if got := strings.Count(body, heading); got != 1 {
-			t.Errorf("%d headings %s, want 1:\n%s", got, heading, body)
+			t.Errorf("%d group rows %s, want 1:\n%s", got, heading, body)
 		}
 	}
 }
 
-func TestAClusterWithoutAppsHasOnlyItsOwnSection(t *testing.T) {
-	_, body := page(t, &orchestratortest.Fake{Own: []model.Running{{Replica: "dns-1", Container: "dns", Image: "example.test/dns:1"}}})
-	if strings.Count(body, "<section>") != 1 || !strings.Contains(body, "<h2>The cluster's own</h2>") {
+func TestARowIsTheContainerThenItsInstanceThenItsImage(t *testing.T) {
+	_, body := page(t, &orchestratortest.Fake{Own: []model.Running{{Instance: "dns-1", Container: "dns", Image: "example.test/dns:1"}}})
+	for _, row := range []string{"<tr><th>Container</th><th>Instance</th><th>Image</th></tr>", "<tr><td>dns</td><td>dns-1</td><td>example.test/dns:1</td></tr>"} {
+		if !strings.Contains(body, row) {
+			t.Errorf("the page has no row %s:\n%s", row, body)
+		}
+	}
+}
+
+func TestAClusterWithoutAppsHasOnlyItsOwnGroup(t *testing.T) {
+	_, body := page(t, &orchestratortest.Fake{Own: []model.Running{{Instance: "dns-1", Container: "dns", Image: "example.test/dns:1"}}})
+	if strings.Count(body, "<tbody>") != 1 || !strings.Contains(body, ">System</th>") {
 		t.Errorf("the page of a cluster without apps:\n%s", body)
 	}
 }
 
-func TestAClusterWithoutContainersOfItsOwnHasNoSectionForThem(t *testing.T) {
+func TestAClusterWithoutContainersOfItsOwnHasNoGroupForThem(t *testing.T) {
 	f := &orchestratortest.Fake{}
 	if err := f.Deploy(context.Background(), model.App{Name: "shop", Containers: []model.Container{{Name: "web", Image: "example.test/web:1"}}}, func(orchestrator.Step) {}); err != nil {
 		t.Fatal(err)
 	}
 	_, body := page(t, f)
-	if strings.Count(body, "<section>") != 1 || strings.Contains(body, "The cluster") {
+	if strings.Count(body, "<tbody>") != 1 || strings.Contains(body, "System") {
 		t.Errorf("the page of a cluster with nothing of its own running:\n%s", body)
 	}
 }
 
 func TestNamesFromTheClusterAreEscaped(t *testing.T) {
-	f := &orchestratortest.Fake{Own: []model.Running{{Replica: `"><script>p()</script>`, Container: "<i>c</i>", Image: "<script>alert(1)</script>"}}}
+	f := &orchestratortest.Fake{Own: []model.Running{{Instance: `"><script>p()</script>`, Container: "<i>c</i>", Image: "<script>alert(1)</script>"}}}
 	app := model.App{Name: "<b>app</b>", Containers: []model.Container{{Name: "<u>web</u>", Image: "<script>alert(2)</script>"}}}
 	if err := f.Deploy(context.Background(), app, func(orchestrator.Step) {}); err != nil {
 		t.Fatal(err)
@@ -90,7 +99,7 @@ func TestNamesFromTheClusterAreEscaped(t *testing.T) {
 			t.Errorf("the page holds %s unescaped:\n%s", raw, body)
 		}
 	}
-	for _, shown := range []string{"&lt;script&gt;alert(1)&lt;/script&gt;", "&lt;script&gt;alert(2)&lt;/script&gt;", "<h2>&lt;b&gt;app&lt;/b&gt;</h2>"} {
+	for _, shown := range []string{"&lt;script&gt;alert(1)&lt;/script&gt;", "&lt;script&gt;alert(2)&lt;/script&gt;", ">&lt;b&gt;app&lt;/b&gt;</th>"} {
 		if !strings.Contains(body, shown) {
 			t.Errorf("the page doesn't show %s:\n%s", shown, body)
 		}
